@@ -1,0 +1,56 @@
+{
+  "data": {
+    "root": "/data/game_name",
+    "frame_regex": "^(?P<video>.*?)(?P<frame>\\d{5})\\.(?P<ext>png|jpg|jpeg)$",
+    "frame_digits": null,
+    "stride": 1
+  },
+  "model": {
+    "factory": "my_project.hard_mining_adapter:create_current_model",
+    "checkpoint": "ckpts/current/model.pth",
+    "input_height": 540,
+    "input_width": 960,
+    "batch_size": 4,
+    "mask0_role": "warp0_weight",
+    "align_corners": false,
+    "padding_mode": "border",
+    "flow_units": "input_pixels",
+    "factory_kwargs": {}
+  },
+  "thresholds": {
+    "wrong_reject_below": 0.20,
+    "wrong_accept_at": 0.45,
+    "solvable_reject_below": 0.30,
+    "solvable_accept_at": 0.55,
+    "menu_transition_review_at": 0.40,
+    "menu_transition_reject_at": 0.70,
+    "foreground_motion_review_at": 0.35,
+    "foreground_motion_reject_at": 0.65,
+    "occlusion_review_at": 0.40,
+    "occlusion_reject_at": 0.70,
+    "ui_priority_floor": 0.35,
+    "non_ui_region_reserve": 1
+  },
+  "runtime": {
+    "backend": "npu",
+    "devices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "workers": 8,
+    "chunk_triplets": 256,
+    "prefetch": 2,
+    "cpu_threads_per_worker": 16,
+    "warmup_batches": 2,
+    "lease_seconds": 1800,
+    "precision": "float32",
+    "state_db": "runs/state.sqlite3",
+    "run_dir": "runs/game_name"
+  },
+  "output": {
+    "hard_case_dir": "extremely_hard_case",
+    "visualization_dir": "extremely_hard_case_visualization",
+    "manifest_name": "hard_case_manifest.jsonl",
+    "link_mode": "hardlink_then_copy",
+    "layout": "segment_relative",
+    "save_review": false,
+    "visualization_width": 320
+  }
+}

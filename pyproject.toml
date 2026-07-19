@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfi-hard-miner"
+version = "0.1.0"
+description = "Offline local-error hard-case mining for video frame interpolation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "VFI Hard Miner contributors" }]
+dependencies = [
+  "numpy>=1.26,<3",
+  "Pillow>=10,<13",
+]
+
+[project.scripts]
+vfi-hard-miner = "vfi_hard_miner.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -p no:cacheprovider"
+testpaths = ["tests"]

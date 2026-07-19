@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "target": {
+    "architecture": "aarch64",
+    "cann": "9.0",
+    "python": "CPython 3.10/3.11/3.12",
+    "os": "manylinux2014 (glibc, aarch64)"
+  },
+  "resources": [
+    {
+      "name": "cgvqm-source",
+      "kind": "source",
+      "path": "third_party/downloads/cgvqm-8302ff4.tar.gz",
+      "source": "https://github.com/IntelLabs/cgvqm",
+      "version": "8302ff45b4ff5a691682baf23f7c007d6b591e98",
+      "license": "Apache-2.0",
+      "sha256": "414c2c3d4f4ddfcfeec78e0366136b805f6e30c3b6ba52eea709afe5f381c73d",
+      "size": 47245230
+    },
+    {
+      "name": "dinov2-source",
+      "kind": "source",
+      "path": "third_party/downloads/dinov2-7764ea0.tar.gz",
+      "source": "https://github.com/facebookresearch/dinov2",
+      "version": "7764ea0f912e53c92e82eb78a2a1631e92725fc8",
+      "license": "Apache-2.0",
+      "sha256": "c27dcdaf50e9fb5bbdf2bb529da357716372e19c6afab17d5350f3f0094aed4b",
+      "size": 2869642
+    },
+    {
+      "name": "flip-source",
+      "kind": "source",
+      "path": "third_party/downloads/flip-b475eb4.tar.gz",
+      "source": "https://github.com/NVlabs/flip",
+      "version": "b475eb4bf394ab877c42166c9eb0a84a02cc5b14",
+      "license": "BSD-3-Clause",
+      "sha256": "576e9ed6e9674da8eb5af59f20abea7ce0c0d7c1f533b61cb97df4cdc71b7782",
+      "size": 56637966
+    },
+    {
+      "name": "cgvqm-license",
+      "kind": "license",
+      "path": "third_party/licenses/CGVQM-Apache-2.0.txt",
+      "source": "https://github.com/IntelLabs/cgvqm/blob/8302ff45b4ff5a691682baf23f7c007d6b591e98/LICENSE",
+      "version": "8302ff4",
+      "license": "Apache-2.0",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "size": 11357
+    },
+    {
+      "name": "dinov2-license",
+      "kind": "license",
+      "path": "third_party/licenses/DINOv2-Apache-2.0.txt",
+      "source": "https://github.com/facebookresearch/dinov2/blob/7764ea0f912e53c92e82eb78a2a1631e92725fc8/LICENSE",
+      "version": "7764ea0",
+      "license": "Apache-2.0",
+      "sha256": "600cc67cc4cb2f5ea317dcfc687ad1c74dc4bec8782bbe9db0afd83513b935b7",
+      "size": 11359
+    },
+    {
+      "name": "flip-license",
+      "kind": "license",
+      "path": "third_party/licenses/FLIP-BSD-3-Clause.txt",
+      "source": "https://github.com/NVlabs/flip/blob/b475eb4bf394ab877c42166c9eb0a84a02cc5b14/LICENSE",
+      "version": "b475eb4",
+      "license": "BSD-3-Clause",
+      "sha256": "13b955078ffb4a3215757038ab2e5fcf0cc66349d0990faec9adba8ad034e578",
+      "size": 1648
+    },
+    {
+      "name": "cgvqm-2-weight",
+      "kind": "weight",
+      "path": "third_party/weights/cgvqm/cgvqm-2.pickle",
+      "source": "https://github.com/IntelLabs/cgvqm/blob/8302ff45b4ff5a691682baf23f7c007d6b591e98/weights/cgvqm-2.pickle",
+      "version": "8302ff45b4ff5a691682baf23f7c007d6b591e98",
+      "license": "Apache-2.0",
+      "sha256": "18de1638b04886f972eb6534cc35a0e22ce9ebf26fa40689ba1e8130ea110f14",
+      "size": 1204
+    },
+    {
+      "name": "cgvqm-5-weight",
+      "kind": "weight",
+      "path": "third_party/weights/cgvqm/cgvqm-5.pickle",
+      "source": "https://github.com/IntelLabs/cgvqm/blob/8302ff45b4ff5a691682baf23f7c007d6b591e98/weights/cgvqm-5.pickle",
+      "version": "8302ff45b4ff5a691682baf23f7c007d6b591e98",
+      "license": "Apache-2.0",
+      "sha256": "851ba1fcc92beddf4dd24c5bcfc1f2aa80f0f8b926b6b42fbffb2b0db7130cfd",
+      "size": 4791
+    },
+    {
+      "name": "dinov2-vits14-pretrain",
+      "kind": "weight",
+      "path": "third_party/weights/dinov2/dinov2_vits14_pretrain.pth",
+      "source": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_pretrain.pth",
+      "version": "dinov2_vits14",
+      "license": "Apache-2.0",
+      "sha256": "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9",
+      "size": 88283115
+    },
+    {
+      "name": "numpy-1.26.4-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/numpy-1.26.4-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+      "source": "https://pypi.org/project/numpy/1.26.4/",
+      "version": "1.26.4",
+      "license": "PSF-compatible",
+      "sha256": "d209d8969599b27ad20994c8e41936ee0964e6da07478d6c35016bc386b66ad4",
+      "size": 14219016
+    },
+    {
+      "name": "numpy-1.26.4-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/numpy-1.26.4-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+      "source": "https://pypi.org/project/numpy/1.26.4/",
+      "version": "1.26.4",
+      "license": "PSF-compatible",
+      "sha256": "7ab55401287bfec946ced39700c053796e7cc0e3acbef09993a9ad2adba6ca6e",
+      "size": 14222994
+    },
+    {
+      "name": "numpy-1.26.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/numpy-1.26.4-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+      "source": "https://pypi.org/project/numpy/1.26.4/",
+      "version": "1.26.4",
+      "license": "PSF-compatible",
+      "sha256": "9fad7dcb1aac3c7f0584a5a8133e3a43eeb2fe127f47e3632d43d677c66c102b",
+      "size": 13925109
+    },
+    {
+      "name": "pillow-11.3.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/pillow-11.3.0-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+      "source": "https://pypi.org/project/Pillow/11.3.0/",
+      "version": "11.3.0",
+      "license": "PSF-compatible",
+      "sha256": "7107195ddc914f656c7fc8e4a5e1c25f32e9236ea3ea860f257b0436011fddd0",
+      "size": 5859742
+    },
+    {
+      "name": "pillow-11.3.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/pillow-11.3.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+      "source": "https://pypi.org/project/Pillow/11.3.0/",
+      "version": "11.3.0",
+      "license": "PSF-compatible",
+      "sha256": "7d1aa4de119a0ecac0a34a9c8bde33f34022e2e8f99104e47a3ca392fd60e37d",
+      "size": 5870978
+    },
+    {
+      "name": "pillow-11.3.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/pillow-11.3.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+      "source": "https://pypi.org/project/Pillow/11.3.0/",
+      "version": "11.3.0",
+      "license": "PSF-compatible",
+      "sha256": "eb76541cba2f958032d79d143b98a3a6b3ea87f0959bbe256c0b5e416599fd5d",
+      "size": 5871726
+    },
+    {
+      "name": "setuptools-80.9.0-py3-none-any",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/setuptools-80.9.0-py3-none-any.whl",
+      "source": "https://pypi.org/project/setuptools/80.9.0/",
+      "version": "80.9.0",
+      "license": "PSF-compatible",
+      "sha256": "062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922",
+      "size": 1201486
+    },
+    {
+      "name": "vfi_hard_miner-0.1.0-py3-none-any",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/vfi_hard_miner-0.1.0-py3-none-any.whl",
+      "source": "local-project",
+      "version": "0.1.0",
+      "license": "Proprietary",
+      "sha256": "b25740ee9c52bed88f5e3ea30564c32ef9b00ada2b4e32f6c95acc0238185209",
+      "size": 101358
+    },
+    {
+      "name": "wheel-0.45.1-py3-none-any",
+      "kind": "wheel",
+      "path": "third_party/wheelhouse/linux-aarch64/wheel-0.45.1-py3-none-any.whl",
+      "source": "https://pypi.org/project/wheel/0.45.1/",
+      "version": "0.45.1",
+      "license": "PSF-compatible",
+      "sha256": "708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248",
+      "size": 72494
+    }
+  ]
+}

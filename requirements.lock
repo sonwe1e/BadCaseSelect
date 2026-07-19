@@ -1,0 +1,4 @@
+# Project-local runtime packages. torch and torch_npu are intentionally omitted:
+# they must match the target server's preinstalled CANN 9.0 stack.
+numpy==1.26.4
+Pillow==11.3.0
