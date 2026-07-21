@@ -6,8 +6,8 @@
     "stride": 1
   },
   "model": {
-    "factory": "my_project.hard_mining_adapter:create_current_model",
-    "checkpoint": "ckpts/current/model.pth",
+    "factory": "unet",
+    "checkpoint": null,
     "input_height": 540,
     "input_width": 960,
     "batch_size": 4,
@@ -15,7 +15,9 @@
     "align_corners": false,
     "padding_mode": "border",
     "flow_units": "input_pixels",
-    "factory_kwargs": {}
+    "factory_kwargs": {
+      "base_channels": 32
+    }
   },
   "thresholds": {
     "wrong_reject_below": 0.20,

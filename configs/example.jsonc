@@ -1,0 +1,226 @@
+// VFI Hard Miner — 带注释的配置参考
+// 用法：复制 example.json（不是本文件），按下方说明修改。
+// 本文件为 JSONC 格式（JSON with Comments），运行时不能直接加载。
+// VS Code 会将 .jsonc 渲染为带语法高亮的注释，适合作为字段说明文档。
+{
+  // ─────────────────────────────────────────────────────
+  // data: 输入数据配置
+  // ─────────────────────────────────────────────────────
+  "data": {
+    // 游戏连续帧的根目录。工具会递归扫描该目录下所有符合
+    // frame_regex 的文件，按 (video, frame) 分组排序后建立索引。
+    "root": "/data/game_name",
+
+    // 帧文件名匹配正则。必须包含三个具名捕获组：
+    //   video — 视频/场景标识符（路径前缀或场景名）
+    //   frame — 帧编号，必须为纯数字
+    //   ext   — 文件扩展名
+    // 下面的默认值匹配形如 "scene_a00042.png" 的命名：
+    "frame_regex": "^(?P<video>.*?)(?P<frame>\\d{5})\\.(?P<ext>png|jpg|jpeg)$",
+
+    // 帧号位数。null 表示从 frame_regex 自动推断（推荐）。
+    // 仅在无法从正则推断时手动指定，例如帧号无前导零时设为 1。
+    "frame_digits": null,
+
+    // 帧采样步长。stride=1 表示每一帧都参与建立 triplet（最密集）。
+    // stride=2 表示每隔一帧取一对，可在数据量极大时加速索引但会遗漏帧间样本。
+    "stride": 1
+  },
+
+  // ─────────────────────────────────────────────────────
+  // model: 当前 VFI 模型配置（主挖掘模型）
+  // ─────────────────────────────────────────────────────
+  "model": {
+    // 模型工厂，两种写法：
+    //   短名称   — 直接使用 models/ 包中的文件名，例如 "unet" 对应
+    //              src/vfi_hard_miner/models/unet.py 中的 create_model()
+    //   完整路径 — "my_project.adapter:create_model"（保持向后兼容）
+    "factory": "unet",
+
+    // 权重文件路径（state_dict 格式）。null 表示随机初始化，
+    // 仅用于开发调试；生产配置必须指向真实 checkpoint。
+    "checkpoint": null,
+
+    // 网络固定输入尺寸（高×宽，单位像素）。
+    // ModelAdapter 会在推理前自动将原始帧双线性缩放到此尺寸，
+    // 因此网络始终以此固定分辨率运行，与输入帧的实际分辨率无关。
+    "input_height": 540,
+    "input_width": 960,
+
+    // 每次推理的批大小。NPU 建议 4～8（视显存而定）；
+    // CPU 调试时可设为 1 以减少内存占用。
+    "batch_size": 4,
+
+    // mask0 的语义角色，决定后处理时如何将 mask0/mask1 用于融合：
+    //   "warp0_weight" — mask0 是 frame0 backward warp 的混合权重（默认）
+    //   "warp1_weight" — mask0 是 frame1 backward warp 的混合权重
+    // 具体含义见 docs/model_adapter.md。
+    "mask0_role": "warp0_weight",
+
+    // flow 上采样时 F.interpolate 的 align_corners 参数。
+    // false（默认）与大多数现代框架的行为一致；
+    // 若模型训练时使用 true，则需改为 true 以保持一致性。
+    "align_corners": false,
+
+    // backward warp 时超出图像边界的填充方式，对应 grid_sample 的 padding_mode：
+    //   "border"     — 复制边缘像素（推荐，对遮挡区域更稳定）
+    //   "zeros"      — 填充 0
+    //   "reflection" — 镜像填充
+    "padding_mode": "border",
+
+    // flow 向量的单位制：
+    //   "input_pixels"   — flow 值以原始输入帧的像素为单位（推荐）
+    //   "network_pixels" — flow 值以网络固定输入尺寸的像素为单位
+    // 绝大多数模型输出 network_pixels；设为 input_pixels 时工具会
+    // 在后处理中自动做比例换算。
+    "flow_units": "input_pixels",
+
+    // 额外传给 create_model() 的关键字参数，与 factory_kwargs 字段对应。
+    // 这里的 key 必须与 create_model() 的参数名完全匹配。
+    // UNet 示例：base_channels 控制所有特征图的宽度倍数。
+    "factory_kwargs": {
+      "base_channels": 32
+    }
+  },
+
+  // ─────────────────────────────────────────────────────
+  // thresholds: 困难样本筛选阈值
+  // 所有值均为概率，范围 [0, 1]。
+  // reject_below < p < accept_at 的样本进入 review 队列。
+  // ─────────────────────────────────────────────────────
+  "thresholds": {
+    // p_wrong 阈值：当前模型在此 triplet 上的错误程度。
+    //   低于 wrong_reject_below → 模型没做错，丢弃（不够难）
+    //   高于 wrong_accept_at   → 模型确实做错，接受为困难样本
+    "wrong_reject_below": 0.20,
+    "wrong_accept_at": 0.45,
+
+    // p_solvable 阈值：此 triplet 是否在理论上可被模型解决。
+    //   低于 solvable_reject_below → 无法解（遮挡/超出运动范围），丢弃
+    //   高于 solvable_accept_at   → 可解，保留
+    "solvable_reject_below": 0.30,
+    "solvable_accept_at": 0.55,
+
+    // 菜单转场特征得分阈值。
+    //   低于 review_at  → 忽略此特征
+    //   review_at ～ reject_at → 进入人工审核
+    //   高于 reject_at  → 识别为 UI 转场，拒绝（此类样本无训练价值）
+    "menu_transition_review_at": 0.40,
+    "menu_transition_reject_at": 0.70,
+
+    // 前景大幅运动特征得分阈值（人物/车辆等高速运动）。
+    //   review_at ～ reject_at 区间的样本优先级降低但不丢弃。
+    "foreground_motion_review_at": 0.35,
+    "foreground_motion_reject_at": 0.65,
+
+    // 遮挡特征得分阈值（物体进入/离开画面导致的遮挡区域）。
+    "occlusion_review_at": 0.40,
+    "occlusion_reject_at": 0.70,
+
+    // UI 区域（文字、图标、小地图等）的 priority_weight 下限。
+    // 贴边、高边缘密度区域的 priority_weight 会被压低至此值，
+    // 防止 UI 元素垄断困难样本名额。
+    "ui_priority_floor": 0.35,
+
+    // 非 UI 候选（中央人物/武器结构等）保留的最少名额数。
+    // 即使 p_wrong 整体偏低，也至少保留 non_ui_region_reserve 个非 UI 样本。
+    "non_ui_region_reserve": 1
+  },
+
+  // ─────────────────────────────────────────────────────
+  // runtime: 执行环境与并行配置
+  // ─────────────────────────────────────────────────────
+  "runtime": {
+    // 计算后端：
+    //   "cpu"  — 纯 CPU，适合开发调试，无需 GPU/NPU
+    //   "cuda" — NVIDIA CUDA GPU
+    //   "npu"  — Ascend 910B，生产环境推荐
+    "backend": "npu",
+
+    // 使用的设备编号列表。
+    //   CUDA: 对应 GPU 卡号，如 [0, 1]
+    //   NPU:  对应 Ascend 卡号，生产配置通常为 [0,1,2,3,4,5,6,7]
+    //   CPU:  忽略此字段（填 [0] 即可）
+    "devices": [0, 1, 2, 3, 4, 5, 6, 7],
+
+    // 并行 worker 进程数。每个 worker 独占一块设备、加载一次模型。
+    // 通常等于 devices 的长度。任务不足时会自动减少实际启动数量。
+    "workers": 8,
+
+    // 每个任务块包含的 triplet 数量。较大的值减少任务分发开销，
+    // 但单个任务失败时需重跑更多工作；256 是通常合理的默认值。
+    "chunk_triplets": 256,
+
+    // 预取队列深度：图片解码与 NPU 推理的流水线并发深度。
+    // 2 表示在 NPU 处理当前批的同时，CPU 已在解码下一批。
+    // 内存充足时可适当增大（4～8）以提高吞吐；内存紧张时设为 1。
+    "prefetch": 2,
+
+    // 每个 worker 进程的 CPU 线程数（用于 PyTorch/OpenCV 内部并行）。
+    // 多 worker 时建议 cpu_threads_per_worker × workers ≤ 物理核心数。
+    "cpu_threads_per_worker": 16,
+
+    // 每个 worker 在正式推理前运行的预热批数。
+    // 预热使 NPU JIT / 算子缓存充分预热，避免前几批延迟偏高影响统计。
+    "warmup_batches": 2,
+
+    // 任务租约时长（秒）。worker 在领取任务后必须在此时间内完成
+    // 并续约，否则其他 worker 可重新领取该任务（防止 worker 崩溃
+    // 导致任务永久卡死）。建议设为单块任务预期耗时的 3～5 倍。
+    "lease_seconds": 1800,
+
+    // 推理精度：
+    //   "float32" — 最高精度，Ascend 910B 生产必须使用此值
+    //   "float16" — 半精度，CUDA 调试/加速时可使用
+    "precision": "float32",
+
+    // SQLite 状态数据库路径。记录任务进度、租约和结果，
+    // 支持断点续跑——重启工具后会自动跳过已完成任务。
+    // 每次实验建议使用独立路径（与 run_dir 保持一致）。
+    "state_db": "runs/state.sqlite3",
+
+    // 本次运行的输出根目录。index 首次运行时会写入不可变快照
+    // execution.snapshot.json；同一 run_dir 不能混用不同 checkpoint
+    // 或数据源的结果。每次新实验请使用新目录。
+    "run_dir": "runs/game_name"
+  },
+
+  // ─────────────────────────────────────────────────────
+  // output: 结果输出配置
+  // ─────────────────────────────────────────────────────
+  "output": {
+    // 困难帧原始片段的输出目录名（相对于 run_dir）。
+    // 每个合并后的片段会在此目录下独占一个叶子目录，
+    // 训练器应将每个叶子目录视为独立视频。
+    "hard_case_dir": "extremely_hard_case",
+
+    // 诊断可视化拼图（对比图）的输出目录名（相对于 run_dir）。
+    // 每个困难中心生成一张拼图：img0 / 预测 / img1 / GT / 差异图。
+    "visualization_dir": "extremely_hard_case_visualization",
+
+    // JSONL 清单文件名（位于 run_dir 根目录）。
+    // 每行一条记录，包含片段路径、帧编号范围、p_wrong/p_solvable 等元数据。
+    "manifest_name": "hard_case_manifest.jsonl",
+
+    // 文件落盘方式：
+    //   "hardlink_then_copy" — 优先使用硬链接（零拷贝，同文件系统时最快），
+    //                          跨文件系统则回退为完整复制
+    //   "copy"               — 始终完整复制
+    //   "symlink"            — 创建符号链接（需注意相对路径和清理问题）
+    "link_mode": "hardlink_then_copy",
+
+    // 输出目录布局：
+    //   "segment_relative" — 每个片段的帧按相对路径保留目录结构，
+    //                        适合训练器按视频组织数据
+    //   "flat"             — 所有帧平铺在一个目录，适合小规模快速检查
+    "layout": "segment_relative",
+
+    // 是否为 review 级别的样本（p_wrong 处于中间区间）也生成诊断图。
+    // false 可显著减少诊断阶段的 I/O 和存储占用。
+    "save_review": false,
+
+    // 诊断拼图的输出宽度（像素）。拼图高度自动按比例计算。
+    // 较小的值（160～320）适合快速人工浏览；较大值（640+）便于细节审查。
+    "visualization_width": 320
+  }
+}

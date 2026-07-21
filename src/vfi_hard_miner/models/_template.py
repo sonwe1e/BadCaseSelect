@@ -22,6 +22,18 @@ File saved as ``models/rife.py``, config entry::
         "batch_size":   4,
         "factory_kwargs": {}
     }
+
+Calling the model
+-----------------
+Through ``ModelAdapter`` (normal pipeline use)::
+
+    adapter = ModelAdapter.from_config(config.model, device=device)
+    outputs = adapter(img0, img1)   # returns ModelOutputs dataclass
+
+Standalone (custom scripts, evaluation)::
+
+    model = create_model(checkpoint=..., device=device)
+    outputs = model.infer(img0, img1)   # dict with flow_t0/t1, mask0/1
 """
 
 from __future__ import annotations
@@ -41,7 +53,7 @@ class TemplateModel(nn.Module):
         #       a type annotation and a sensible default where possible.
         #
         # Example:
-        #   scale: int = 4,
+        #   base_channels: int = 32,
         #   use_attention: bool = True,
     ) -> None:
         super().__init__()
@@ -55,29 +67,53 @@ class TemplateModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Estimate midpoint optical flow and blending masks.
 
+        Called by ``ModelAdapter`` after it has already resized inputs to
+        ``(input_height, input_width)`` and moved them to the target device.
+        Do not add ``torch.no_grad()`` or device transfers here.
+
         Parameters
         ----------
         img0, img1:
             ``[B, 3, H, W]`` float32, RGB normalized to ``[0, 1]``.
-            ``ModelAdapter`` has already resized both frames to the
-            network's fixed ``(input_height, input_width)`` before
-            calling this method.
 
         Returns
         -------
         dict with keys ``flow_t0``, ``flow_t1``, ``mask0``, ``mask1``:
 
-        ``flow_t0``  ``[B, 2, h, w]``  optical flow from frame 0 to midpoint
-        ``flow_t1``  ``[B, 2, h, w]``  optical flow from frame 1 to midpoint
-        ``mask0``    ``[B, 1, h, w]``  blending weight, **already** in [0, 1]
-        ``mask1``    ``[B, 1, h, w]``  blending weight, **already** in [0, 1]
+        ``flow_t0``  ``[B, 2, h, w]``  backward flow from frame 0 to midpoint
+        ``flow_t1``  ``[B, 2, h, w]``  backward flow from frame 1 to midpoint
+        ``mask0``    ``[B, 1, h, w]``  blending weight, **already** sigmoid-normalized to [0, 1]
+        ``mask1``    ``[B, 1, h, w]``  blending weight, **already** sigmoid-normalized to [0, 1]
 
-        ``(h, w)`` may differ from ``(H, W)``.  All four tensors must
-        share the same spatial shape and reside on the same device as
-        the inputs.
+        ``(h, w)`` may differ from ``(H, W)`` (e.g. quarter resolution).
+        All four tensors must share the same spatial shape and reside on
+        the same device as the inputs.
         """
         # TODO: implement the forward pass.
         raise NotImplementedError("fill in forward before using this model")
+
+    @torch.inference_mode()
+    def infer(
+        self,
+        img0: torch.Tensor,
+        img1: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Run a single forward pass with gradient tracking disabled.
+
+        Use this when calling the model directly (e.g. in a custom
+        evaluation script).  ``ModelAdapter`` manages ``inference_mode``
+        internally, so you do not need this method when going through
+        the adapter.
+
+        Parameters
+        ----------
+        img0, img1:
+            ``[B, 3, H, W]`` float32 tensors already on the correct
+            device, RGB normalized to ``[0, 1]``.  No resizing is
+            applied — pass the network's fixed ``input_height ×
+            input_width`` directly.
+        """
+        return self(img0, img1)
 
 
 def create_model(
@@ -88,7 +124,7 @@ def create_model(
     #       passed via "factory_kwargs" in the config.
     #
     # Example (matching the constructor above):
-    #   scale: int = 4,
+    #   base_channels: int = 32,
     #   use_attention: bool = True,
 ) -> TemplateModel:
     """Factory called by ``ModelAdapter`` — do not rename or change the signature.
@@ -96,8 +132,8 @@ def create_model(
     Parameters
     ----------
     checkpoint:
-        Path to the weight file, or ``None`` for a randomly initialized
-        model (useful during development / smoke tests).
+        Path to the weight file (``state_dict``), or ``None`` for a
+        randomly initialized model (useful during development / smoke tests).
     device:
         Target device, already resolved from the runtime config.
     **extra kwargs:
@@ -105,7 +141,7 @@ def create_model(
     """
     model = TemplateModel(
         # TODO: forward constructor arguments.
-        #   scale=scale,
+        #   base_channels=base_channels,
         #   use_attention=use_attention,
     )
     if checkpoint is not None:

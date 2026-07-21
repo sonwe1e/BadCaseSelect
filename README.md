@@ -33,7 +33,69 @@ cp configs/example.json configs/my_game.json
 - `runtime.run_dir` 使用本次实验独立目录。
 - NPU 生产配置使用 `backend: "npu"`、设备 `0..7`、`workers: 8` 和 `precision: "float32"`。
 
-工具不会猜测 checkpoint key、网络输出顺序或 `mask0` 方向；接入契约见 `docs/model_adapter.md`。`configs/example.json` 中的 `ckpts/current/model.pth` 是占位路径，当前仓库并未提供这个实际 VFI checkpoint。
+工具不会猜测 checkpoint key、网络输出顺序或 `mask0` 方向；接入契约见 `docs/model_adapter.md`。  
+配置字段的详细说明见 `configs/example.jsonc`（JSONC 格式，VS Code 可渲染内联注释，运行时不能直接加载）：
+
+```bash
+cp configs/example.json configs/my_game.json
+# 参考 configs/example.jsonc 了解每个字段的含义后再修改
+```
+
+## 添加新模型
+
+`src/vfi_hard_miner/models/` 目录提供基于文件名的短名称机制：将模型文件放入该目录，即可在配置中直接用文件名引用，无需修改其他任何代码。
+
+**快速上手**
+
+```bash
+# 1. 复制模板，以目标模型命名
+cp src/vfi_hard_miner/models/_template.py src/vfi_hard_miner/models/my_model.py
+
+# 2. 填入网络结构（__init__、forward）和工厂函数（create_model）
+
+# 3. 在配置中引用
+#    "model": { "factory": "my_model", "checkpoint": "ckpts/my_model.pth", ... }
+```
+
+原有的完整路径写法保持向后兼容：
+
+```json
+"model": { "factory": "my_project.adapter:create_model", ... }
+```
+
+**内置模型**
+
+| 名称 | 文件 | 说明 |
+|------|------|------|
+| `unet` | `models/unet.py` | 轻量 UNet，两帧拼接输入，1/4 分辨率双向 flow + 混合 mask 输出 |
+
+查看当前全部可用模型：
+
+```python
+from vfi_hard_miner.models import list_models
+print(list_models())   # ['unet', ...]
+```
+
+**两种调用方式**
+
+通过 `ModelAdapter`（pipeline 正常路径，推荐）：
+
+```python
+adapter = ModelAdapter.from_config(config.model, device=device)
+outputs = adapter(img0, img1)   # 返回 ModelOutputs dataclass
+```
+
+直接调用模型（自定义评估脚本等）：
+
+```python
+import torch
+from vfi_hard_miner.models.unet import create_model
+
+model = create_model(checkpoint="ckpts/unet.pth", device=torch.device("cuda"))
+outputs = model.infer(img0, img1)   # 自动 inference_mode，返回 dict
+```
+
+`infer()` 与 `forward()` 的区别：`infer()` 由模型类直接暴露，内置 `torch.inference_mode()` 包裹，适合独立脚本调用；`forward()` 是 PyTorch 内部接口，由 `ModelAdapter` 调用。通过 adapter 使用时无需手动调用 `infer()`。
 
 ## 典型流程
 
