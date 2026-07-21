@@ -14,6 +14,11 @@ from .runtime import DeviceSpec, configure_device
 
 REQUIRED_OUTPUT_NAMES = ("flow_t0", "flow_t1", "mask0", "mask1")
 
+# Resolved once at import time so short-name lookup never hard-codes the
+# package name.  __name__ is "vfi_hard_miner.model_adapter", so rpartition
+# gives "vfi_hard_miner", and we append ".models".
+_MODELS_PACKAGE: str = __name__.rpartition(".")[0] + ".models"
+
 
 @dataclass(frozen=True)
 class ModelOutputs:
@@ -34,14 +39,35 @@ class ModelOutputs:
 
 
 def load_factory(factory_spec: str) -> Callable[..., Any]:
-    """Resolve an explicit ``module:function`` model factory."""
+    """Resolve a model factory from a short name or an explicit ``module:function`` path.
+
+    Short name (no ``:``)
+        A bare identifier like ``"rife"`` is resolved to
+        ``vfi_hard_miner.models.rife:create_model``.  The file
+        ``src/vfi_hard_miner/models/rife.py`` must therefore exist and
+        expose a ``create_model`` function.
+
+    Explicit path
+        The original ``"module.path:function"`` syntax is unchanged.
+        Dotted attribute chains (``"pkg.mod:cls.factory"``) still work.
+    """
 
     if not isinstance(factory_spec, str) or not factory_spec.strip():
-        raise ValueError("model factory must be a non-empty 'module:function' string")
-    module_name, separator, attribute_path = factory_spec.strip().partition(":")
+        raise ValueError(
+            "model factory must be a non-empty short name or 'module:function' string"
+        )
+    spec = factory_spec.strip()
+    if ":" not in spec:
+        if not spec.isidentifier():
+            raise ValueError(
+                f"model short name must be a valid Python identifier, got {spec!r}; "
+                f"use 'module:function' syntax for an explicit path"
+            )
+        spec = f"{_MODELS_PACKAGE}.{spec}:create_model"
+    module_name, separator, attribute_path = spec.partition(":")
     if not separator or not module_name or not attribute_path:
         raise ValueError(
-            f"model factory must use 'module:function' syntax, got {factory_spec!r}"
+            f"model factory must use 'module:function' syntax or a short name, got {factory_spec!r}"
         )
     try:
         value: Any = importlib.import_module(module_name)
