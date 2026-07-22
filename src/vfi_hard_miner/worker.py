@@ -9,6 +9,8 @@ import os
 from queue import Full, Queue
 import socket
 from threading import Event, Thread
+import sys
+import time
 import traceback
 from typing import Any
 
@@ -244,6 +246,52 @@ def _configure_cpu_threads(config: AppConfig) -> None:
         pass
 
 
+class _ProgressLog:
+    """Periodic stderr progress reporter, safe for concurrent worker processes.
+
+    Each worker process writes complete lines so output from different processes
+    does not interleave mid-line.  A log line is emitted at construction time
+    (task start), every ``_INTERVAL`` seconds during processing, and once on
+    ``close()`` (task end).
+    """
+
+    _INTERVAL: float = 30.0
+
+    def __init__(self, total: int, prefix: str) -> None:
+        self._total = total
+        self._prefix = prefix
+        self._done = 0
+        self._start = time.monotonic()
+        self._last = self._start
+        print(
+            f"{self._prefix}  0/{self._total}  starting",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def update(self, n: int) -> None:
+        self._done += n
+        now = time.monotonic()
+        if now - self._last >= self._INTERVAL:
+            self._emit(now)
+            self._last = now
+
+    def close(self) -> None:
+        self._emit(time.monotonic(), final=True)
+
+    def _emit(self, now: float, *, final: bool = False) -> None:
+        elapsed = now - self._start
+        rate = self._done / elapsed if elapsed > 0 else 0.0
+        pct = 100 * self._done // self._total if self._total > 0 else 0
+        label = "done" if final else "..."
+        print(
+            f"{self._prefix}  {self._done}/{self._total} ({pct}%)"
+            f"  {elapsed:.0f}s  {rate:.1f}/s  {label}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def _prefetched_decode_batches(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -446,6 +494,7 @@ def process_main_payload(
     adapter: ModelAdapter,
     config: AppConfig,
     heartbeat: Callable[[], None] | None = None,
+    progress_prefix: str = "",
 ) -> list[dict[str, Any]]:
     _validate_payload_identity(payload, config, stage="main")
     records = payload.get("triplets")
@@ -461,6 +510,7 @@ def process_main_payload(
         if heartbeat is not None:
             heartbeat()
 
+    bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vfi-main-cpu") as executor:
         for kind, value in _prefetched_decode_batches(
             records,
@@ -488,18 +538,24 @@ def process_main_payload(
                 # launches the following accelerator batch.
                 while len(pending) > max_pending:
                     drain_one()
+                if bar is not None:
+                    bar.update(len(value))
             elif kind == "invalid":
                 # Preserve source order across a decode barrier.
                 while pending:
                     drain_one()
                 record, error = value
                 output.append(_invalid_record(record, error))
+                if bar is not None:
+                    bar.update(1)
             else:  # pragma: no cover - producer owns this internal protocol
                 raise RuntimeError(f"unexpected decode event {kind!r}")
             if heartbeat is not None:
                 heartbeat()
         while pending:
             drain_one()
+    if bar is not None:
+        bar.close()
     return output
 
 
@@ -523,6 +579,8 @@ def main_worker_entry(
         validate_values=False,
     )
     _warmup_adapter(adapter, config.model, config.runtime.warmup_batches)
+    _prefix = f"[{device} W{worker_index}]"
+    print(f"{_prefix} ready", file=sys.stderr, flush=True)
     owner = f"{socket.gethostname()}:{os.getpid()}:{worker_index}:{device}"
     state_path = __import__("vfi_hard_miner.pipeline", fromlist=["run_state_path"]).run_state_path(
         config, stage="main"
@@ -531,10 +589,15 @@ def main_worker_entry(
     parts_dir.mkdir(parents=True, exist_ok=True)
     with TaskStore(state_path) as store:
         while task := store.claim(owner, lease_seconds=config.runtime.lease_seconds):
-            part_path = parts_dir / (
-                f"{task.task_id.rsplit(':', 1)[-1]}.attempt-{task.attempt}.jsonl"
+            short_id = task.task_id.rsplit(":", 1)[-1]
+            n_triplets = len(task.payload.get("triplets", ()))
+            part_path = parts_dir / f"{short_id}.attempt-{task.attempt}.jsonl"
+            print(
+                f"{_prefix} task {short_id}: {n_triplets} triplets",
+                file=sys.stderr,
+                flush=True,
             )
-
+            _t0 = time.monotonic()
             try:
                 with LeaseHeartbeat(
                     state_path,
@@ -548,9 +611,18 @@ def main_worker_entry(
                         adapter=adapter,
                         config=config,
                         heartbeat=lease.check,
+                        progress_prefix=_prefix,
                     )
                     write_jsonl_part(part_path, records)
                     lease.check()
+                _elapsed = time.monotonic() - _t0
+                _rate = n_triplets / _elapsed if _elapsed > 0 else 0.0
+                print(
+                    f"{_prefix} task {short_id}: complete"
+                    f"  {n_triplets} triplets  {_elapsed:.1f}s  {_rate:.1f}/s",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 store.complete(
                     task.task_id,
                     owner,
@@ -558,9 +630,11 @@ def main_worker_entry(
                     attempt=task.attempt,
                 )
             except LeaseLostError:
+                print(f"{_prefix} task {short_id}: lease lost", file=sys.stderr, flush=True)
                 continue
             except Exception as exc:
                 detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                print(f"{_prefix} task {short_id}: failed — {detail}", file=sys.stderr, flush=True)
                 try:
                     store.fail(
                         task.task_id,
@@ -856,6 +930,7 @@ def process_teacher_payload(
     adapter: ModelAdapter,
     config: AppConfig,
     heartbeat: Callable[[], None] | None = None,
+    progress_prefix: str = "",
 ) -> list[dict[str, Any]]:
     if config.teacher is None:
         raise RuntimeError("teacher stage requires config.teacher")
@@ -873,6 +948,7 @@ def process_teacher_payload(
         if heartbeat is not None:
             heartbeat()
 
+    bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vfi-teacher-cpu") as executor:
         for kind, value in _prefetched_decode_batches(
             records,
@@ -898,6 +974,8 @@ def process_teacher_payload(
                 )
                 while len(pending) > max_pending:
                     drain_one()
+                if bar is not None:
+                    bar.update(len(value))
             elif kind == "invalid":
                 while pending:
                     drain_one()
@@ -906,12 +984,16 @@ def process_teacher_payload(
                 failed["status"] = "review"
                 failed["teacher"] = {"error": str(error)}
                 output.append(failed)
+                if bar is not None:
+                    bar.update(1)
             else:  # pragma: no cover - producer owns this internal protocol
                 raise RuntimeError(f"unexpected decode event {kind!r}")
             if heartbeat is not None:
                 heartbeat()
         while pending:
             drain_one()
+    if bar is not None:
+        bar.close()
     return output
 
 
@@ -932,6 +1014,8 @@ def teacher_worker_entry(
         validate_values=False,
     )
     _warmup_adapter(adapter, config.teacher, config.runtime.warmup_batches)
+    _prefix = f"[{device} W{worker_index}:teacher]"
+    print(f"{_prefix} ready", file=sys.stderr, flush=True)
     owner = f"{socket.gethostname()}:{os.getpid()}:{worker_index}:{device}:teacher"
     state_path = __import__("vfi_hard_miner.pipeline", fromlist=["run_state_path"]).run_state_path(
         config, stage="teacher"
@@ -940,10 +1024,15 @@ def teacher_worker_entry(
     parts_dir.mkdir(parents=True, exist_ok=True)
     with TaskStore(state_path) as store:
         while task := store.claim(owner, lease_seconds=config.runtime.lease_seconds):
-            part_path = parts_dir / (
-                f"{task.task_id.rsplit(':', 1)[-1]}.attempt-{task.attempt}.jsonl"
+            short_id = task.task_id.rsplit(":", 1)[-1]
+            n_records = len(task.payload.get("records", ()))
+            part_path = parts_dir / f"{short_id}.attempt-{task.attempt}.jsonl"
+            print(
+                f"{_prefix} task {short_id}: {n_records} records",
+                file=sys.stderr,
+                flush=True,
             )
-
+            _t0 = time.monotonic()
             try:
                 with LeaseHeartbeat(
                     state_path,
@@ -957,9 +1046,18 @@ def teacher_worker_entry(
                         adapter=adapter,
                         config=config,
                         heartbeat=lease.check,
+                        progress_prefix=_prefix,
                     )
                     write_jsonl_part(part_path, records)
                     lease.check()
+                _elapsed = time.monotonic() - _t0
+                _rate = n_records / _elapsed if _elapsed > 0 else 0.0
+                print(
+                    f"{_prefix} task {short_id}: complete"
+                    f"  {n_records} records  {_elapsed:.1f}s  {_rate:.1f}/s",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 store.complete(
                     task.task_id,
                     owner,
@@ -967,9 +1065,11 @@ def teacher_worker_entry(
                     attempt=task.attempt,
                 )
             except LeaseLostError:
+                print(f"{_prefix} task {short_id}: lease lost", file=sys.stderr, flush=True)
                 continue
             except Exception as exc:
                 detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                print(f"{_prefix} task {short_id}: failed — {detail}", file=sys.stderr, flush=True)
                 try:
                     store.fail(
                         task.task_id,
