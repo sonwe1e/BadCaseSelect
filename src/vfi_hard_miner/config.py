@@ -52,8 +52,13 @@ class ModelConfig:
     factory_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
-        if ":" not in self.factory:
-            raise ValueError("model.factory must use 'module:function'")
+        # Accept both models/ short names (bare identifiers, resolved by
+        # load_factory) and explicit 'module:function' paths.
+        factory = self.factory.strip()
+        if ":" not in factory and not factory.isidentifier():
+            raise ValueError(
+                "model.factory must be a models/ short name or use 'module:function'"
+            )
         if self.input_height < 1 or self.input_width < 1:
             raise ValueError("model input size must be positive")
         if self.batch_size < 1:
@@ -215,18 +220,25 @@ class RuntimeConfig:
     workers: int = 1
     chunk_triplets: int = 256
     prefetch: int = 2
+    decode_cache_mb: int = 512
     cpu_threads_per_worker: int = 1
+    postproc_workers: int = 0
     warmup_batches: int = 1
     lease_seconds: int = 1800
     precision: Literal["float32", "float16", "bfloat16"] = "float32"
+    reconstruction: Literal["auto", "device", "cpu"] = "auto"
     state_db: str = "runs/state.sqlite3"
     run_dir: str = "runs/default"
 
     def validate(self) -> None:
         if self.workers < 1 or self.chunk_triplets < 1 or self.prefetch < 1:
             raise ValueError("runtime worker/chunk/prefetch values must be positive")
+        if self.decode_cache_mb < 16:
+            raise ValueError("runtime.decode_cache_mb must be >= 16")
         if self.cpu_threads_per_worker < 1:
             raise ValueError("runtime.cpu_threads_per_worker must be >= 1")
+        if self.postproc_workers < 0:
+            raise ValueError("runtime.postproc_workers must be >= 0")
         if self.warmup_batches < 0:
             raise ValueError("runtime.warmup_batches must be >= 0")
         if self.lease_seconds < 30:

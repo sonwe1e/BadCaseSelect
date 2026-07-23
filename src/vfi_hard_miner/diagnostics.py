@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 from queue import Full, Queue
 import socket
+import sys
 from threading import Event, Thread
 import traceback
 from typing import Any
@@ -26,15 +27,20 @@ import numpy as np
 import torch
 
 from .config import AppConfig, load_config
-from .image_io import read_rgb01, write_image_atomic
+from .image_io import read_rgb_uint8, rgb_uint8_to_float32, write_image_atomic
 from .manifest import merge_jsonl_parts, read_jsonl, write_jsonl_part
 from .model_adapter import ModelAdapter, ModelOutputs
 from .pipeline import execution_id, run_directory, run_state_path
-from .reconstruction import ReconstructionResult, reconstruct_midpoint
+from .reconstruction import ReconstructionResult
 from .runtime import get_spawn_context, spawn_device_workers
 from .scoring import score_local_errors
 from .state import LeaseHeartbeat, LeaseLostError, TaskRecord, TaskStore
 from .visualization import make_diagnostic_grid
+from .worker import (
+    _infer_and_reconstruct,
+    _resolve_postproc_workers,
+    _resolve_reconstruction_device,
+)
 
 
 ImageCache = OrderedDict[str, np.ndarray]
@@ -60,12 +66,12 @@ def _hwc(tensor: torch.Tensor) -> np.ndarray:
     return np.asarray(value, dtype=np.float32)
 
 
-def _load_cached(cache: ImageCache, path: str, *, max_items: int) -> np.ndarray:
+def _load_cached_uint8(cache: ImageCache, path: str, *, max_items: int) -> np.ndarray:
     existing = cache.pop(path, None)
     if existing is not None:
         cache[path] = existing
         return existing
-    image = read_rgb01(path)
+    image = read_rgb_uint8(path)
     cache[path] = image
     while len(cache) > max_items:
         cache.popitem(last=False)
@@ -85,47 +91,24 @@ def _pack_outputs_cpu(outputs: ModelOutputs, valid_count: int) -> ModelOutputs:
     return ModelOutputs(flow_t0, flow_t1, mask0, mask1)
 
 
-def _infer_batch(
+def _infer_and_reconstruct_batch(
     items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
     *,
     adapter: ModelAdapter,
     config: AppConfig,
-) -> tuple[ModelOutputs, torch.Tensor, torch.Tensor]:
+    reconstruction_device: torch.device | str | None = None,
+) -> ReconstructionResult:
     if not items:
         raise ValueError("diagnostic batch must not be empty")
-    production_batch = config.model.batch_size
-    if len(items) > production_batch:
+    if len(items) > config.model.batch_size:
         raise ValueError("diagnostic batch exceeds model.batch_size")
-    padded = list(items)
-    while len(padded) < production_batch:
-        padded.append(padded[-1])
-    img0_padded = torch.stack([_tensor_from_hwc(item[1]) for item in padded])
-    img1_padded = torch.stack([_tensor_from_hwc(item[3]) for item in padded])
-    outputs_cpu = _pack_outputs_cpu(adapter.infer(img0_padded, img1_padded), len(items))
-    img0 = img0_padded[: len(items)]
-    img1 = img1_padded[: len(items)]
-    return outputs_cpu, img0, img1
-
-
-def _reconstruct_cpu(
-    outputs_cpu: ModelOutputs,
-    img0: torch.Tensor,
-    img1: torch.Tensor,
-    *,
-    config: AppConfig,
-) -> ReconstructionResult:
-    # The expensive original-resolution CPU reconstruction never sees tail padding.
-    return reconstruct_midpoint(
-        img0,
-        img1,
-        outputs_cpu.flow_t0,
-        outputs_cpu.flow_t1,
-        outputs_cpu.mask0,
-        outputs_cpu.mask1,
-        network_size=(config.model.input_height, config.model.input_width),
-        mask0_role=config.model.mask0_role,
-        align_corners=config.model.align_corners,
-        padding_mode=config.model.padding_mode,
+    # The expensive original-resolution reconstruction never sees tail padding.
+    return _infer_and_reconstruct(
+        items,
+        adapter=adapter,
+        model_config=config.model,
+        production_batch=config.model.batch_size,
+        reconstruction_device=reconstruction_device,
     )
 
 
@@ -159,16 +142,11 @@ def _safe_destination(root: Path, relative: str) -> Path:
 
 def _finish_batch_diagnostics(
     items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
-    outputs: ModelOutputs,
-    img0_tensor: torch.Tensor,
-    img1_tensor: torch.Tensor,
+    reconstructed: ReconstructionResult,
     *,
     config: AppConfig,
     artifact_root: Path,
 ) -> list[dict[str, Any]]:
-    reconstructed = _reconstruct_cpu(
-        outputs, img0_tensor, img1_tensor, config=config
-    )
     results: list[dict[str, Any]] = []
     for index, (record, img0, gt, img1) in enumerate(items):
         prediction = _hwc(reconstructed.prediction[index])
@@ -208,8 +186,13 @@ def _prefetched_diagnostic_batches(
     batch_size: int,
     prefetch: int,
     max_cache: int,
+    cache_budget_bytes: int | None = None,
 ) -> Iterator[list[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]]]:
-    """Decode and shape-group on a bounded CPU-only producer thread."""
+    """Decode and shape-group on a bounded CPU-only producer thread.
+
+    Frames are cached as uint8 (a quarter of float32 memory) and converted to
+    float32 when each triplet item is built.
+    """
 
     queue: Queue[tuple[str, Any]] = Queue(maxsize=max(1, prefetch))
     stopped = Event()
@@ -227,6 +210,19 @@ def _prefetched_diagnostic_batches(
         cache: ImageCache = OrderedDict()
         pending: list[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]] = []
         pending_shape: tuple[int, int, int] | None = None
+        capacity = max(1, int(max_cache))
+        budget_resolved = cache_budget_bytes is None
+
+        def load(path: str) -> np.ndarray:
+            nonlocal capacity, budget_resolved
+            image = _load_cached_uint8(cache, path, max_items=capacity)
+            if not budget_resolved:
+                budget_resolved = True
+                capacity = max(
+                    1,
+                    min(capacity, max(8, int(cache_budget_bytes) // max(1, image.nbytes))),
+                )
+            return rgb_uint8_to_float32(image)
 
         def flush() -> bool:
             nonlocal pending, pending_shape
@@ -241,9 +237,9 @@ def _prefetched_diagnostic_batches(
             for record in records:
                 if stopped.is_set():
                     return
-                first = _load_cached(cache, str(record["img0"]["path"]), max_items=max_cache)
-                middle = _load_cached(cache, str(record["gt"]["path"]), max_items=max_cache)
-                last = _load_cached(cache, str(record["img1"]["path"]), max_items=max_cache)
+                first = load(str(record["img0"]["path"]))
+                middle = load(str(record["gt"]["path"]))
+                last = load(str(record["img1"]["path"]))
                 if first.shape != middle.shape or first.shape != last.shape:
                     raise ValueError(
                         f"diagnostic triplet shapes differ for {record.get('sample_id')}: "
@@ -285,6 +281,7 @@ def process_diagnostic_payload(
     config: AppConfig,
     artifact_root: Path,
     heartbeat: Any | None = None,
+    reconstruction_device: torch.device | str | None = None,
 ) -> list[dict[str, Any]]:
     if (
         payload.get("run_hash") != config.run_hash()
@@ -295,31 +292,37 @@ def process_diagnostic_payload(
     records = payload.get("records")
     if not isinstance(records, list):
         raise TypeError("diagnostic task payload must contain a records array")
-    max_cache = max(8, config.model.batch_size * 2 + 3)
+    max_cache = int(config.runtime.chunk_triplets) + 2
+    cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
     output: list[dict[str, Any]] = []
+    postproc_workers = _resolve_postproc_workers(config)
     pending_futures: list[Future[list[dict[str, Any]]]] = []
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vfi-diagnostic-cpu") as executor:
+    with ThreadPoolExecutor(
+        max_workers=postproc_workers, thread_name_prefix="vfi-diagnostic-cpu"
+    ) as executor:
         for items in _prefetched_diagnostic_batches(
             records,
             batch_size=config.model.batch_size,
             prefetch=config.runtime.prefetch,
             max_cache=max_cache,
+            cache_budget_bytes=cache_budget_bytes,
         ):
-            outputs, img0_tensor, img1_tensor = _infer_batch(
-                items, adapter=adapter, config=config
+            reconstructed = _infer_and_reconstruct_batch(
+                items,
+                adapter=adapter,
+                config=config,
+                reconstruction_device=reconstruction_device,
             )
             pending_futures.append(
                 executor.submit(
                     _finish_batch_diagnostics,
                     items,
-                    outputs,
-                    img0_tensor,
-                    img1_tensor,
+                    reconstructed,
                     config=config,
                     artifact_root=artifact_root,
                 )
             )
-            if len(pending_futures) >= config.runtime.prefetch:
+            if len(pending_futures) >= max(postproc_workers, config.runtime.prefetch):
                 output.extend(pending_futures.pop(0).result())
                 if heartbeat is not None:
                     heartbeat()
@@ -361,6 +364,18 @@ def diagnostic_worker_entry(worker_index: int, device: torch.device, config_path
     _configure_worker_threads(config)
     adapter = ModelAdapter.from_config(config.model, device=device, validate_values=False)
     _warmup(adapter, config)
+    reconstruction_device = _resolve_reconstruction_device(config, device)
+    if (
+        device.type != "cpu"
+        and reconstruction_device is None
+        and config.runtime.reconstruction == "auto"
+    ):
+        print(
+            f"[{device} W{worker_index}:diagnostic] device reconstruction "
+            "unavailable; using CPU reference",
+            file=sys.stderr,
+            flush=True,
+        )
     owner = f"{socket.gethostname()}:{os.getpid()}:{worker_index}:{device}"
     state_path = run_state_path(config, stage="diagnostic")
     parts_dir = run_directory(config) / "diagnostic_parts"
@@ -390,6 +405,7 @@ def diagnostic_worker_entry(worker_index: int, device: torch.device, config_path
                         config=config,
                         artifact_root=artifact_root,
                         heartbeat=lease.check,
+                        reconstruction_device=reconstruction_device,
                     )
                     for record in records:
                         record["task_id"] = task.task_id

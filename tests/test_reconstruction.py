@@ -155,3 +155,54 @@ def test_reconstruction_rejects_unknown_mask_role() -> None:
             network_size=(2, 3),
             mask0_role="choose_best_from_gt",  # type: ignore[arg-type]
         )
+
+# ---------------------------------------------------------------------------
+# device parameter: explicit CPU must match the reference; packed D2H helper
+# ---------------------------------------------------------------------------
+
+from vfi_hard_miner.reconstruction import pack_reconstruction_to_cpu  # noqa: E402
+
+
+def _random_reconstruction_inputs():
+    torch.manual_seed(7)
+    img0 = torch.rand((2, 3, 5, 7))
+    img1 = torch.rand((2, 3, 5, 7))
+    flow0 = (torch.rand((2, 2, 2, 3)) - 0.5) * 2.0
+    flow1 = (torch.rand((2, 2, 2, 3)) - 0.5) * 2.0
+    mask0 = torch.rand((2, 1, 2, 3))
+    mask1 = torch.rand((2, 1, 2, 3))
+    return img0, img1, flow0, flow1, mask0, mask1
+
+
+@pytest.mark.parametrize("mask0_role", ["warp0_weight", "warp1_weight"])
+@pytest.mark.parametrize("align_corners", [False, True])
+@pytest.mark.parametrize("padding_mode", ["zeros", "border", "reflection"])
+def test_explicit_cpu_device_matches_default_reference(
+    mask0_role, align_corners, padding_mode
+) -> None:
+    inputs = _random_reconstruction_inputs()
+    kwargs = dict(
+        network_size=(2, 3),
+        mask0_role=mask0_role,
+        align_corners=align_corners,
+        padding_mode=padding_mode,
+    )
+    reference = reconstruct_midpoint(*inputs, **kwargs)
+    explicit = reconstruct_midpoint(*inputs, **kwargs, device="cpu")
+    for name, tensor in reference.__dict__.items():
+        torch.testing.assert_close(explicit.__dict__[name], tensor)
+        assert explicit.__dict__[name].device.type == "cpu"
+
+
+def test_pack_reconstruction_to_cpu_round_trips_all_fields() -> None:
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    packed = pack_reconstruction_to_cpu(result)
+    for name, tensor in result.__dict__.items():
+        field = packed.__dict__[name]
+        assert field.device.type == "cpu"
+        assert field.dtype == torch.float32
+        torch.testing.assert_close(field, tensor)

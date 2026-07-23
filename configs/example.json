@@ -39,10 +39,13 @@
     "workers": 8,
     "chunk_triplets": 256,
     "prefetch": 2,
+    "decode_cache_mb": 512,
     "cpu_threads_per_worker": 16,
+    "postproc_workers": 0,
     "warmup_batches": 2,
     "lease_seconds": 1800,
     "precision": "float32",
+    "reconstruction": "auto",
     "state_db": "runs/state.sqlite3",
     "run_dir": "runs/game_name"
   },

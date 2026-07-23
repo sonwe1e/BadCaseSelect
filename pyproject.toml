@@ -13,6 +13,7 @@ authors = [{ name = "VFI Hard Miner contributors" }]
 dependencies = [
   "numpy>=1.26,<3",
   "Pillow>=10,<13",
+  "scipy>=1.13,<2",
 ]
 
 [project.scripts]

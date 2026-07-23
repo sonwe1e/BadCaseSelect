@@ -140,3 +140,75 @@ def test_primary_region_prefers_central_structure_over_static_edge_hud():
     assert primary.metrics["priority_weight"] == pytest.approx(1.0)
     assert result.mining_p_wrong == pytest.approx(result.p_wrong)
     assert result.metrics["selected_mining_p_wrong"] == pytest.approx(result.p_wrong)
+
+
+# ---------------------------------------------------------------------------
+# _binary_component_count / _edge_endpoint_count vs brute-force references
+# ---------------------------------------------------------------------------
+
+from vfi_hard_miner.diagnosis import (  # noqa: E402
+    _binary_component_count,
+    _edge_endpoint_count,
+)
+
+
+def _reference_component_count(binary):
+    remaining = binary.copy()
+    height, width = remaining.shape
+    count = 0
+    for y in range(height):
+        for x in range(width):
+            if not remaining[y, x]:
+                continue
+            count += 1
+            remaining[y, x] = False
+            stack = [(y, x)]
+            while stack:
+                cy, cx = stack.pop()
+                for ny in (cy - 1, cy, cy + 1):
+                    for nx in (cx - 1, cx, cx + 1):
+                        if (
+                            0 <= ny < height
+                            and 0 <= nx < width
+                            and remaining[ny, nx]
+                        ):
+                            remaining[ny, nx] = False
+                            stack.append((ny, nx))
+    return count
+
+
+def _reference_endpoint_count(binary):
+    height, width = binary.shape
+    count = 0
+    for y in range(height):
+        for x in range(width):
+            if not binary[y, x]:
+                continue
+            neighbours = 0
+            for ny in (y - 1, y, y + 1):
+                for nx in (x - 1, x, x + 1):
+                    if (ny, nx) == (y, x):
+                        continue
+                    if 0 <= ny < height and 0 <= nx < width and binary[ny, nx]:
+                        neighbours += 1
+            if neighbours <= 1:
+                count += 1
+    return count
+
+
+def test_binary_component_count_matches_brute_force_on_known_shapes():
+    edge_map = np.zeros((12, 12), dtype=np.float32)
+    # Two eight-connected islands, one of them diagonal-linked.
+    edge_map[1, 1] = edge_map[2, 2] = edge_map[2, 3] = 1.0
+    edge_map[8:10, 8:10] = 1.0
+    assert _binary_component_count(edge_map, 0.5) == 2
+    assert _binary_component_count(np.zeros((4, 4), dtype=np.float32), 0.5) == 0
+
+
+@pytest.mark.parametrize("density", [0.02, 0.1, 0.3])
+def test_edge_feature_counts_match_brute_force_on_random_maps(density):
+    rng = np.random.default_rng(987)
+    edge_map = np.asarray(rng.random((33, 41)), dtype=np.float32)
+    binary = edge_map >= 0.5
+    assert _binary_component_count(edge_map, 0.5) == _reference_component_count(binary)
+    assert _edge_endpoint_count(edge_map, 0.5) == _reference_endpoint_count(binary)

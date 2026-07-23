@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .config import AppConfig, load_config
 from .diagnosis import (
@@ -31,11 +32,15 @@ from .gates import (
     evaluate_in_scope,
     evaluate_validity,
 )
-from .image_io import read_rgb01
+from .image_io import read_rgb_uint8, rgb_uint8_to_float32
 from .manifest import write_jsonl_part
 from .model_adapter import ModelAdapter, ModelOutputs
 from .pipeline import run_directory
-from .reconstruction import ReconstructionResult, reconstruct_midpoint
+from .reconstruction import (
+    ReconstructionResult,
+    pack_reconstruction_to_cpu,
+    reconstruct_midpoint,
+)
 from .scoring import score_local_errors, score_region
 from .state import LeaseHeartbeat, LeaseLostError, TaskStore
 
@@ -56,12 +61,14 @@ def _hwc(tensor: torch.Tensor) -> np.ndarray:
     return np.asarray(value, dtype=np.float32)
 
 
-def _load_cached(cache: ImageCache, path: str, *, max_items: int) -> np.ndarray:
+def _load_cached_uint8(cache: ImageCache, path: str, *, max_items: int) -> np.ndarray:
+    """LRU frame cache in uint8 form (4x less memory than float32)."""
+
     existing = cache.pop(path, None)
     if existing is not None:
         cache[path] = existing
         return existing
-    image = read_rgb01(path)
+    image = read_rgb_uint8(path)
     cache[path] = image
     while len(cache) > max_items:
         cache.popitem(last=False)
@@ -246,6 +253,59 @@ def _configure_cpu_threads(config: AppConfig) -> None:
         pass
 
 
+def _probe_device_reconstruction(device: torch.device) -> bool:
+    """Return True if ``device`` can run the reconstruction's grid_sample."""
+
+    try:
+        image = torch.zeros((1, 3, 8, 8), dtype=torch.float32, device=device)
+        grid = torch.zeros((1, 8, 8, 2), dtype=torch.float32, device=device)
+        warped = F.grid_sample(
+            image,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        return bool(torch.isfinite(warped).all())
+    except Exception:
+        return False
+
+
+def _resolve_reconstruction_device(
+    config: AppConfig, device: torch.device
+) -> torch.device | None:
+    """Pick the reconstruction device per ``runtime.reconstruction``.
+
+    Returns ``None`` for the CPU reference path.  ``"auto"`` probes the
+    accelerator once and silently degrades to CPU when grid_sample is
+    unavailable; ``"device"`` forces the accelerator and fails loudly.
+    """
+
+    mode = config.runtime.reconstruction
+    if mode == "cpu" or device.type == "cpu":
+        return None
+    if mode == "device":
+        return device
+    if _probe_device_reconstruction(device):
+        return device
+    return None
+
+
+def _resolve_postproc_workers(config: AppConfig) -> int:
+    """Resolve the CPU postprocess thread count for one worker process.
+
+    ``runtime.postproc_workers == 0`` selects an automatic count derived from
+    the per-worker CPU budget; scipy/numpy release the GIL on the heavy paths,
+    so these threads achieve real parallelism on reconstruction-free scoring.
+    """
+
+    configured = int(config.runtime.postproc_workers)
+    if configured > 0:
+        return configured
+    automatic = max(1, int(config.runtime.cpu_threads_per_worker) // 4)
+    return min(automatic, 8)
+
+
 class _ProgressLog:
     """Periodic stderr progress reporter, safe for concurrent worker processes.
 
@@ -298,12 +358,19 @@ def _prefetched_decode_batches(
     batch_size: int,
     prefetch: int,
     max_cache: int,
+    cache_budget_bytes: int | None = None,
 ) -> Iterator[DecodeEvent]:
     """Decode/group triplets on one bounded producer thread.
 
     The producer only performs CPU file I/O and shape grouping.  Model calls
     remain on the worker's main thread, so the producer never touches a CANN,
     CUDA, or NPU context.
+
+    Frames are cached as uint8 (a quarter of float32 memory) so a large cache
+    can cover a whole stride=1 chunk; conversion to float32 happens when each
+    triplet item is built, so downstream consumers still see the usual
+    float32 arrays.  ``cache_budget_bytes`` caps cache memory once the first
+    frame's size is known.
     """
 
     queue: Queue[DecodeEvent] = Queue(maxsize=max(1, prefetch))
@@ -322,6 +389,19 @@ def _prefetched_decode_batches(
         cache: ImageCache = OrderedDict()
         pending: list[DecodedItem] = []
         pending_shape: tuple[int, int, int] | None = None
+        capacity = max(1, int(max_cache))
+        budget_resolved = cache_budget_bytes is None
+
+        def load(path: str) -> np.ndarray:
+            nonlocal capacity, budget_resolved
+            image = _load_cached_uint8(cache, path, max_items=capacity)
+            if not budget_resolved:
+                budget_resolved = True
+                capacity = max(
+                    1,
+                    min(capacity, max(8, int(cache_budget_bytes) // max(1, image.nbytes))),
+                )
+            return rgb_uint8_to_float32(image)
 
         def flush() -> bool:
             nonlocal pending, pending_shape
@@ -337,21 +417,9 @@ def _prefetched_decode_batches(
                 if stopped.is_set():
                     return
                 try:
-                    first = _load_cached(
-                        cache,
-                        str(record["img0"]["path"]),
-                        max_items=max_cache,
-                    )
-                    middle = _load_cached(
-                        cache,
-                        str(record["gt"]["path"]),
-                        max_items=max_cache,
-                    )
-                    last = _load_cached(
-                        cache,
-                        str(record["img1"]["path"]),
-                        max_items=max_cache,
-                    )
+                    first = load(str(record["img0"]["path"]))
+                    middle = load(str(record["gt"]["path"]))
+                    last = load(str(record["img1"]["path"]))
                     if first.shape != middle.shape or first.shape != last.shape:
                         raise ValueError(
                             "triplet image shapes differ: "
@@ -411,14 +479,40 @@ def _infer_output_batch(
     return img0_tensor[:valid_count], img1_tensor[:valid_count], outputs
 
 
+def _trim_model_outputs(outputs: ModelOutputs, valid_count: int) -> ModelOutputs:
+    """Drop tail padding on-device (a cheap slice, no host synchronization)."""
+
+    if valid_count < 1 or valid_count > outputs.flow_t0.shape[0]:
+        raise ValueError(
+            f"valid_count must be between 1 and output batch "
+            f"{outputs.flow_t0.shape[0]}, got {valid_count}"
+        )
+    if valid_count == outputs.flow_t0.shape[0]:
+        return outputs
+    return ModelOutputs(
+        outputs.flow_t0[:valid_count],
+        outputs.flow_t1[:valid_count],
+        outputs.mask0[:valid_count],
+        outputs.mask1[:valid_count],
+    )
+
+
 def _reconstruct_outputs(
     img0_tensor: torch.Tensor,
     img1_tensor: torch.Tensor,
     outputs: ModelOutputs,
     *,
     model_config: Any,
+    device: torch.device | str | None = None,
 ) -> ReconstructionResult:
-    return reconstruct_midpoint(
+    """Run reconstruction on ``device`` and return CPU tensors.
+
+    ``device=None`` keeps the calibrated CPU reference path.  On accelerator
+    devices the native-resolution warps run there and the result returns to
+    the host in one packed transfer, so CPU threads only ever score.
+    """
+
+    reconstructed = reconstruct_midpoint(
         img0_tensor,
         img1_tensor,
         outputs.flow_t0,
@@ -429,20 +523,54 @@ def _reconstruct_outputs(
         mask0_role=model_config.mask0_role,
         align_corners=model_config.align_corners,
         padding_mode=model_config.padding_mode,
+        device=device,
+    )
+    if reconstructed.prediction.device.type != "cpu":
+        reconstructed = pack_reconstruction_to_cpu(reconstructed)
+    return reconstructed
+
+
+def _infer_and_reconstruct(
+    items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
+    *,
+    adapter: ModelAdapter,
+    model_config: Any,
+    production_batch: int,
+    reconstruction_device: torch.device | str | None = None,
+) -> ReconstructionResult:
+    """Inference + reconstruction on the worker's main thread.
+
+    Model outputs never round-trip to the host before reconstruction: on
+    accelerator devices the reconstruction consumes them in place, and only
+    the finished native-resolution result is transferred back (packed).
+    """
+
+    if not items:
+        raise ValueError("inference batch must not be empty")
+    valid_count = len(items)
+    padded = list(items)
+    while len(padded) < production_batch:
+        padded.append(padded[-1])
+    img0_tensor = torch.stack([_tensor_from_hwc(item[1]) for item in padded])
+    img1_tensor = torch.stack([_tensor_from_hwc(item[3]) for item in padded])
+    outputs = _trim_model_outputs(
+        adapter.infer(img0_tensor, img1_tensor), valid_count
+    )
+    return _reconstruct_outputs(
+        img0_tensor[:valid_count],
+        img1_tensor[:valid_count],
+        outputs,
+        model_config=model_config,
+        device=reconstruction_device,
     )
 
 
 def _finish_main_batch(
     items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
-    img0_tensor: torch.Tensor,
-    img1_tensor: torch.Tensor,
-    outputs: ModelOutputs,
+    reconstructed: ReconstructionResult,
     *,
     config: AppConfig,
 ) -> list[dict[str, Any]]:
-    reconstructed = _reconstruct_outputs(
-        img0_tensor, img1_tensor, outputs, model_config=config.model
-    )
     return [
         _sample_record(
             item[0],
@@ -462,17 +590,20 @@ def _evaluate_batch(
     *,
     adapter: ModelAdapter,
     config: AppConfig,
+    reconstruction_device: torch.device | str | None = None,
 ) -> list[dict[str, Any]]:
     if not items:
         return []
-    img0_tensor, img1_tensor, outputs = _infer_output_batch(
-        items, adapter=adapter, production_batch=config.model.batch_size
+    reconstructed = _infer_and_reconstruct(
+        items,
+        adapter=adapter,
+        model_config=config.model,
+        production_batch=config.model.batch_size,
+        reconstruction_device=reconstruction_device,
     )
     return _finish_main_batch(
         items,
-        img0_tensor,
-        img1_tensor,
-        outputs,
+        reconstructed,
         config=config,
     )
 
@@ -495,14 +626,17 @@ def process_main_payload(
     config: AppConfig,
     heartbeat: Callable[[], None] | None = None,
     progress_prefix: str = "",
+    reconstruction_device: torch.device | str | None = None,
 ) -> list[dict[str, Any]]:
     _validate_payload_identity(payload, config, stage="main")
     records = payload.get("triplets")
     if not isinstance(records, list):
         raise TypeError("main task payload must contain a triplets array")
-    max_cache = max(8, config.model.batch_size * 2 + 3)
+    max_cache = int(config.runtime.chunk_triplets) + 2
+    cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
     output: list[dict[str, Any]] = []
-    max_pending = max(1, config.runtime.prefetch)
+    postproc_workers = _resolve_postproc_workers(config)
+    max_pending = max(postproc_workers, config.runtime.prefetch)
     pending: list[Future[list[dict[str, Any]]]] = []
 
     def drain_one() -> None:
@@ -511,26 +645,29 @@ def process_main_payload(
             heartbeat()
 
     bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vfi-main-cpu") as executor:
+    with ThreadPoolExecutor(
+        max_workers=postproc_workers, thread_name_prefix="vfi-main-cpu"
+    ) as executor:
         for kind, value in _prefetched_decode_batches(
             records,
             batch_size=config.model.batch_size,
             prefetch=config.runtime.prefetch,
             max_cache=max_cache,
+            cache_budget_bytes=cache_budget_bytes,
         ):
             if kind == "batch":
-                img0_tensor, img1_tensor, outputs = _infer_output_batch(
+                reconstructed = _infer_and_reconstruct(
                     value,
                     adapter=adapter,
+                    model_config=config.model,
                     production_batch=config.model.batch_size,
+                    reconstruction_device=reconstruction_device,
                 )
                 pending.append(
                     executor.submit(
                         _finish_main_batch,
                         value,
-                        img0_tensor,
-                        img1_tensor,
-                        outputs,
+                        reconstructed,
                         config=config,
                     )
                 )
@@ -580,7 +717,22 @@ def main_worker_entry(
     )
     _warmup_adapter(adapter, config.model, config.runtime.warmup_batches)
     _prefix = f"[{device} W{worker_index}]"
-    print(f"{_prefix} ready", file=sys.stderr, flush=True)
+    reconstruction_device = _resolve_reconstruction_device(config, device)
+    if (
+        device.type != "cpu"
+        and reconstruction_device is None
+        and config.runtime.reconstruction == "auto"
+    ):
+        print(
+            f"{_prefix} device reconstruction unavailable; using CPU reference",
+            file=sys.stderr,
+            flush=True,
+        )
+    print(
+        f"{_prefix} ready (reconstruction: {reconstruction_device or 'cpu'})",
+        file=sys.stderr,
+        flush=True,
+    )
     owner = f"{socket.gethostname()}:{os.getpid()}:{worker_index}:{device}"
     state_path = __import__("vfi_hard_miner.pipeline", fromlist=["run_state_path"]).run_state_path(
         config, stage="main"
@@ -612,6 +764,7 @@ def main_worker_entry(
                         config=config,
                         heartbeat=lease.check,
                         progress_prefix=_prefix,
+                        reconstruction_device=reconstruction_device,
                     )
                     write_jsonl_part(part_path, records)
                     lease.check()
@@ -879,39 +1032,32 @@ def _evaluate_teacher_batch(
     *,
     adapter: ModelAdapter,
     config: AppConfig,
+    reconstruction_device: torch.device | str | None = None,
 ) -> list[dict[str, Any]]:
     if not items or config.teacher is None:
         return []
-    img0_tensor, img1_tensor, outputs = _infer_output_batch(
+    reconstructed = _infer_and_reconstruct(
         items,
         adapter=adapter,
+        model_config=config.teacher,
         production_batch=config.teacher.batch_size,
+        reconstruction_device=reconstruction_device,
     )
     return _finish_teacher_batch(
         items,
-        img0_tensor,
-        img1_tensor,
-        outputs,
+        reconstructed,
         config=config,
     )
 
 
 def _finish_teacher_batch(
     items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
-    img0_tensor: torch.Tensor,
-    img1_tensor: torch.Tensor,
-    outputs: ModelOutputs,
+    reconstructed: ReconstructionResult,
     *,
     config: AppConfig,
 ) -> list[dict[str, Any]]:
     if config.teacher is None:
         raise RuntimeError("teacher postprocess requires config.teacher")
-    reconstructed = _reconstruct_outputs(
-        img0_tensor,
-        img1_tensor,
-        outputs,
-        model_config=config.teacher,
-    )
     return [
         _teacher_update_record(
             item[0],
@@ -931,6 +1077,7 @@ def process_teacher_payload(
     config: AppConfig,
     heartbeat: Callable[[], None] | None = None,
     progress_prefix: str = "",
+    reconstruction_device: torch.device | str | None = None,
 ) -> list[dict[str, Any]]:
     if config.teacher is None:
         raise RuntimeError("teacher stage requires config.teacher")
@@ -938,9 +1085,11 @@ def process_teacher_payload(
     records = payload.get("records")
     if not isinstance(records, list):
         raise TypeError("teacher task payload must contain a records array")
-    max_cache = max(8, config.teacher.batch_size * 2 + 3)
+    max_cache = int(config.runtime.chunk_triplets) + 2
+    cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
     output: list[dict[str, Any]] = []
-    max_pending = max(1, config.runtime.prefetch)
+    postproc_workers = _resolve_postproc_workers(config)
+    max_pending = max(postproc_workers, config.runtime.prefetch)
     pending: list[Future[list[dict[str, Any]]]] = []
 
     def drain_one() -> None:
@@ -949,26 +1098,29 @@ def process_teacher_payload(
             heartbeat()
 
     bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="vfi-teacher-cpu") as executor:
+    with ThreadPoolExecutor(
+        max_workers=postproc_workers, thread_name_prefix="vfi-teacher-cpu"
+    ) as executor:
         for kind, value in _prefetched_decode_batches(
             records,
             batch_size=config.teacher.batch_size,
             prefetch=config.runtime.prefetch,
             max_cache=max_cache,
+            cache_budget_bytes=cache_budget_bytes,
         ):
             if kind == "batch":
-                img0_tensor, img1_tensor, outputs = _infer_output_batch(
+                reconstructed = _infer_and_reconstruct(
                     value,
                     adapter=adapter,
+                    model_config=config.teacher,
                     production_batch=config.teacher.batch_size,
+                    reconstruction_device=reconstruction_device,
                 )
                 pending.append(
                     executor.submit(
                         _finish_teacher_batch,
                         value,
-                        img0_tensor,
-                        img1_tensor,
-                        outputs,
+                        reconstructed,
                         config=config,
                     )
                 )
@@ -1015,7 +1167,22 @@ def teacher_worker_entry(
     )
     _warmup_adapter(adapter, config.teacher, config.runtime.warmup_batches)
     _prefix = f"[{device} W{worker_index}:teacher]"
-    print(f"{_prefix} ready", file=sys.stderr, flush=True)
+    reconstruction_device = _resolve_reconstruction_device(config, device)
+    if (
+        device.type != "cpu"
+        and reconstruction_device is None
+        and config.runtime.reconstruction == "auto"
+    ):
+        print(
+            f"{_prefix} device reconstruction unavailable; using CPU reference",
+            file=sys.stderr,
+            flush=True,
+        )
+    print(
+        f"{_prefix} ready (reconstruction: {reconstruction_device or 'cpu'})",
+        file=sys.stderr,
+        flush=True,
+    )
     owner = f"{socket.gethostname()}:{os.getpid()}:{worker_index}:{device}:teacher"
     state_path = __import__("vfi_hard_miner.pipeline", fromlist=["run_state_path"]).run_state_path(
         config, stage="teacher"
@@ -1047,6 +1214,7 @@ def teacher_worker_entry(
                         config=config,
                         heartbeat=lease.check,
                         progress_prefix=_prefix,
+                        reconstruction_device=reconstruction_device,
                     )
                     write_jsonl_part(part_path, records)
                     lease.check()

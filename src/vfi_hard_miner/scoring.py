@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from scipy.ndimage import find_objects as _nd_find_objects
+from scipy.ndimage import label as _nd_label
+from scipy.ndimage import maximum as _nd_maximum
+from scipy.ndimage import sum as _nd_sum
 
 from .schemas import RegionBox
 
@@ -431,8 +435,72 @@ class _Component:
     perimeter: float
 
 
+_STRUCTURE_8_CONNECTED = np.ones((3, 3), dtype=np.uint8)
+
+
 def _extract_components(mask: np.ndarray, values: np.ndarray) -> list[_Component]:
-    """Eight-connected components using row runs instead of per-pixel Python BFS."""
+    """Eight-connected components with vectorized per-component statistics.
+
+    Implements true eight-connectivity: components separated by a one-pixel
+    background gap on consecutive rows stay distinct.  The legacy run-based
+    implementation below over-merged such pairs (its overlap test accepted
+    ``px1 == x0 - 1``), so the two can disagree on component counts; the
+    legacy version is kept only as an approximate reference for tests.
+
+    Perimeter identity: ``4*area - 2*(horizontal_pairs + vertical_pairs)``
+    equals the legacy run formula ``sum(2 + 2*length) - 2*overlap`` because
+    ``area - horizontal_pairs`` equals the number of row runs (each run of
+    length L contributes L pixels and L-1 horizontal adjacencies).
+    """
+
+    if mask.shape != values.shape or mask.ndim != 2:
+        raise ValueError("mask and values must be equally-shaped 2-D arrays")
+    labeled, count = _nd_label(
+        np.asarray(mask, dtype=np.uint8), structure=_STRUCTURE_8_CONNECTED
+    )
+    if count == 0:
+        return []
+    index = np.arange(1, count + 1)
+    area = np.bincount(labeled.reshape(-1), minlength=count + 1)[1:]
+    total = _nd_sum(
+        np.asarray(values, dtype=np.float64), labels=labeled, index=index
+    )
+    peak = _nd_maximum(values, labels=labeled, index=index)
+    left, right = labeled[:, :-1], labeled[:, 1:]
+    horizontal = left[(left == right) & (left > 0)]
+    horizontal_pairs = np.bincount(horizontal, minlength=count + 1)[1:]
+    up, down = labeled[:-1, :], labeled[1:, :]
+    vertical = up[(up == down) & (up > 0)]
+    vertical_pairs = np.bincount(vertical, minlength=count + 1)[1:]
+    perimeter = 4 * area - 2 * (horizontal_pairs + vertical_pairs)
+    slices = _nd_find_objects(labeled)
+    components: list[_Component] = []
+    for label_id in index:
+        region = slices[label_id - 1]
+        if region is None:  # pragma: no cover - labels are dense by construction
+            continue
+        position = label_id - 1
+        components.append(
+            _Component(
+                region[1].start,
+                region[0].start,
+                region[1].stop,
+                region[0].stop,
+                int(area[position]),
+                float(total[position]),
+                float(peak[position]),
+                float(perimeter[position]),
+            )
+        )
+    return components
+
+
+def _extract_components_legacy(mask: np.ndarray, values: np.ndarray) -> list[_Component]:
+    """Eight-connected components using row runs instead of per-pixel Python BFS.
+
+    Kept as the reference implementation for equivalence tests; the vectorized
+    ``_extract_components`` above replaces it on the hot path.
+    """
 
     if mask.shape != values.shape or mask.ndim != 2:
         raise ValueError("mask and values must be equally-shaped 2-D arrays")

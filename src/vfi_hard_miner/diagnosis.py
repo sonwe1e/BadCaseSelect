@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from scipy.ndimage import convolve as _nd_convolve
+from scipy.ndimage import label as _nd_label
 
 from .schemas import RegionBox
 from .scoring import (
@@ -292,42 +294,35 @@ def _crop(values: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
     return values[y0:y1, x0:x1]
 
 
+_NEIGHBOR_KERNEL_3X3 = np.ones((3, 3), dtype=np.int32)
+_NEIGHBOR_KERNEL_3X3[1, 1] = 0
+_STRUCTURE_8_CONNECTED = np.ones((3, 3), dtype=np.uint8)
+
+
 def _edge_endpoint_count(edge_map: np.ndarray, threshold: float) -> int:
+    """Count edge pixels with at most one thresholded 8-neighbour.
+
+    Vectorized equivalent of the former pad-and-shift implementation: a
+    zero-padded 3x3 convolution with a hollow kernel counts neighbours exactly.
+    """
+
     binary = edge_map >= threshold
     if not np.any(binary):
         return 0
-    padded = np.pad(binary.astype(np.uint8), ((1, 1), (1, 1)), mode="constant")
-    neighbors = np.zeros(binary.shape, dtype=np.uint8)
-    for y_offset in range(3):
-        for x_offset in range(3):
-            if y_offset == 1 and x_offset == 1:
-                continue
-            neighbors += padded[
-                y_offset : y_offset + binary.shape[0],
-                x_offset : x_offset + binary.shape[1],
-            ]
+    neighbors = _nd_convolve(
+        binary.astype(np.int32), _NEIGHBOR_KERNEL_3X3, mode="constant", cval=0
+    )
     return int(np.count_nonzero(binary & (neighbors <= 1)))
 
 
 def _binary_component_count(edge_map: np.ndarray, threshold: float) -> int:
     """Count eight-connected edge islands inside a small candidate crop."""
 
-    remaining = edge_map >= threshold
-    count = 0
-    height, width = remaining.shape
-    while np.any(remaining):
-        start_y, start_x = np.argwhere(remaining)[0]
-        remaining[start_y, start_x] = False
-        stack = [(int(start_y), int(start_x))]
-        count += 1
-        while stack:
-            y, x = stack.pop()
-            for next_y in range(max(0, y - 1), min(height, y + 2)):
-                for next_x in range(max(0, x - 1), min(width, x + 2)):
-                    if remaining[next_y, next_x]:
-                        remaining[next_y, next_x] = False
-                        stack.append((next_y, next_x))
-    return count
+    binary = edge_map >= threshold
+    if not np.any(binary):
+        return 0
+    _, count = _nd_label(binary.astype(np.uint8), structure=_STRUCTURE_8_CONNECTED)
+    return int(count)
 
 
 def _branch_error(

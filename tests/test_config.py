@@ -145,11 +145,21 @@ def test_config_rejects_reversed_scope_gray_zone(tmp_path):
 
 def test_config_rejects_ambiguous_factory(tmp_path):
     payload = _payload(tmp_path)
-    payload["model"]["factory"] = "some_module"
+    # Neither a valid short-name identifier nor 'module:function' syntax.
+    payload["model"]["factory"] = "not a factory"
     path = tmp_path / "config.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="module:function"):
         load_config(path)
+
+
+def test_config_accepts_short_name_factory(tmp_path):
+    payload = _payload(tmp_path)
+    payload["model"]["factory"] = "unet"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    config = load_config(path)
+    assert config.model.factory == "unet"
 
 
 def test_config_allows_fixed_frame_digits(tmp_path):

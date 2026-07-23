@@ -286,10 +286,9 @@ def test_inference_overlaps_cpu_finish_and_preserves_batch_order(
         yield "batch", first_batch
         yield "batch", tail_batch
 
-    def finish(items, img0, img1, outputs, *, config):
+    def finish(items, reconstructed, *, config):
         finish_threads.append(threading.current_thread().name)
-        assert img0.shape[0] == img1.shape[0] == len(items)
-        assert outputs.flow_t0.shape[0] == len(items)
+        assert reconstructed.prediction.shape[0] == len(items)
         if items[0][0]["sample_id"] == "first":
             cpu_started.set()
             assert second_inference_started.wait(timeout=2.0)
@@ -676,3 +675,88 @@ def test_worker_payloads_reject_another_execution_snapshot(tmp_path):
             adapter=None,
             config=config,
         )
+
+
+# ---------------------------------------------------------------------------
+# runtime.postproc_workers: resolution and executor propagation
+# ---------------------------------------------------------------------------
+
+import dataclasses  # noqa: E402
+
+
+def test_resolve_postproc_workers_explicit_and_auto():
+    from vfi_hard_miner.worker import _resolve_postproc_workers
+
+    def resolve(**runtime_overrides):
+        config = _parallel_test_config()
+        runtime = dataclasses.replace(config.runtime, **runtime_overrides)
+        return _resolve_postproc_workers(dataclasses.replace(config, runtime=runtime))
+
+    assert resolve(postproc_workers=5) == 5
+    assert resolve(postproc_workers=0, cpu_threads_per_worker=1) == 1
+    assert resolve(postproc_workers=0, cpu_threads_per_worker=16) == 4
+    assert resolve(postproc_workers=0, cpu_threads_per_worker=128) == 8
+
+
+def test_negative_postproc_workers_fails_validation():
+    runtime = RuntimeConfig(postproc_workers=-1)
+    with pytest.raises(ValueError, match="postproc_workers"):
+        runtime.validate()
+
+
+def test_postproc_workers_propagates_to_executor(monkeypatch):
+    config = _parallel_test_config(batch_size=2, prefetch=1)
+    runtime = dataclasses.replace(config.runtime, postproc_workers=3)
+    config = dataclasses.replace(config, runtime=runtime)
+    created_workers = []
+    real_executor = worker_module.ThreadPoolExecutor
+
+    class _RecordingExecutor(real_executor):
+        def __init__(self, max_workers=None, **kwargs):
+            created_workers.append(max_workers)
+            super().__init__(max_workers=max_workers, **kwargs)
+
+    item = _decoded_item("only", 0.25)
+    item[0]["frame_indices"] = [1, 2, 3]
+    item[0]["stride"] = 1
+    batch = [item]
+
+    def decoded_batches(*args, **kwargs):
+        yield "batch", batch
+
+    monkeypatch.setattr(worker_module, "_validate_payload_identity", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "_prefetched_decode_batches", decoded_batches)
+    monkeypatch.setattr(worker_module, "ThreadPoolExecutor", _RecordingExecutor)
+
+    result = process_main_payload(
+        {"run_hash": config.run_hash(), "stage": "main", "triplets": []},
+        adapter=_RecordingAdapter(),
+        config=config,
+    )
+
+    assert created_workers == [3]
+    assert [record["sample_id"] for record in result] == ["only"]
+
+
+def test_decode_prefetch_respects_cache_budget_and_still_yields_batches(tmp_path):
+    image_path = tmp_path / "frame.png"
+    _save(image_path, np.zeros((8, 8, 3), dtype=np.uint8))
+
+    def record(sample_id):
+        frame = {"path": str(image_path)}
+        return {"sample_id": sample_id, "img0": frame, "gt": frame, "img1": frame}
+
+    events = list(
+        _prefetched_decode_batches(
+            [record("a"), record("b")],
+            batch_size=2,
+            prefetch=1,
+            max_cache=258,
+            cache_budget_bytes=16 * 1024 * 1024,
+        )
+    )
+
+    assert [kind for kind, _ in events] == ["batch"]
+    batch = events[0][1]
+    assert [item[0]["sample_id"] for item in batch] == ["a", "b"]
+    assert batch[0][1].dtype == np.float32

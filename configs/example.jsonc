@@ -156,9 +156,20 @@
     // 内存充足时可适当增大（4～8）以提高吞吐；内存紧张时设为 1。
     "prefetch": 2,
 
+    // 每个 worker 的图片解码缓存上限（MB）。帧以 uint8 缓存（比 float32
+    // 省 4 倍内存），缓存帧数 = min(本预算 / 单帧字节数, chunk_triplets + 2)。
+    // stride=1 时缓存覆盖整个 chunk 即可实现每帧只解码一次；4K 帧约 24MB/帧，
+    // 512MB 约缓存 21 帧。内存紧张时下限为 16。
+    "decode_cache_mb": 512,
+
     // 每个 worker 进程的 CPU 线程数（用于 PyTorch/OpenCV 内部并行）。
     // 多 worker 时建议 cpu_threads_per_worker × workers ≤ 物理核心数。
     "cpu_threads_per_worker": 16,
+
+    // 每个 worker 的 CPU 后处理线程数（重建结果的评分与诊断）。
+    // 0 表示自动：min(8, cpu_threads_per_worker / 4)。评分热点已由 scipy/
+    // numpy 在 C 层执行并释放 GIL，多线程可获得真实并行；设为 1 可复现旧行为。
+    "postproc_workers": 0,
 
     // 每个 worker 在正式推理前运行的预热批数。
     // 预热使 NPU JIT / 算子缓存充分预热，避免前几批延迟偏高影响统计。
@@ -173,6 +184,14 @@
     //   "float32" — 最高精度，Ascend 910B 生产必须使用此值
     //   "float16" — 半精度，CUDA 调试/加速时可使用
     "precision": "float32",
+
+    // 重建（flow 上采样 + backward warp + mask 融合）的计算设备：
+    //   "auto"   — 启动时探测加速卡 grid_sample 能力，支持则在加速卡上重建，
+    //              否则回退 CPU 参考实现（stderr 会打印一行回退提示）
+    //   "device" — 强制在加速卡上重建（不支持时直接报错）
+    //   "cpu"    — 始终使用 CPU FP32 参考实现（校准基线；与旧版本行为一致）
+    // 加速卡重建与 CPU 参考之间存在 fp32 级舍入差异，属正常现象。
+    "reconstruction": "auto",
 
     // SQLite 状态数据库路径。记录任务进度、租约和结果，
     // 支持断点续跑——重启工具后会自动跳过已完成任务。

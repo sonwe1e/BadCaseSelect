@@ -2,3 +2,4 @@
 # they must match the target server's preinstalled CANN 9.0 stack.
 numpy==1.26.4
 Pillow==11.3.0
+scipy==1.13.1

@@ -207,3 +207,127 @@ def test_non_ui_reserve_can_keep_a_central_window_only_candidate():
     assert central, "a compact non-UI window must survive a native HUD candidate"
     assert central[0].metrics["source_native"] == 0.0
     assert central[0].metrics["priority_weight"] == pytest.approx(1.0)
+
+
+
+# ---------------------------------------------------------------------------
+# _extract_components: vectorized scipy path vs independent brute force
+# ---------------------------------------------------------------------------
+
+from vfi_hard_miner.scoring import (  # noqa: E402
+    _extract_components,
+    _extract_components_legacy,
+)
+
+
+def _reference_components(mask, values):
+    """Brute-force eight-connected components (BFS), sorted by first pixel."""
+
+    height, width = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    components = []
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x] or seen[y, x]:
+                continue
+            pixels = []
+            stack = [(y, x)]
+            seen[y, x] = True
+            while stack:
+                cy, cx = stack.pop()
+                pixels.append((cy, cx))
+                for ny in (cy - 1, cy, cy + 1):
+                    for nx in (cx - 1, cx, cx + 1):
+                        if (
+                            0 <= ny < height
+                            and 0 <= nx < width
+                            and mask[ny, nx]
+                            and not seen[ny, nx]
+                        ):
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+            xs = [px for _, px in pixels]
+            ys = [py for py, _ in pixels]
+            membership = {(py, px) for py, px in pixels}
+            area = len(pixels)
+            total = 0.0
+            peak = 0.0
+            perimeter = 0
+            for py, px in pixels:
+                value = float(values[py, px])
+                total += value
+                peak = max(peak, value)
+                for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    if (py + dy, px + dx) not in membership:
+                        perimeter += 1
+            components.append(
+                (min(xs), min(ys), max(xs) + 1, max(ys) + 1, area, total, peak, float(perimeter))
+            )
+    return sorted(components)
+
+
+def _as_sorted_tuples(components):
+    return sorted(
+        (c.x0, c.y0, c.x1, c.y1, c.area, c.total, c.peak, c.perimeter)
+        for c in components
+    )
+
+
+def test_extract_components_empty_mask_returns_no_components():
+    mask = np.zeros((16, 16), dtype=bool)
+    values = np.ones((16, 16), dtype=np.float32)
+    assert _extract_components(mask, values) == []
+    assert _extract_components_legacy(mask, values) == []
+
+
+@pytest.mark.parametrize(
+    ("cells", "expected_perimeter"),
+    [
+        ([(5, 5)], 4.0),  # single pixel
+        ([(2, 2), (2, 3), (3, 2), (3, 3)], 8.0),  # 2x2 block
+        ([(4, 4), (4, 5), (4, 6)], 8.0),  # horizontal run
+        ([(0, 0), (1, 0), (1, 1)], 8.0),  # L shape
+        ([(0, 0), (1, 1)], 8.0),  # diagonal bridge (eight-connected)
+    ],
+)
+def test_extract_components_matches_legacy_on_known_shapes(cells, expected_perimeter):
+    mask = np.zeros((10, 10), dtype=bool)
+    values = np.zeros((10, 10), dtype=np.float32)
+    for y, x in cells:
+        mask[y, x] = True
+        values[y, x] = 0.5
+    fresh = _extract_components(mask, values)
+    legacy = _extract_components_legacy(mask, values)
+    assert len(fresh) == len(legacy) == 1
+    for component in (fresh[0], legacy[0]):
+        assert component.area == len(cells)
+        assert component.perimeter == expected_perimeter
+        assert component.total == pytest.approx(0.5 * len(cells))
+        assert component.peak == 0.5
+
+
+def test_extract_components_keeps_one_pixel_gap_distinct():
+    # Rows carry runs [0,3) and [4,6): separated by exactly one background
+    # column, so they are NOT eight-connected.  The legacy run-union code
+    # over-merged this case.
+    mask = np.zeros((4, 8), dtype=bool)
+    mask[0, 0:3] = True
+    mask[1, 4:6] = True
+    values = np.ones((4, 8), dtype=np.float32)
+    assert len(_extract_components(mask, values)) == 2
+    assert len(_extract_components_legacy(mask, values)) == 1  # legacy bug
+
+
+@pytest.mark.parametrize("density", [0.05, 0.2, 0.5, 0.8])
+def test_extract_components_matches_brute_force_on_random_masks(density):
+    rng = np.random.default_rng(20260722)
+    mask = rng.random((47, 61)) < density
+    values = np.asarray(rng.random((47, 61)), dtype=np.float32)
+    fresh = _as_sorted_tuples(_extract_components(mask, values))
+    reference = _reference_components(mask, values)
+    assert len(fresh) == len(reference)
+    for got, expected in zip(fresh, reference):
+        assert got[:5] == expected[:5]  # bbox + area: exact integers
+        assert got[6] == expected[6]  # peak: exact
+        assert got[7] == expected[7]  # perimeter: exact
+        assert got[5] == pytest.approx(expected[5], rel=1e-6, abs=1e-3)  # total

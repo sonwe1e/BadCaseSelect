@@ -17,6 +17,18 @@ def read_rgb01(path: str | Path) -> np.ndarray:
     return np.ascontiguousarray(array)
 
 
+def read_rgb_uint8(path: str | Path) -> np.ndarray:
+    """Read an image as contiguous uint8 HWC RGB (a 4x smaller cache form)."""
+    with Image.open(path) as image:
+        array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return np.ascontiguousarray(array)
+
+
+def rgb_uint8_to_float32(array: np.ndarray) -> np.ndarray:
+    """Convert cached uint8 RGB to float32 [0, 1], bit-identical to read_rgb01."""
+    return np.asarray(array, dtype=np.float32) / 255.0
+
+
 def _to_uint8_rgb(array: np.ndarray) -> np.ndarray:
     value = np.asarray(array)
     if value.ndim == 2:
