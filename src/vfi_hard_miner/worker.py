@@ -297,12 +297,22 @@ def _resolve_postproc_workers(config: AppConfig) -> int:
     ``runtime.postproc_workers == 0`` selects an automatic count derived from
     the per-worker CPU budget; scipy/numpy release the GIL on the heavy paths,
     so these threads achieve real parallelism on reconstruction-free scoring.
+
+    When ``cpu_threads_per_worker`` is the default value of 1 (meaning the
+    user left it unconfigured), the formula ``1 // 4 == 0`` would collapse to
+    a single postproc thread and negate the entire overlap design.  Fall back
+    to the physical core count in that case so the thread pool actually fires.
     """
 
     configured = int(config.runtime.postproc_workers)
     if configured > 0:
         return configured
-    automatic = max(1, int(config.runtime.cpu_threads_per_worker) // 4)
+    cpu = int(config.runtime.cpu_threads_per_worker)
+    if cpu <= 1:
+        # cpu_threads_per_worker=1 is the "not explicitly configured" default;
+        # derive from physical cores instead of dividing 1 by 4.
+        cpu = os.cpu_count() or 4
+    automatic = max(1, cpu // 4)
     return min(automatic, 8)
 
 
@@ -387,13 +397,25 @@ def _prefetched_decode_batches(
 
     def produce() -> None:
         cache: ImageCache = OrderedDict()
+        # Separate float32 layer so stride=1 frames aren't re-converted on each
+        # triplet overlap.  For stride=1 data each unique frame appears in up to
+        # three consecutive triplets; without this cache the uint8 LRU hit still
+        # costs one full-frame float32 allocation + divide per access.
+        f32_cache: ImageCache = OrderedDict()
         pending: list[DecodedItem] = []
         pending_shape: tuple[int, int, int] | None = None
         capacity = max(1, int(max_cache))
+        # float32 is 4x larger than uint8; keep proportionally fewer entries.
+        f32_capacity = max(4, capacity // 4)
         budget_resolved = cache_budget_bytes is None
 
         def load(path: str) -> np.ndarray:
-            nonlocal capacity, budget_resolved
+            nonlocal capacity, f32_capacity, budget_resolved
+            # Fast path: float32 already computed for this path (stride=1 hit).
+            existing = f32_cache.pop(path, None)
+            if existing is not None:
+                f32_cache[path] = existing
+                return existing
             image = _load_cached_uint8(cache, path, max_items=capacity)
             if not budget_resolved:
                 budget_resolved = True
@@ -401,7 +423,13 @@ def _prefetched_decode_batches(
                     1,
                     min(capacity, max(8, int(cache_budget_bytes) // max(1, image.nbytes))),
                 )
-            return rgb_uint8_to_float32(image)
+                # Re-derive f32 capacity now that per-frame size is known.
+                f32_capacity = max(4, capacity // 4)
+            f32 = rgb_uint8_to_float32(image)
+            f32_cache[path] = f32
+            while len(f32_cache) > f32_capacity:
+                f32_cache.popitem(last=False)
+            return f32
 
         def flush() -> bool:
             nonlocal pending, pending_shape

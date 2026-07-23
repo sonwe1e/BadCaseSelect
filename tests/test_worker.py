@@ -685,6 +685,7 @@ import dataclasses  # noqa: E402
 
 
 def test_resolve_postproc_workers_explicit_and_auto():
+    import os
     from vfi_hard_miner.worker import _resolve_postproc_workers
 
     def resolve(**runtime_overrides):
@@ -693,7 +694,10 @@ def test_resolve_postproc_workers_explicit_and_auto():
         return _resolve_postproc_workers(dataclasses.replace(config, runtime=runtime))
 
     assert resolve(postproc_workers=5) == 5
-    assert resolve(postproc_workers=0, cpu_threads_per_worker=1) == 1
+    # cpu_threads_per_worker=1 is the "not configured" default: falls back to
+    # os.cpu_count() so the postproc thread pool actually provides overlap.
+    expected_auto = min(max(1, (os.cpu_count() or 4) // 4), 8)
+    assert resolve(postproc_workers=0, cpu_threads_per_worker=1) == expected_auto
     assert resolve(postproc_workers=0, cpu_threads_per_worker=16) == 4
     assert resolve(postproc_workers=0, cpu_threads_per_worker=128) == 8
 
