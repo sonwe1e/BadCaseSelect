@@ -17,6 +17,7 @@ from .config import AppConfig, load_config
 from .diagnostics import run_diagnostic_stage
 from .indexing import build_index
 from .manifest import read_jsonl, write_jsonl_part
+from .materialization import IncrementalMaterializer
 from .offline import sha256_file
 from .outputs import (
     link_or_copy,
@@ -631,11 +632,28 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
             record.get("regions", []), list
         ):
             raise RuntimeError(f"result reasons/regions schema is invalid for {sample_id}")
-    segments = merge_classified_intervals(
-        (_classified(record) for record in records),
-        min_length=3,
-    )
-    segments = _retain_segments_with_hard_centers(segments, records)
+    incremental_materializer: IncrementalMaterializer | None = None
+    if config.output.materialize_strategy == "per_video":
+        incremental_materializer = IncrementalMaterializer(
+            config,
+            execution_id=expected_execution,
+            run_dir=run_directory(config),
+            index_records=index_records,
+        )
+        incremental_materializer.materialize_all(records)
+        (
+            segments,
+            segment_mappings,
+            segment_output_directories,
+        ) = incremental_materializer.final_plan(records)
+    else:
+        segments = merge_classified_intervals(
+            (_classified(record) for record in records),
+            min_length=3,
+        )
+        segments = _retain_segments_with_hard_centers(segments, records)
+        segment_mappings = []
+        segment_output_directories = {}
     data_root = Path(config.data.root).expanduser().resolve()
     hard_root, visualization_root = _checked_output_roots(config, data_root)
     manifest_path = (data_root / config.output.manifest_name).resolve()
@@ -646,14 +664,18 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
     if manifest_path == data_root or hard_root in manifest_path.parents or visualization_root in manifest_path.parents:
         raise ValueError("manifest must be outside the generated frame and visualization trees")
     frame_lookup = _frame_lookup(index_records)
-    segment_mappings: list[tuple[Path, Path]] = []
-    segment_output_directories: dict[str, str] = {}
-    if segments and config.output.layout == "segment_relative":
+    if (
+        incremental_materializer is None
+        and segments
+        and config.output.layout == "segment_relative"
+    ):
         segment_mappings, segment_output_directories = _segment_materialization_plan(
             segments,
             frame_lookup,
             run_hash=config.run_hash(),
         )
+        sources = [source for source, _ in segment_mappings]
+    elif incremental_materializer is not None:
         sources = [source for source, _ in segment_mappings]
     else:
         sources = _segment_sources(segments, frame_lookup) if segments else []
@@ -700,21 +722,31 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
     if len(diagnostic_by_sample) != len(diagnostic_inputs):
         raise RuntimeError("diagnostic stage did not return one result per requested sample")
 
-    staging_root = Path(
-        tempfile.mkdtemp(prefix=f".vfi-finalize-{config.run_hash()}-", dir=data_root)
-    )
-    hard_staging = staging_root / "hard_case"
+    if incremental_materializer is None:
+        staging_root = Path(
+            tempfile.mkdtemp(prefix=f".vfi-finalize-{config.run_hash()}-", dir=data_root)
+        )
+        hard_staging = staging_root / "hard_case"
+    else:
+        staging_root = incremental_materializer.generation_root
+        hard_staging = incremental_materializer.hard_staging
     visualization_staging = staging_root / "visualization"
-    hard_staging.mkdir(parents=True)
+    hard_staging.mkdir(parents=True, exist_ok=True)
+    if visualization_staging.exists():
+        shutil.rmtree(visualization_staging)
     visualization_staging.mkdir(parents=True)
+    published = False
     try:
         segment_triplet_counts: dict[str, int] = {}
         if config.output.layout == "segment_relative":
-            link_counts = materialize_mapped_frames(
-                segment_mappings,
-                output_root=hard_staging,
-                mode=config.output.link_mode,
-            )
+            if incremental_materializer is None:
+                link_counts = materialize_mapped_frames(
+                    segment_mappings,
+                    output_root=hard_staging,
+                    mode=config.output.link_mode,
+                )
+            else:
+                link_counts = incremental_materializer.summary().link_counts
             segment_triplet_counts = _validate_segment_relative_staging(
                 hard_staging,
                 config=config,
@@ -818,11 +850,19 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
                 "segments": str(segment_path),
             },
         )
+        published = True
     finally:
-        # After publication the two staged children have been renamed away;
-        # this removes only the unique temporary parent and any unpublished data.
-        if staging_root.exists():
+        # Preserve durable per-video frames after a failed finalize so a retry
+        # never repeats inference or materialization.  A successful publication
+        # renames both staged children away and leaves only the owned parent.
+        if staging_root.exists() and (
+            incremental_materializer is None or published
+        ):
             shutil.rmtree(staging_root)
+        elif incremental_materializer is not None:
+            if visualization_staging.exists():
+                shutil.rmtree(visualization_staging)
+            (staging_root / "manifest.jsonl").unlink(missing_ok=True)
         if "segment_staging" in locals():
             segment_staging.unlink(missing_ok=True)
 

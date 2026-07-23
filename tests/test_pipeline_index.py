@@ -110,3 +110,26 @@ def test_custom_generated_output_directories_are_always_excluded(tmp_path):
     summary = build_run_index(config)
     assert summary.triplets == 1
     assert summary.videos == 1
+
+
+def test_incremental_staging_directory_is_always_excluded(tmp_path):
+    root = tmp_path / "game"
+    for directory in (
+        root / "scene",
+        root / ".vfi_hard_miner_staging" / "execution" / "hard_case" / "01",
+    ):
+        for index in range(1, 4):
+            _write_frame(directory / f"01{index:05d}.png", index)
+    config = AppConfig(
+        data=DataConfig(root=str(root)),
+        model=ModelConfig(factory="examples.mock_model:create_model"),
+        runtime=RuntimeConfig(
+            state_db=str(tmp_path / "state.sqlite3"),
+            run_dir=str(tmp_path / "run"),
+        ),
+    )
+
+    summary = build_run_index(config)
+
+    assert summary.triplets == 1
+    assert summary.videos == 1

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import os
 from queue import Full, Queue
 import socket
@@ -330,32 +330,84 @@ class _ProgressLog:
     def __init__(self, total: int, prefix: str) -> None:
         self._total = total
         self._prefix = prefix
-        self._done = 0
+        self._inferred = 0
+        self._scored = 0
         self._start = time.monotonic()
         self._last = self._start
         print(
-            f"{self._prefix}  0/{self._total}  starting",
+            f"{self._prefix}  inferred 0/{self._total}"
+            f"  scored 0/{self._total}  starting",
             file=sys.stderr,
             flush=True,
         )
 
-    def update(self, n: int) -> None:
-        self._done += n
+    def update_inferred(
+        self, n: int, *, pending_batches: int, pending_bytes: int
+    ) -> None:
+        self._inferred += n
+        self._maybe_emit(
+            pending_batches=pending_batches,
+            pending_bytes=pending_bytes,
+        )
+
+    def update_scored(
+        self, n: int, *, pending_batches: int, pending_bytes: int
+    ) -> None:
+        self._scored += n
+        self._maybe_emit(
+            pending_batches=pending_batches,
+            pending_bytes=pending_bytes,
+        )
+
+    def update_invalid(
+        self, n: int, *, pending_batches: int, pending_bytes: int
+    ) -> None:
+        self._inferred += n
+        self._scored += n
+        self._maybe_emit(
+            pending_batches=pending_batches,
+            pending_bytes=pending_bytes,
+        )
+
+    def waiting(self, *, pending_batches: int, pending_bytes: int) -> None:
+        self._maybe_emit(
+            pending_batches=pending_batches,
+            pending_bytes=pending_bytes,
+        )
+
+    def _maybe_emit(self, *, pending_batches: int, pending_bytes: int) -> None:
         now = time.monotonic()
         if now - self._last >= self._INTERVAL:
-            self._emit(now)
+            self._emit(
+                now,
+                pending_batches=pending_batches,
+                pending_bytes=pending_bytes,
+            )
             self._last = now
 
-    def close(self) -> None:
-        self._emit(time.monotonic(), final=True)
+    def close(self, *, pending_batches: int = 0, pending_bytes: int = 0) -> None:
+        self._emit(
+            time.monotonic(),
+            pending_batches=pending_batches,
+            pending_bytes=pending_bytes,
+            final=True,
+        )
 
-    def _emit(self, now: float, *, final: bool = False) -> None:
+    def _emit(
+        self,
+        now: float,
+        *,
+        pending_batches: int,
+        pending_bytes: int,
+        final: bool = False,
+    ) -> None:
         elapsed = now - self._start
-        rate = self._done / elapsed if elapsed > 0 else 0.0
-        pct = 100 * self._done // self._total if self._total > 0 else 0
+        rate = self._scored / elapsed if elapsed > 0 else 0.0
         label = "done" if final else "..."
         print(
-            f"{self._prefix}  {self._done}/{self._total} ({pct}%)"
+            f"{self._prefix}  inferred {self._inferred}/{self._total}"
+            f"  scored {self._scored}/{self._total}"
+            f"  pending {pending_batches} batches/{pending_bytes / (1024 * 1024):.0f} MiB"
             f"  {elapsed:.0f}s  {rate:.1f}/s  {label}",
             file=sys.stderr,
             flush=True,
@@ -593,6 +645,188 @@ def _infer_and_reconstruct(
     )
 
 
+_RECONSTRUCTION_CHANNELS = 15
+_FUTURE_WAIT_SECONDS = 5.0
+
+
+def _infer_model_batch(
+    items: Sequence[DecodedItem],
+    *,
+    adapter: ModelAdapter,
+    production_batch: int,
+) -> tuple[torch.Tensor, torch.Tensor, ModelOutputs]:
+    """Run one production-sized model batch without full-resolution reconstruction."""
+
+    if not items:
+        raise ValueError("inference batch must not be empty")
+    valid_count = len(items)
+    padded = list(items)
+    while len(padded) < production_batch:
+        padded.append(padded[-1])
+    img0_tensor = torch.stack([_tensor_from_hwc(item[1]) for item in padded])
+    img1_tensor = torch.stack([_tensor_from_hwc(item[3]) for item in padded])
+    outputs = _trim_model_outputs(
+        adapter.infer(img0_tensor, img1_tensor),
+        valid_count,
+    )
+    return img0_tensor[:valid_count], img1_tensor[:valid_count], outputs
+
+
+def _slice_model_outputs(
+    outputs: ModelOutputs, start: int, end: int
+) -> ModelOutputs:
+    return ModelOutputs(
+        outputs.flow_t0[start:end],
+        outputs.flow_t1[start:end],
+        outputs.mask0[start:end],
+        outputs.mask1[start:end],
+    )
+
+
+def _reconstruction_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
+    if not items:
+        raise ValueError("cannot estimate reconstruction bytes for an empty batch")
+    height, width = items[0][1].shape[:2]
+    return int(height) * int(width) * _RECONSTRUCTION_CHANNELS * 4
+
+
+def _postproc_microbatch_size(
+    items: Sequence[DecodedItem],
+    *,
+    buffer_bytes: int,
+    postproc_workers: int,
+) -> int:
+    """Choose a slice so all active CPU futures fit inside one worker budget."""
+
+    bytes_per_sample = _reconstruction_bytes_per_sample(items)
+    per_future_budget = max(1, int(buffer_bytes) // max(1, int(postproc_workers)))
+    return max(1, min(len(items), per_future_budget // max(1, bytes_per_sample)))
+
+
+def _process_payload_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    adapter: ModelAdapter,
+    config: AppConfig,
+    model_config: Any,
+    finish_batch: Callable[..., list[dict[str, Any]]],
+    invalid_record: Callable[[Mapping[str, Any], Exception], dict[str, Any]],
+    heartbeat: Callable[[], None] | None,
+    progress_prefix: str,
+    reconstruction_device: torch.device | str | None,
+    thread_name_prefix: str,
+) -> list[dict[str, Any]]:
+    max_cache = int(config.runtime.chunk_triplets) + 2
+    cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
+    postproc_buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
+    postproc_workers = _resolve_postproc_workers(config)
+    output: list[dict[str, Any]] = []
+    pending: list[tuple[Future[list[dict[str, Any]]], int, int]] = []
+    pending_bytes = 0
+    bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
+
+    def drain_one() -> None:
+        nonlocal pending_bytes
+        future, sample_count, estimated_bytes = pending.pop(0)
+        while True:
+            try:
+                completed = future.result(timeout=_FUTURE_WAIT_SECONDS)
+                break
+            except FutureTimeoutError:
+                if heartbeat is not None:
+                    heartbeat()
+                if bar is not None:
+                    bar.waiting(
+                        pending_batches=len(pending) + 1,
+                        pending_bytes=pending_bytes,
+                    )
+        output.extend(completed)
+        pending_bytes -= estimated_bytes
+        if heartbeat is not None:
+            heartbeat()
+        if bar is not None:
+            bar.update_scored(
+                sample_count,
+                pending_batches=len(pending),
+                pending_bytes=pending_bytes,
+            )
+
+    with ThreadPoolExecutor(
+        max_workers=postproc_workers,
+        thread_name_prefix=thread_name_prefix,
+    ) as executor:
+        for kind, value in _prefetched_decode_batches(
+            records,
+            batch_size=model_config.batch_size,
+            prefetch=config.runtime.prefetch,
+            max_cache=max_cache,
+            cache_budget_bytes=cache_budget_bytes,
+        ):
+            if kind == "batch":
+                items: Sequence[DecodedItem] = value
+                img0_tensor, img1_tensor, outputs = _infer_model_batch(
+                    items,
+                    adapter=adapter,
+                    production_batch=model_config.batch_size,
+                )
+                if bar is not None:
+                    bar.update_inferred(
+                        len(items),
+                        pending_batches=len(pending),
+                        pending_bytes=pending_bytes,
+                    )
+                microbatch_size = _postproc_microbatch_size(
+                    items,
+                    buffer_bytes=postproc_buffer_bytes,
+                    postproc_workers=postproc_workers,
+                )
+                bytes_per_sample = _reconstruction_bytes_per_sample(items)
+                for start in range(0, len(items), microbatch_size):
+                    end = min(len(items), start + microbatch_size)
+                    item_slice = list(items[start:end])
+                    estimated_bytes = len(item_slice) * bytes_per_sample
+                    while pending and (
+                        len(pending) >= postproc_workers
+                        or pending_bytes + estimated_bytes > postproc_buffer_bytes
+                    ):
+                        drain_one()
+                    reconstructed = _reconstruct_outputs(
+                        img0_tensor[start:end],
+                        img1_tensor[start:end],
+                        _slice_model_outputs(outputs, start, end),
+                        model_config=model_config,
+                        device=reconstruction_device,
+                    )
+                    future = executor.submit(
+                        finish_batch,
+                        item_slice,
+                        reconstructed,
+                        config=config,
+                    )
+                    pending.append((future, len(item_slice), estimated_bytes))
+                    pending_bytes += estimated_bytes
+            elif kind == "invalid":
+                while pending:
+                    drain_one()
+                record, error = value
+                output.append(invalid_record(record, error))
+                if bar is not None:
+                    bar.update_invalid(
+                        1,
+                        pending_batches=0,
+                        pending_bytes=0,
+                    )
+            else:  # pragma: no cover - producer owns this internal protocol
+                raise RuntimeError(f"unexpected decode event {kind!r}")
+            if heartbeat is not None:
+                heartbeat()
+        while pending:
+            drain_one()
+    if bar is not None:
+        bar.close()
+    return output
+
+
 def _finish_main_batch(
     items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
     reconstructed: ReconstructionResult,
@@ -660,68 +894,18 @@ def process_main_payload(
     records = payload.get("triplets")
     if not isinstance(records, list):
         raise TypeError("main task payload must contain a triplets array")
-    max_cache = int(config.runtime.chunk_triplets) + 2
-    cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
-    output: list[dict[str, Any]] = []
-    postproc_workers = _resolve_postproc_workers(config)
-    max_pending = max(postproc_workers, config.runtime.prefetch)
-    pending: list[Future[list[dict[str, Any]]]] = []
-
-    def drain_one() -> None:
-        output.extend(pending.pop(0).result())
-        if heartbeat is not None:
-            heartbeat()
-
-    bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
-    with ThreadPoolExecutor(
-        max_workers=postproc_workers, thread_name_prefix="vfi-main-cpu"
-    ) as executor:
-        for kind, value in _prefetched_decode_batches(
-            records,
-            batch_size=config.model.batch_size,
-            prefetch=config.runtime.prefetch,
-            max_cache=max_cache,
-            cache_budget_bytes=cache_budget_bytes,
-        ):
-            if kind == "batch":
-                reconstructed = _infer_and_reconstruct(
-                    value,
-                    adapter=adapter,
-                    model_config=config.model,
-                    production_batch=config.model.batch_size,
-                    reconstruction_device=reconstruction_device,
-                )
-                pending.append(
-                    executor.submit(
-                        _finish_main_batch,
-                        value,
-                        reconstructed,
-                        config=config,
-                    )
-                )
-                # Keep at least one CPU job in flight while the main thread
-                # launches the following accelerator batch.
-                while len(pending) > max_pending:
-                    drain_one()
-                if bar is not None:
-                    bar.update(len(value))
-            elif kind == "invalid":
-                # Preserve source order across a decode barrier.
-                while pending:
-                    drain_one()
-                record, error = value
-                output.append(_invalid_record(record, error))
-                if bar is not None:
-                    bar.update(1)
-            else:  # pragma: no cover - producer owns this internal protocol
-                raise RuntimeError(f"unexpected decode event {kind!r}")
-            if heartbeat is not None:
-                heartbeat()
-        while pending:
-            drain_one()
-    if bar is not None:
-        bar.close()
-    return output
+    return _process_payload_records(
+        records,
+        adapter=adapter,
+        config=config,
+        model_config=config.model,
+        finish_batch=_finish_main_batch,
+        invalid_record=_invalid_record,
+        heartbeat=heartbeat,
+        progress_prefix=progress_prefix,
+        reconstruction_device=reconstruction_device,
+        thread_name_prefix="vfi-main-cpu",
+    )
 
 
 def main_worker_entry(
@@ -794,12 +978,17 @@ def main_worker_entry(
                         progress_prefix=_prefix,
                         reconstruction_device=reconstruction_device,
                     )
+                    print(
+                        f"{_prefix} task {short_id}: scoring complete; writing JSON part",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     write_jsonl_part(part_path, records)
                     lease.check()
                 _elapsed = time.monotonic() - _t0
                 _rate = n_triplets / _elapsed if _elapsed > 0 else 0.0
                 print(
-                    f"{_prefix} task {short_id}: complete"
+                    f"{_prefix} task {short_id}: JSON part committed"
                     f"  {n_triplets} triplets  {_elapsed:.1f}s  {_rate:.1f}/s",
                     file=sys.stderr,
                     flush=True,
@@ -809,6 +998,11 @@ def main_worker_entry(
                     owner,
                     result_path=part_path,
                     attempt=task.attempt,
+                )
+                print(
+                    f"{_prefix} task {short_id}: SQLite task committed",
+                    file=sys.stderr,
+                    flush=True,
                 )
             except LeaseLostError:
                 print(f"{_prefix} task {short_id}: lease lost", file=sys.stderr, flush=True)
@@ -1113,68 +1307,27 @@ def process_teacher_payload(
     records = payload.get("records")
     if not isinstance(records, list):
         raise TypeError("teacher task payload must contain a records array")
-    max_cache = int(config.runtime.chunk_triplets) + 2
-    cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
-    output: list[dict[str, Any]] = []
-    postproc_workers = _resolve_postproc_workers(config)
-    max_pending = max(postproc_workers, config.runtime.prefetch)
-    pending: list[Future[list[dict[str, Any]]]] = []
 
-    def drain_one() -> None:
-        output.extend(pending.pop(0).result())
-        if heartbeat is not None:
-            heartbeat()
+    def invalid_teacher_record(
+        record: Mapping[str, Any], error: Exception
+    ) -> dict[str, Any]:
+        failed = dict(record)
+        failed["status"] = "review"
+        failed["teacher"] = {"error": str(error)}
+        return failed
 
-    bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
-    with ThreadPoolExecutor(
-        max_workers=postproc_workers, thread_name_prefix="vfi-teacher-cpu"
-    ) as executor:
-        for kind, value in _prefetched_decode_batches(
-            records,
-            batch_size=config.teacher.batch_size,
-            prefetch=config.runtime.prefetch,
-            max_cache=max_cache,
-            cache_budget_bytes=cache_budget_bytes,
-        ):
-            if kind == "batch":
-                reconstructed = _infer_and_reconstruct(
-                    value,
-                    adapter=adapter,
-                    model_config=config.teacher,
-                    production_batch=config.teacher.batch_size,
-                    reconstruction_device=reconstruction_device,
-                )
-                pending.append(
-                    executor.submit(
-                        _finish_teacher_batch,
-                        value,
-                        reconstructed,
-                        config=config,
-                    )
-                )
-                while len(pending) > max_pending:
-                    drain_one()
-                if bar is not None:
-                    bar.update(len(value))
-            elif kind == "invalid":
-                while pending:
-                    drain_one()
-                record, error = value
-                failed = dict(record)
-                failed["status"] = "review"
-                failed["teacher"] = {"error": str(error)}
-                output.append(failed)
-                if bar is not None:
-                    bar.update(1)
-            else:  # pragma: no cover - producer owns this internal protocol
-                raise RuntimeError(f"unexpected decode event {kind!r}")
-            if heartbeat is not None:
-                heartbeat()
-        while pending:
-            drain_one()
-    if bar is not None:
-        bar.close()
-    return output
+    return _process_payload_records(
+        records,
+        adapter=adapter,
+        config=config,
+        model_config=config.teacher,
+        finish_batch=_finish_teacher_batch,
+        invalid_record=invalid_teacher_record,
+        heartbeat=heartbeat,
+        progress_prefix=progress_prefix,
+        reconstruction_device=reconstruction_device,
+        thread_name_prefix="vfi-teacher-cpu",
+    )
 
 
 def teacher_worker_entry(
@@ -1244,12 +1397,17 @@ def teacher_worker_entry(
                         progress_prefix=_prefix,
                         reconstruction_device=reconstruction_device,
                     )
+                    print(
+                        f"{_prefix} task {short_id}: scoring complete; writing JSON part",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     write_jsonl_part(part_path, records)
                     lease.check()
                 _elapsed = time.monotonic() - _t0
                 _rate = n_records / _elapsed if _elapsed > 0 else 0.0
                 print(
-                    f"{_prefix} task {short_id}: complete"
+                    f"{_prefix} task {short_id}: JSON part committed"
                     f"  {n_records} records  {_elapsed:.1f}s  {_rate:.1f}/s",
                     file=sys.stderr,
                     flush=True,
@@ -1259,6 +1417,11 @@ def teacher_worker_entry(
                     owner,
                     result_path=part_path,
                     attempt=task.attempt,
+                )
+                print(
+                    f"{_prefix} task {short_id}: SQLite task committed",
+                    file=sys.stderr,
+                    flush=True,
                 )
             except LeaseLostError:
                 print(f"{_prefix} task {short_id}: lease lost", file=sys.stderr, flush=True)

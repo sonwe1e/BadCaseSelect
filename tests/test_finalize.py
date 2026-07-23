@@ -21,7 +21,7 @@ from vfi_hard_miner.manifest import read_jsonl, write_jsonl_part
 from vfi_hard_miner.pipeline import build_run_index, run_main_stage
 
 
-def _completed_case(tmp_path):
+def _completed_case(tmp_path, *, materialize_strategy="finalize"):
     root = tmp_path / "game"
     root.mkdir()
     for index, value in enumerate((0, 64, 128, 192, 255), start=1):
@@ -56,7 +56,11 @@ def _completed_case(tmp_path):
             state_db=str(tmp_path / "state.sqlite3"),
             run_dir=str(tmp_path / "run"),
         ),
-        output=OutputConfig(link_mode="copy", visualization_width=64),
+        output=OutputConfig(
+            link_mode="copy",
+            materialize_strategy=materialize_strategy,
+            visualization_width=64,
+        ),
     )
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -65,6 +69,31 @@ def _completed_case(tmp_path):
     build_run_index(config)
     main = run_main_stage(config_path)
     return root, config, config_path, main
+
+
+def test_finalize_reuses_per_video_materialization(tmp_path, monkeypatch):
+    root, _, config_path, main = _completed_case(
+        tmp_path,
+        materialize_strategy="per_video",
+    )
+    assert main.materialization is not None
+    assert main.materialization.link_counts["copy"] == 5
+
+    def fail_duplicate_copy(*args, **kwargs):
+        raise AssertionError("finalize repeated original-frame materialization")
+
+    monkeypatch.setattr(finalize_module, "materialize_mapped_frames", fail_duplicate_copy)
+    summary = finalize_run(config_path)
+
+    assert summary.frames == 5
+    assert summary.link_counts["copy"] == 5
+    copied = sorted((root / "extremely_hard_case").rglob("*.png"))
+    assert len(copied) == 5
+    assert len({path.parent for path in copied}) == 1
+    manifest = list(read_jsonl(summary.manifest_path))
+    output_directory = manifest[0]["segment_output_directories"][0]
+    assert output_directory.startswith("01/")
+    assert (root / "extremely_hard_case" / output_directory).is_dir()
 
 
 def test_finalize_merges_and_materializes_continuous_frames(tmp_path):

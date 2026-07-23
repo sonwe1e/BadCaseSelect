@@ -742,6 +742,113 @@ def test_postproc_workers_propagates_to_executor(monkeypatch):
     assert [record["sample_id"] for record in result] == ["only"]
 
 
+@pytest.mark.parametrize("record_count", [250, 256, 257])
+def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
+    monkeypatch,
+    capsys,
+    record_count,
+):
+    config = _parallel_test_config(batch_size=64, prefetch=1)
+    runtime = dataclasses.replace(
+        config.runtime,
+        postproc_workers=2,
+        postproc_buffer_mb=1,
+    )
+    config = dataclasses.replace(config, runtime=runtime)
+    items = [_decoded_item(f"sample-{index}", index / 1000) for index in range(record_count)]
+    batches = [items[start : start + 64] for start in range(0, record_count, 64)]
+    reconstructed_sizes = []
+
+    def decoded_batches(*args, **kwargs):
+        for batch in batches:
+            yield "batch", batch
+
+    def reconstruct(img0, img1, outputs, **kwargs):
+        batch = img0.shape[0]
+        reconstructed_sizes.append(batch)
+        flow = torch.zeros((batch, 2, 2, 2), dtype=torch.float32)
+        mask = torch.zeros((batch, 1, 2, 2), dtype=torch.float32)
+        image = torch.zeros((batch, 3, 2, 2), dtype=torch.float32)
+        return ReconstructionResult(
+            flow_t0=flow,
+            flow_t1=flow,
+            mask0=mask,
+            mask1=mask,
+            warp0=image,
+            warp1=image,
+            warp_blend=image,
+            prediction=image,
+        )
+
+    def finish(batch, reconstructed, *, config):
+        return [{"sample_id": item[0]["sample_id"]} for item in batch]
+
+    monkeypatch.setattr(worker_module, "_validate_payload_identity", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "_prefetched_decode_batches", decoded_batches)
+    monkeypatch.setattr(worker_module, "_reconstruction_bytes_per_sample", lambda items: 100 * 1024)
+    monkeypatch.setattr(worker_module, "_reconstruct_outputs", reconstruct)
+    monkeypatch.setattr(worker_module, "_finish_main_batch", finish)
+
+    result = process_main_payload(
+        {
+            "run_hash": config.run_hash(),
+            "stage": "main",
+            "triplets": [item[0] for item in items],
+        },
+        adapter=_RecordingAdapter(),
+        config=config,
+        progress_prefix="[test]",
+    )
+
+    assert [record["sample_id"] for record in result] == [
+        f"sample-{index}" for index in range(record_count)
+    ]
+    assert sum(reconstructed_sizes) == record_count
+    assert max(reconstructed_sizes) == 5
+    progress = capsys.readouterr().err
+    assert f"inferred {record_count}/{record_count}" in progress
+    assert f"scored {record_count}/{record_count}" in progress
+
+
+def test_slow_postprocess_wait_emits_progress_and_heartbeat(monkeypatch, capsys):
+    config = _parallel_test_config(batch_size=1, prefetch=1)
+    runtime = dataclasses.replace(
+        config.runtime,
+        postproc_workers=1,
+        postproc_buffer_mb=1,
+    )
+    config = dataclasses.replace(config, runtime=runtime)
+    item = _decoded_item("slow", 0.5)
+    heartbeats = []
+
+    def decoded_batches(*args, **kwargs):
+        yield "batch", [item]
+
+    def slow_finish(batch, reconstructed, *, config):
+        threading.Event().wait(0.05)
+        return [{"sample_id": "slow"}]
+
+    monkeypatch.setattr(worker_module, "_validate_payload_identity", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_module, "_prefetched_decode_batches", decoded_batches)
+    monkeypatch.setattr(worker_module, "_finish_main_batch", slow_finish)
+    monkeypatch.setattr(worker_module, "_FUTURE_WAIT_SECONDS", 0.005)
+    monkeypatch.setattr(worker_module._ProgressLog, "_INTERVAL", 0.005)
+
+    result = process_main_payload(
+        {"run_hash": config.run_hash(), "stage": "main", "triplets": [item[0]]},
+        adapter=_RecordingAdapter(),
+        config=config,
+        heartbeat=lambda: heartbeats.append(True),
+        progress_prefix="[slow]",
+    )
+
+    assert result == [{"sample_id": "slow"}]
+    assert len(heartbeats) >= 2
+    progress = capsys.readouterr().err
+    assert "pending 1 batches" in progress
+    assert "scored 1/1" in progress
+
+
 def test_decode_prefetch_respects_cache_budget_and_still_yields_batches(tmp_path):
     image_path = tmp_path / "frame.png"
     _save(image_path, np.zeros((8, 8, 3), dtype=np.uint8))

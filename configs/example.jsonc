@@ -171,6 +171,11 @@
     // numpy 在 C 层执行并释放 GIL，多线程可获得真实并行；设为 1 可复现旧行为。
     "postproc_workers": 0,
 
+    // 每个 worker 允许同时滞留在 CPU 后处理队列中的重建结果上限（MB）。
+    // 模型 batch 与后处理微批次解耦；程序会按实际分辨率自动切分，并在
+    // 提交新微批次前回收 Future，避免大 batch 在 chunk 尾部引发换页。
+    "postproc_buffer_mb": 1024,
+
     // 每个 worker 在正式推理前运行的预热批数。
     // 预热使 NPU JIT / 算子缓存充分预热，避免前几批延迟偏高影响统计。
     "warmup_batches": 2,
@@ -233,6 +238,12 @@
     //                        适合训练器按视频组织数据
     //   "flat"             — 所有帧平铺在一个目录，适合小规模快速检查
     "layout": "segment_relative",
+
+    // 原始困难帧物化策略：
+    //   "finalize"  — 保持旧行为，全部推理完成后统一复制并原子发布
+    //   "per_video" — 每个视频完成后写入运行专属暂存区；首版要求
+    //                 layout="segment_relative" 且不能配置 teacher
+    "materialize_strategy": "finalize",
 
     // 是否为 review 级别的样本（p_wrong 处于中间区间）也生成诊断图。
     // false 可显著减少诊断阶段的 I/O 和存储占用。

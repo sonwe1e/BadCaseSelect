@@ -11,10 +11,16 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+import time
 from typing import Any, Iterable, Iterator
 
 from .config import AppConfig
 from .indexing import FrameTriplet, build_index
+from .materialization import (
+    IncrementalMaterializer,
+    MaterializationSummary,
+    STAGING_DIRECTORY,
+)
 from .manifest import canonical_json, read_jsonl, write_jsonl_part
 from .manifest import merge_jsonl_parts
 from .runtime import get_spawn_context, spawn_device_workers
@@ -39,6 +45,7 @@ class MainStageSummary:
     records: int
     counts: dict[str, int]
     manifest_path: Path
+    materialization: MaterializationSummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +287,7 @@ def build_run_index(config: AppConfig) -> IndexSummary:
                     *config.data.excluded_dirs,
                     config.output.hard_case_dir,
                     config.output.visualization_dir,
+                    STAGING_DIRECTORY,
                 )
             )
         ),
@@ -468,6 +476,28 @@ def _cpu_teacher_bootstrap(worker_index: int, config_path: str) -> None:
     teacher_worker_entry(worker_index, torch.device("cpu"), config_path)
 
 
+def _materialize_ready_videos(
+    config: AppConfig,
+    materializer: IncrementalMaterializer,
+) -> None:
+    completed = materializer.completed_video_ids()
+    grouped: dict[str, list[TaskRecord]] = defaultdict(list)
+    with TaskStore(run_state_path(config, stage="main")) as store:
+        for task in store.list_tasks():
+            video_id = str(task.payload.get("video_id", ""))
+            if video_id:
+                grouped[video_id].append(task)
+    for video_id in sorted(grouped):
+        if video_id in completed:
+            continue
+        tasks = grouped[video_id]
+        if not tasks or any(task.status != "done" for task in tasks):
+            continue
+        if any(not _stage_part_is_valid(config, "main", task) for task in tasks):
+            continue
+        materializer.materialize_tasks(video_id, tasks)
+
+
 def run_main_stage(config_path: str | Path) -> MainStageSummary:
     """Run independent device workers and merge their atomic result parts."""
 
@@ -475,8 +505,18 @@ def run_main_stage(config_path: str | Path) -> MainStageSummary:
 
     path = Path(config_path).resolve()
     config = __import__("vfi_hard_miner.config", fromlist=["load_config"]).load_config(path)
-    load_index_records(config)
+    index_records = load_index_records(config)
     _recover_stage_results(config, "main")
+    materializer = (
+        IncrementalMaterializer(
+            config,
+            execution_id=execution_id(config),
+            run_dir=run_directory(config),
+            index_records=index_records,
+        )
+        if config.output.materialize_strategy == "per_video"
+        else None
+    )
     if config.runtime.backend == "cpu":
         context = get_spawn_context()
         processes = [
@@ -489,24 +529,44 @@ def run_main_stage(config_path: str | Path) -> MainStageSummary:
         ]
         for process in processes:
             process.start()
-        failures: list[str] = []
-        for process in processes:
-            process.join()
-            if process.exitcode != 0:
-                failures.append(f"{process.name}: exit code {process.exitcode}")
-        if failures:
-            raise RuntimeError("one or more CPU workers failed: " + "; ".join(failures))
     else:
         devices = [
             f"{config.runtime.backend}:{index}"
             for index in config.runtime.devices[: config.runtime.workers]
         ]
-        spawn_device_workers(
+        processes = spawn_device_workers(
             main_worker_entry,
             devices,
             args=(str(path),),
-            join=True,
+            join=False,
         )
+    materialization_error: Exception | None = None
+    while any(process.is_alive() for process in processes):
+        if materializer is not None and materialization_error is None:
+            try:
+                _materialize_ready_videos(config, materializer)
+            except Exception as exc:  # workers keep producing resumable result parts
+                materialization_error = exc
+        for process in processes:
+            process.join(timeout=0.1)
+        time.sleep(0.1)
+    if materializer is not None and materialization_error is None:
+        try:
+            _materialize_ready_videos(config, materializer)
+        except Exception as exc:
+            materialization_error = exc
+    failures = [
+        f"{process.name}: exit code {process.exitcode}"
+        for process in processes
+        if process.exitcode != 0
+    ]
+    if failures:
+        label = "CPU workers" if config.runtime.backend == "cpu" else "device workers"
+        raise RuntimeError(f"one or more {label} failed: " + "; ".join(failures))
+    if materialization_error is not None:
+        raise RuntimeError(
+            f"incremental materialization failed: {materialization_error}"
+        ) from materialization_error
     state_path = run_state_path(config, stage="main")
     with TaskStore(state_path) as store:
         counts = store.counts()
@@ -527,6 +587,7 @@ def run_main_stage(config_path: str | Path) -> MainStageSummary:
         records=records,
         counts=counts,
         manifest_path=manifest_path,
+        materialization=None if materializer is None else materializer.summary(),
     )
 
 

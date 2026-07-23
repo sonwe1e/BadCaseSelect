@@ -175,6 +175,7 @@ def test_config_allows_fixed_frame_digits(tmp_path):
     ("name", "value", "match"),
     [
         ("cpu_threads_per_worker", 0, "cpu_threads_per_worker"),
+        ("postproc_buffer_mb", 0, "postproc_buffer_mb"),
         ("warmup_batches", -1, "warmup_batches"),
     ],
 )
@@ -184,4 +185,23 @@ def test_config_rejects_invalid_worker_runtime_values(tmp_path, name, value, mat
     path = tmp_path / "config.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match=match):
+        load_config(path)
+
+
+def test_per_video_materialization_requires_segment_relative_without_teacher(tmp_path):
+    payload = _payload(tmp_path)
+    payload["output"] = {
+        "materialize_strategy": "per_video",
+        "layout": "flat",
+    }
+    path = tmp_path / "flat.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="segment_relative"):
+        load_config(path)
+
+    payload["output"]["layout"] = "segment_relative"
+    payload["teacher"] = dict(payload["model"])
+    path = tmp_path / "teacher.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not support teacher"):
         load_config(path)

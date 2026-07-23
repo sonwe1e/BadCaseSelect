@@ -42,6 +42,7 @@
     "decode_cache_mb": 512,
     "cpu_threads_per_worker": 16,
     "postproc_workers": 0,
+    "postproc_buffer_mb": 1024,
     "warmup_batches": 2,
     "lease_seconds": 1800,
     "precision": "float32",
@@ -55,6 +56,7 @@
     "manifest_name": "hard_case_manifest.jsonl",
     "link_mode": "hardlink_then_copy",
     "layout": "segment_relative",
+    "materialize_strategy": "finalize",
     "save_review": false,
     "visualization_width": 320
   }

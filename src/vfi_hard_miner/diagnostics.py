@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import hashlib
 import json
@@ -37,9 +37,15 @@ from .scoring import score_local_errors
 from .state import LeaseHeartbeat, LeaseLostError, TaskRecord, TaskStore
 from .visualization import make_diagnostic_grid
 from .worker import (
-    _infer_and_reconstruct,
+    _FUTURE_WAIT_SECONDS,
+    _ProgressLog,
+    _infer_model_batch,
+    _postproc_microbatch_size,
+    _reconstruct_outputs,
+    _reconstruction_bytes_per_sample,
     _resolve_postproc_workers,
     _resolve_reconstruction_device,
+    _slice_model_outputs,
 )
 
 
@@ -89,27 +95,6 @@ def _pack_outputs_cpu(outputs: ModelOutputs, valid_count: int) -> ModelOutputs:
     packed = packed.detach().to(device="cpu", dtype=torch.float32)
     flow_t0, flow_t1, mask0, mask1 = packed.split((2, 2, 1, 1), dim=1)
     return ModelOutputs(flow_t0, flow_t1, mask0, mask1)
-
-
-def _infer_and_reconstruct_batch(
-    items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
-    *,
-    adapter: ModelAdapter,
-    config: AppConfig,
-    reconstruction_device: torch.device | str | None = None,
-) -> ReconstructionResult:
-    if not items:
-        raise ValueError("diagnostic batch must not be empty")
-    if len(items) > config.model.batch_size:
-        raise ValueError("diagnostic batch exceeds model.batch_size")
-    # The expensive original-resolution reconstruction never sees tail padding.
-    return _infer_and_reconstruct(
-        items,
-        adapter=adapter,
-        model_config=config.model,
-        production_batch=config.model.batch_size,
-        reconstruction_device=reconstruction_device,
-    )
 
 
 def _region_boxes(record: Mapping[str, Any]) -> list[dict[str, int]]:
@@ -282,6 +267,7 @@ def process_diagnostic_payload(
     artifact_root: Path,
     heartbeat: Any | None = None,
     reconstruction_device: torch.device | str | None = None,
+    progress_prefix: str = "",
 ) -> list[dict[str, Any]]:
     if (
         payload.get("run_hash") != config.run_hash()
@@ -294,9 +280,41 @@ def process_diagnostic_payload(
         raise TypeError("diagnostic task payload must contain a records array")
     max_cache = int(config.runtime.chunk_triplets) + 2
     cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
+    postproc_buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
     output: list[dict[str, Any]] = []
     postproc_workers = _resolve_postproc_workers(config)
-    pending_futures: list[Future[list[dict[str, Any]]]] = []
+    pending_futures: list[
+        tuple[Future[list[dict[str, Any]]], int, int]
+    ] = []
+    pending_bytes = 0
+    bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
+
+    def drain_one() -> None:
+        nonlocal pending_bytes
+        future, sample_count, estimated_bytes = pending_futures.pop(0)
+        while True:
+            try:
+                completed = future.result(timeout=_FUTURE_WAIT_SECONDS)
+                break
+            except FutureTimeoutError:
+                if heartbeat is not None:
+                    heartbeat()
+                if bar is not None:
+                    bar.waiting(
+                        pending_batches=len(pending_futures) + 1,
+                        pending_bytes=pending_bytes,
+                    )
+        output.extend(completed)
+        pending_bytes -= estimated_bytes
+        if heartbeat is not None:
+            heartbeat()
+        if bar is not None:
+            bar.update_scored(
+                sample_count,
+                pending_batches=len(pending_futures),
+                pending_bytes=pending_bytes,
+            )
+
     with ThreadPoolExecutor(
         max_workers=postproc_workers, thread_name_prefix="vfi-diagnostic-cpu"
     ) as executor:
@@ -307,29 +325,54 @@ def process_diagnostic_payload(
             max_cache=max_cache,
             cache_budget_bytes=cache_budget_bytes,
         ):
-            reconstructed = _infer_and_reconstruct_batch(
+            img0_tensor, img1_tensor, outputs = _infer_model_batch(
                 items,
                 adapter=adapter,
-                config=config,
-                reconstruction_device=reconstruction_device,
+                production_batch=config.model.batch_size,
             )
-            pending_futures.append(
-                executor.submit(
+            if bar is not None:
+                bar.update_inferred(
+                    len(items),
+                    pending_batches=len(pending_futures),
+                    pending_bytes=pending_bytes,
+                )
+            microbatch_size = _postproc_microbatch_size(
+                items,
+                buffer_bytes=postproc_buffer_bytes,
+                postproc_workers=postproc_workers,
+            )
+            bytes_per_sample = _reconstruction_bytes_per_sample(items)
+            for start in range(0, len(items), microbatch_size):
+                end = min(len(items), start + microbatch_size)
+                item_slice = list(items[start:end])
+                estimated_bytes = len(item_slice) * bytes_per_sample
+                while pending_futures and (
+                    len(pending_futures) >= postproc_workers
+                    or pending_bytes + estimated_bytes > postproc_buffer_bytes
+                ):
+                    drain_one()
+                reconstructed = _reconstruct_outputs(
+                    img0_tensor[start:end],
+                    img1_tensor[start:end],
+                    _slice_model_outputs(outputs, start, end),
+                    model_config=config.model,
+                    device=reconstruction_device,
+                )
+                future = executor.submit(
                     _finish_batch_diagnostics,
-                    items,
+                    item_slice,
                     reconstructed,
                     config=config,
                     artifact_root=artifact_root,
                 )
-            )
-            if len(pending_futures) >= max(postproc_workers, config.runtime.prefetch):
-                output.extend(pending_futures.pop(0).result())
-                if heartbeat is not None:
-                    heartbeat()
-        for future in pending_futures:
-            output.extend(future.result())
-            if heartbeat is not None:
-                heartbeat()
+                pending_futures.append(
+                    (future, len(item_slice), estimated_bytes)
+                )
+                pending_bytes += estimated_bytes
+        while pending_futures:
+            drain_one()
+    if bar is not None:
+        bar.close()
     return output
 
 
@@ -364,6 +407,7 @@ def diagnostic_worker_entry(worker_index: int, device: torch.device, config_path
     _configure_worker_threads(config)
     adapter = ModelAdapter.from_config(config.model, device=device, validate_values=False)
     _warmup(adapter, config)
+    prefix = f"[{device} W{worker_index}:diagnostic]"
     reconstruction_device = _resolve_reconstruction_device(config, device)
     if (
         device.type != "cpu"
@@ -371,7 +415,7 @@ def diagnostic_worker_entry(worker_index: int, device: torch.device, config_path
         and config.runtime.reconstruction == "auto"
     ):
         print(
-            f"[{device} W{worker_index}:diagnostic] device reconstruction "
+            f"{prefix} device reconstruction "
             "unavailable; using CPU reference",
             file=sys.stderr,
             flush=True,
@@ -406,6 +450,7 @@ def diagnostic_worker_entry(worker_index: int, device: torch.device, config_path
                         artifact_root=artifact_root,
                         heartbeat=lease.check,
                         reconstruction_device=reconstruction_device,
+                        progress_prefix=prefix,
                     )
                     for record in records:
                         record["task_id"] = task.task_id

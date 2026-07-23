@@ -223,6 +223,7 @@ class RuntimeConfig:
     decode_cache_mb: int = 512
     cpu_threads_per_worker: int = 1
     postproc_workers: int = 0
+    postproc_buffer_mb: int = 1024
     warmup_batches: int = 1
     lease_seconds: int = 1800
     precision: Literal["float32", "float16", "bfloat16"] = "float32"
@@ -239,6 +240,8 @@ class RuntimeConfig:
             raise ValueError("runtime.cpu_threads_per_worker must be >= 1")
         if self.postproc_workers < 0:
             raise ValueError("runtime.postproc_workers must be >= 0")
+        if self.postproc_buffer_mb < 1:
+            raise ValueError("runtime.postproc_buffer_mb must be >= 1")
         if self.warmup_batches < 0:
             raise ValueError("runtime.warmup_batches must be >= 0")
         if self.lease_seconds < 30:
@@ -258,6 +261,7 @@ class OutputConfig:
     layout: Literal["segment_relative", "preserve_relative", "flat"] = (
         "segment_relative"
     )
+    materialize_strategy: Literal["finalize", "per_video"] = "finalize"
     save_review: bool = False
     visualization_width: int = 320
 
@@ -286,6 +290,16 @@ class AppConfig:
         self.thresholds.validate()
         self.runtime.validate()
         self.output.validate()
+        if self.output.materialize_strategy == "per_video":
+            if self.output.layout != "segment_relative":
+                raise ValueError(
+                    "output.materialize_strategy='per_video' requires "
+                    "output.layout='segment_relative'"
+                )
+            if self.teacher is not None:
+                raise ValueError(
+                    "output.materialize_strategy='per_video' does not support teacher"
+                )
 
     def canonical_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True, separators=(",", ":"))

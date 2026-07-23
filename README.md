@@ -33,7 +33,7 @@ cp configs/example.json configs/my_game.json
 - `model.factory` 指向实际适配器的 `module:function`。
 - `model.checkpoint` 指向已经存在的当前模型权重。
 - `runtime.run_dir` 使用本次实验独立目录。
-- NPU 生产配置使用 `backend: "npu"`、设备 `0..7`、`workers: 8` 和 `precision: "float32"`。吞吐调优项：`runtime.postproc_workers`（CPU 评分线程数，0 为自动）、`runtime.decode_cache_mb`（uint8 帧缓存上限）、`runtime.reconstruction`（重建设备，默认 `"auto"`）、`model.batch_size`（显存/HBM 充足时可提到 8）。
+- NPU 生产配置使用 `backend: "npu"`、设备 `0..7`、`workers: 8` 和 `precision: "float32"`。吞吐调优项：`runtime.postproc_workers`（CPU 评分线程数，0 为自动）、`runtime.postproc_buffer_mb`（每 worker 在途重建结果的内存预算，默认 1024 MB）、`runtime.decode_cache_mb`（uint8 帧缓存上限）、`runtime.reconstruction`（重建设备，默认 `"auto"`）和 `model.batch_size`。模型 batch 与重建/CPU 后处理微批次相互独立，大 batch 不会再把多个完整的全分辨率结果无限堆入 Future 队列。
 
 工具不会猜测 checkpoint key、网络输出顺序或 `mask0` 方向；接入契约见 `docs/model_adapter.md`。  
 配置字段的详细说明见 `configs/example.jsonc`（JSONC 格式，VS Code 可渲染内联注释，运行时不能直接加载）：
@@ -128,6 +128,13 @@ vfi-hard-miner finalize --config configs/my_game.json
 ```
 
 也可以用 `vfi-hard-miner run --config configs/my_game.json` 串行执行 index、main、可选 teacher 和 finalize。没有实际模型时可使用项目 mock 适配器和合成数据做 smoke test，但它只能验证流水线，不能代表困难样本质量。
+
+需要在长时间运行中提前查看已完成视频的原始困难帧时，可设置
+`output.materialize_strategy: "per_video"`。该模式要求
+`output.layout: "segment_relative"` 且首版不支持 teacher；`mine` 会在一个视频的
+全部 chunk 完成后，将其原子物化到
+`data.root/.vfi_hard_miner_staging/<execution_id>/hard_case`。中间目录只供人工查看，
+`finalize` 会复用这些帧并在诊断与 manifest 完成后统一切换正式输出目录。
 
 ## Execution snapshot
 
