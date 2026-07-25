@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -231,3 +232,60 @@ def test_graded_flat_requires_cgvqm_and_byte_copy(tmp_path):
     config = load_config(path)
     assert config.output.layout == "graded_flat"
     assert config.cgvqm.spatial_overlap_at == 0.4
+
+
+_CONFIGS_DIR = Path(__file__).resolve().parents[1] / "configs"
+
+
+def test_example_json_loads_with_production_settings():
+    config = load_config(_CONFIGS_DIR / "example.json")
+    assert config.runtime.prefetch == 4
+    assert config.runtime.decode_workers == 4
+    assert config.runtime.decode_cache_mb == 1024
+    assert config.runtime.postproc_workers == 4
+    assert config.runtime.postproc_buffer_mb == 2048
+    assert config.runtime.reconstruction == "device"
+    assert config.cgvqm.batch_size == 4
+    assert config.cgvqm.context_cache_mb == 256
+    # Calibration baseline stays put.
+    assert config.model.batch_size == 64
+    assert config.runtime.cpu_threads_per_worker == 8
+    assert config.runtime.precision == "float32"
+
+
+def test_example_jsonc_matches_example_json():
+    def strip_line_comments(text: str) -> str:
+        out = []
+        in_string = False
+        escaped = False
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if in_string:
+                out.append(char)
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+                out.append(char)
+            elif char == "/" and text[index + 1 : index + 2] == "/":
+                newline = text.find("\n", index)
+                if newline == -1:
+                    break
+                index = newline - 1
+            else:
+                out.append(char)
+            index += 1
+        return "".join(out)
+
+    plain = json.loads((_CONFIGS_DIR / "example.json").read_text(encoding="utf-8"))
+    annotated = json.loads(
+        strip_line_comments(
+            (_CONFIGS_DIR / "example.jsonc").read_text(encoding="utf-8")
+        )
+    )
+    assert annotated == plain

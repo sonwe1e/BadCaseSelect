@@ -105,8 +105,14 @@
     // 首尾使用确定性边界 padding，不跨视频。
     "clip_frames": 16,
     "crop_size": 224,
-    "batch_size": 1,
+    // R3D-18 Conv3D 的评分微批次；4 在 224×224×16 clip 下有吞吐与显存余量。
+    // 实际批大小仍按 postproc_buffer_mb 预算自动下压（只降不升）。
+    "batch_size": 4,
     "candidates_per_task": 32,
+    // 跨候选 chunk 复用的上下文缓存（MB/worker）：相邻候选窗口共享大量
+    // context 帧，命中即跳过解码与推理；淘汰只会触发重推，评分逐位不变。
+    // 0 表示禁用。视频之间自动清空。
+    "context_cache_mb": 256,
 
     // CGVQM 使用 error 方向：越高表示感知劣化越明显。
     "b_error_at": 25.0,
@@ -191,15 +197,20 @@
     "chunk_triplets": 256,
 
     // 预取队列深度：图片解码与 NPU 推理的流水线并发深度。
-    // 2 表示在 NPU 处理当前批的同时，CPU 已在解码下一批。
-    // 大分辨率数据建议从 1～2 开始；队列批次保持 uint8，不持有 float32。
-    "prefetch": 2,
+    // 4 表示在 NPU 处理当前批的同时，CPU 已并行解码后续批次。
+    // 队列批次保持 uint8，不持有 float32。
+    "prefetch": 4,
+
+    // 每个 worker 的并行 PNG 解码线程数。LRU 命中检查仍串行，仅缓存未命中
+    // 的解码进线程池（zlib 释放 GIL，有真并行）；事件顺序与单线程逐位一致。
+    // 1 = 单线程旧行为；×8 worker 共 32 个解码线程，按物理核数酌减。
+    "decode_workers": 4,
 
     // 每个 worker 的图片解码缓存上限（MB）。帧以 uint8 缓存（比 float32
     // 省 4 倍内存），缓存帧数 = min(本预算 / 单帧字节数, chunk_triplets + 2)。
     // stride=1 时缓存覆盖整个 chunk 即可实现每帧只解码一次；4K 帧约 24MB/帧，
-    // 512MB 约缓存 21 帧。内存紧张时下限为 16。
-    "decode_cache_mb": 512,
+    // 1024MB 约缓存 42 帧，足以覆盖 bs8 在途窗口。内存紧张时下限为 16。
+    "decode_cache_mb": 1024,
 
     // 每个 worker 进程的 CPU 线程数（用于 PyTorch/OpenCV 内部并行）。
     // 多 worker 时建议 cpu_threads_per_worker × workers ≤ 物理核心数。
@@ -208,14 +219,17 @@
     // 每个 worker 的 CPU 后处理线程数（重建结果的评分与诊断）。
     // 0 表示自动：结合逻辑核数、worker 数与每进程线程预算计算，并将每个
     // NPU worker 的全分辨率评分 Future 限制为最多 2 个，避免内存带宽争用。
-    // 显式正整数仍可覆盖，但实际在途数量继续受 postproc_buffer_mb 限制。
-    "postproc_workers": 0,
+    // 显式 4：×8 worker 共 32 个评分线程（scipy/numpy 释放 GIL 有真并行），
+    // 实际在途数量继续受 postproc_buffer_mb 限制。
+    "postproc_workers": 4,
 
-    // 每个 worker 的 CPU 后处理完整预留上限（MB），覆盖 18 通道重建结果、
-    // Future 持有的 9 通道 float32 输入、24 plane 评分 scratch、当前微批次
-    // 6 通道 endpoint stack transient 和固定开销。准入在原分辨率 float32
-    // 转换与 reconstruction 之前完成；单样本超预算时独占并记录 oversize=1。
-    "postproc_buffer_mb": 1024,
+    // 每个 worker 的 CPU 后处理完整预留上限（MB）。两阶段回传口径：
+    // tier-1 7 通道（prediction+flow）CPU 驻留 + tier-2 11 通道（warp+mask）
+    // 设备端驻留（仅候选按需回传）+ Future 持有的 9 通道 float32 输入、
+    // 24 plane 评分 scratch、当前微批次 6 通道 endpoint stack transient
+    // 和固定开销。准入在原分辨率 float32 转换与 reconstruction 之前完成；
+    // 单样本超预算时独占并记录 oversize=1。
+    "postproc_buffer_mb": 2048,
 
     // 每个 worker 在正式推理前运行的预热批数。
     // 预热使 NPU JIT / 算子缓存充分预热，避免前几批延迟偏高影响统计。
@@ -236,8 +250,9 @@
     //              否则回退 CPU 参考实现（stderr 会打印一行回退提示）
     //   "device" — 强制在加速卡上重建（不支持时直接报错）
     //   "cpu"    — 始终使用 CPU FP32 参考实现（校准基线；与旧版本行为一致）
-    // 加速卡重建与 CPU 参考之间存在 fp32 级舍入差异，属正常现象。
-    "reconstruction": "auto",
+    // 生产环境用 "device" fail-loud：避免探测失败时静默回退 CPU 参考实现
+    // 造成吞吐灾难。加速卡重建与 CPU 参考之间存在 fp32 级舍入差异，属正常现象。
+    "reconstruction": "device",
 
     // SQLite 状态数据库路径。记录任务进度、租约和结果，
     // 支持断点续跑——重启工具后会自动跳过已完成任务。
