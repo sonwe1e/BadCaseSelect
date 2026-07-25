@@ -1187,3 +1187,76 @@ def test_fast_rejected_samples_never_materialize_tier2(tmp_path, monkeypatch):
     assert len(results) == 1
     assert calls == []
     assert results[0]["metrics"]["diagnosis"]["skipped"] == 1.0
+
+
+def test_decode_workers_validation():
+    assert RuntimeConfig().decode_workers == 1
+    RuntimeConfig(decode_workers=4).validate()
+    with pytest.raises(ValueError, match="decode_workers"):
+        RuntimeConfig(decode_workers=0).validate()
+
+
+def test_decode_workers_parallel_preserves_event_order(tmp_path):
+    paths = {}
+    for name, value in (
+        ("a", 10),
+        ("b", 20),
+        ("c", 30),
+        ("d", 40),
+        ("e", 50),
+        ("f", 60),
+    ):
+        frame_path = tmp_path / f"{name}.png"
+        _save(frame_path, np.full((8, 8, 3), value, dtype=np.uint8))
+        paths[name] = str(frame_path)
+
+    def rec(sid, a, b, c):
+        return {
+            "sample_id": sid,
+            "img0": {"path": a},
+            "gt": {"path": b},
+            "img1": {"path": c},
+        }
+
+    records = [
+        rec("r1", paths["a"], paths["b"], paths["c"]),
+        rec("bad", paths["d"], str(tmp_path / "missing.png"), paths["e"]),
+        rec("r2", paths["e"], paths["f"], paths["a"]),
+        rec("r3", paths["b"], paths["c"], paths["d"]),
+    ]
+
+    def run(workers):
+        summary = []
+        for kind, value in _prefetched_decode_batches(
+            records,
+            batch_size=2,
+            prefetch=1,
+            max_cache=64,
+            decode_workers=workers,
+        ):
+            if kind == "batch":
+                items = value.items
+                summary.append(
+                    ("batch", tuple(item[0]["sample_id"] for item in items))
+                )
+                summary.append(
+                    ("pixels", tuple(int(item[1][0, 0, 0]) for item in items))
+                )
+            elif kind == "invalid":
+                record, exc = value
+                summary.append(("invalid", record["sample_id"], type(exc).__name__))
+            else:
+                summary.append((kind,))
+        return summary
+
+    serial = run(1)
+    parallel = run(4)
+
+    assert serial == [
+        ("batch", ("r1",)),
+        ("pixels", (10,)),
+        ("invalid", "bad", "FileNotFoundError"),
+        ("batch", ("r2", "r3")),
+        ("pixels", (50, 20)),
+    ]
+    assert parallel == serial

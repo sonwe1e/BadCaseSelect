@@ -918,6 +918,7 @@ def _prefetched_decode_batches(
     prefetch: int,
     max_cache: int,
     cache_budget_bytes: int | None = None,
+    decode_workers: int = 1,
 ) -> Iterator[DecodeEvent]:
     """Decode/group triplets on one bounded producer thread.
 
@@ -929,6 +930,12 @@ def _prefetched_decode_batches(
     conversion happens only for the reconstruction microbatch that has already
     passed memory admission.  ``cache_budget_bytes`` caps the uint8 LRU once
     the first frame's size is known.
+
+    ``decode_workers > 1`` fans cache-MISS PNG decodes out to a thread pool
+    inside the producer (zlib releases the GIL, so this is true parallelism);
+    LRU hits, cache writes, shape grouping, and the ("invalid", ...) event
+    protocol stay serial, so the event stream is identical to the
+    single-threaded path.
     """
 
     queue: Queue[DecodeEvent] = Queue(maxsize=max(1, prefetch))
@@ -950,17 +957,58 @@ def _prefetched_decode_batches(
         pending_decode_seconds = 0.0
         capacity = max(1, int(max_cache))
         budget_resolved = cache_budget_bytes is None
+        workers = max(1, int(decode_workers))
+        pool: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="vfi-decode-io"
+            )
+            if workers > 1
+            else None
+        )
 
-        def load(path: str) -> np.ndarray:
+        def resolve_budget(image: np.ndarray) -> None:
             nonlocal capacity, budget_resolved
-            image = _load_cached_uint8(cache, path, max_items=capacity)
             if not budget_resolved:
                 budget_resolved = True
                 capacity = max(
                     1,
                     min(capacity, max(8, int(cache_budget_bytes) // max(1, image.nbytes))),
                 )
+
+        def insert(path: str, image: np.ndarray) -> None:
+            cache[path] = image
+            while len(cache) > capacity:
+                cache.popitem(last=False)
+
+        def load(path: str) -> np.ndarray:
+            image = _load_cached_uint8(cache, path, max_items=capacity)
+            resolve_budget(image)
             return image
+
+        def load_many(paths: tuple[str, str, str]) -> tuple[np.ndarray, ...]:
+            """Parallel decode for cache misses; hits and writes stay serial.
+
+            Misses are submitted in path order and collected in the same
+            order, so the cache ends in the same state as the serial path
+            and the first failing path still surfaces first.
+            """
+
+            assert pool is not None
+            images: list[np.ndarray | None] = [None] * len(paths)
+            misses: list[tuple[int, str, Future]] = []
+            for index, path in enumerate(paths):
+                cached = cache.pop(path, None)
+                if cached is not None:
+                    cache[path] = cached
+                    images[index] = cached
+                else:
+                    misses.append((index, path, pool.submit(read_rgb_uint8, path)))
+            for index, path, future in misses:
+                image = future.result()
+                images[index] = image
+                insert(path, image)
+            resolve_budget(images[0])
+            return tuple(images)
 
         def flush() -> bool:
             nonlocal pending, pending_shape, pending_decode_seconds
@@ -983,9 +1031,17 @@ def _prefetched_decode_batches(
                     return
                 try:
                     decode_started = time.perf_counter()
-                    first = load(str(record["img0"]["path"]))
-                    middle = load(str(record["gt"]["path"]))
-                    last = load(str(record["img1"]["path"]))
+                    paths = (
+                        str(record["img0"]["path"]),
+                        str(record["gt"]["path"]),
+                        str(record["img1"]["path"]),
+                    )
+                    if pool is None:
+                        first = load(paths[0])
+                        middle = load(paths[1])
+                        last = load(paths[2])
+                    else:
+                        first, middle, last = load_many(paths)
                     if first.shape != middle.shape or first.shape != last.shape:
                         raise ValueError(
                             "triplet image shapes differ: "
@@ -1009,6 +1065,8 @@ def _prefetched_decode_batches(
             if not put(("error", exc)):
                 return
         finally:
+            if pool is not None:
+                pool.shutdown(wait=False)
             put(("done", None))
 
     producer = Thread(target=produce, name="vfi-decode-prefetch", daemon=True)
@@ -1469,6 +1527,7 @@ def _process_payload_records(
             prefetch=config.runtime.prefetch,
             max_cache=max_cache,
             cache_budget_bytes=cache_budget_bytes,
+            decode_workers=config.runtime.decode_workers,
         ):
             if kind == "batch":
                 decoded_batch = (

@@ -267,6 +267,7 @@ class RuntimeConfig:
     workers: int = 1
     chunk_triplets: int = 256
     prefetch: int = 2
+    decode_workers: int = 1
     decode_cache_mb: int = 512
     cpu_threads_per_worker: int = 1
     postproc_workers: int = 0
@@ -281,6 +282,8 @@ class RuntimeConfig:
     def validate(self) -> None:
         if self.workers < 1 or self.chunk_triplets < 1 or self.prefetch < 1:
             raise ValueError("runtime worker/chunk/prefetch values must be positive")
+        if self.decode_workers < 1:
+            raise ValueError("runtime.decode_workers must be >= 1")
         if self.decode_cache_mb < 16:
             raise ValueError("runtime.decode_cache_mb must be >= 16")
         if self.cpu_threads_per_worker < 1:
