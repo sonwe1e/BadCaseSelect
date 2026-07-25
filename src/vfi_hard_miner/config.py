@@ -82,6 +82,7 @@ class CGVQMConfig:
     crop_size: int = 224
     batch_size: int = 1
     candidates_per_task: int = 32
+    context_cache_mb: int = 256
     b_error_at: float = 25.0
     a_error_at: float = 50.0
     temporal_persistence_at: float = 0.35
@@ -97,6 +98,8 @@ class CGVQMConfig:
             raise ValueError("cgvqm.crop_size must be >= 32")
         if self.batch_size < 1 or self.candidates_per_task < 1:
             raise ValueError("cgvqm batch/task values must be positive")
+        if self.context_cache_mb < 0:
+            raise ValueError("cgvqm.context_cache_mb must be >= 0 (0 disables)")
         if not 0.0 <= self.b_error_at <= self.a_error_at <= 100.0:
             raise ValueError(
                 "cgvqm thresholds must satisfy 0 <= b_error_at <= a_error_at <= 100"

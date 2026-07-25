@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -36,13 +36,13 @@ from .pipeline import (
     run_directory,
     run_state_path,
 )
+from .reconstruction import reconstruct_midpoint
 from .runtime import get_spawn_context
 from .state import LeaseHeartbeat, LeaseLostError, TaskRecord, TaskStore
 from .worker import (
     _infer_model_batch,
     _postproc_microbatch_size,
     _prepare_reconstruction_microbatch,
-    _reconstruct_outputs,
     _resolve_reconstruction_device,
     _slice_model_outputs,
 )
@@ -335,10 +335,12 @@ def _region_mask_in_crop(
     return mask
 
 
-def _model_device(config: AppConfig) -> torch.device:
+def _model_device(
+    config: AppConfig, *, device_index: int | None = None
+) -> torch.device:
     if config.runtime.backend == "cpu":
         return torch.device("cpu")
-    index = int(config.runtime.devices[0])
+    index = int(config.runtime.devices[0]) if device_index is None else int(device_index)
     if config.runtime.backend == "npu":
         import torch_npu  # type: ignore[import-not-found]  # noqa: F401
 
@@ -352,7 +354,12 @@ def _model_device(config: AppConfig) -> torch.device:
     raise ValueError(f"unsupported runtime backend: {config.runtime.backend}")
 
 
-def _scorer_device(config: AppConfig, model_device: torch.device) -> torch.device:
+def _scorer_device(
+    config: AppConfig,
+    model_device: torch.device,
+    *,
+    device_index: int | None = None,
+) -> torch.device:
     desired = (
         config.runtime.backend
         if config.cgvqm.backend == "auto"
@@ -362,17 +369,104 @@ def _scorer_device(config: AppConfig, model_device: torch.device) -> torch.devic
         return torch.device("cpu")
     if desired == model_device.type:
         return model_device
+    index = int(config.runtime.devices[0]) if device_index is None else int(device_index)
     if desired == "cuda":
-        return torch.device(f"cuda:{int(config.runtime.devices[0])}")
+        return torch.device(f"cuda:{index}")
     if desired == "npu":
-        return torch.device(f"npu:{int(config.runtime.devices[0])}")
+        return torch.device(f"npu:{index}")
     raise ValueError(f"unsupported CGVQM backend: {desired}")
 
 
+def _scorer_backend_label(config: AppConfig) -> str:
+    """Configured scorer backend label, resolved without any torch import."""
+
+    return str(
+        config.runtime.backend
+        if config.cgvqm.backend == "auto"
+        else config.cgvqm.backend
+    )
+
+
+class _ContextCache:
+    """Per-video LRU cache of context-frame predictions and GT frames.
+
+    Adjacent candidate chunks share most context samples; caching both the
+    reconstructed prediction (float32 HWC) and the decoded GT frame lets the
+    next chunk fill clip slots without decoding or inferring them again.
+    Eviction only costs a re-inference, so scores stay identical no matter
+    when entries are dropped.
+    """
+
+    def __init__(self, budget_bytes: int) -> None:
+        self._budget = max(0, int(budget_bytes))
+        self._entries: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = OrderedDict()
+        self._bytes = 0
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+
+    def get(self, sample_id: str) -> tuple[np.ndarray, np.ndarray] | None:
+        entry = self._entries.pop(sample_id, None)
+        if entry is None:
+            return None
+        self._entries[sample_id] = entry
+        return entry
+
+    def put(self, sample_id: str, prediction: np.ndarray, gt: np.ndarray) -> None:
+        if self._budget <= 0:
+            return
+        size = int(prediction.nbytes) + int(gt.nbytes)
+        if size > self._budget:
+            return
+        existing = self._entries.pop(sample_id, None)
+        if existing is not None:
+            self._bytes -= int(existing[0].nbytes) + int(existing[1].nbytes)
+        while self._bytes + size > self._budget and self._entries:
+            _, evicted = self._entries.popitem(last=False)
+            self._bytes -= int(evicted[0].nbytes) + int(evicted[1].nbytes)
+        self._entries[sample_id] = (prediction, gt)
+        self._bytes += size
+
+
+def _reconstruct_predictions_cpu(
+    img0_tensor: torch.Tensor,
+    img1_tensor: torch.Tensor,
+    outputs: Any,
+    *,
+    config: AppConfig,
+    device: torch.device | str | None,
+) -> torch.Tensor:
+    """Reconstruct on device and transfer only prediction (3ch) to CPU.
+
+    CGVQM consumes predictions exclusively, so the warps/masks/flows never
+    need to cross the device boundary here.
+    """
+
+    reconstructed = reconstruct_midpoint(
+        img0_tensor,
+        img1_tensor,
+        outputs.flow_t0,
+        outputs.flow_t1,
+        outputs.mask0,
+        outputs.mask1,
+        network_size=(config.model.input_height, config.model.input_width),
+        mask0_role=config.model.mask0_role,
+        align_corners=config.model.align_corners,
+        padding_mode=config.model.padding_mode,
+        device=device,
+        validate=False,
+    )
+    return reconstructed.prediction.detach().to(device="cpu", dtype=torch.float32)
+
+
 def _load_scorer(
-    config: AppConfig, model_device: torch.device
+    config: AppConfig,
+    model_device: torch.device,
+    *,
+    device_index: int | None = None,
 ) -> tuple[CGVQM2Scorer, str]:
-    desired = _scorer_device(config, model_device)
+    desired = _scorer_device(config, model_device, device_index=device_index)
     try:
         scorer = CGVQM2Scorer(
             config.cgvqm.backbone_checkpoint,
@@ -550,6 +644,30 @@ def _score_clip_batch(
     return output
 
 
+def _fill_clip_slots(
+    dependencies: Mapping[str, list[tuple[_CandidateClip, int]]],
+    sample_id: str,
+    *,
+    prediction: np.ndarray,
+    gt: np.ndarray,
+    config: AppConfig,
+) -> None:
+    for clip, slot in dependencies[sample_id]:
+        if clip.region_mask is None:
+            clip.region_mask = _region_mask_in_crop(
+                clip.box,
+                image_shape=gt.shape,
+                crop_size=config.cgvqm.crop_size,
+            )
+        clip.distorted[slot] = _crop_resize_uint8(
+            prediction, clip.box, config.cgvqm.crop_size
+        )
+        clip.reference[slot] = _crop_resize_uint8(
+            gt, clip.box, config.cgvqm.crop_size
+        )
+        clip.filled[slot] = True
+
+
 def _fill_and_score_clips(
     clips: Sequence[_CandidateClip],
     *,
@@ -558,6 +676,7 @@ def _fill_and_score_clips(
     config: AppConfig,
     model_device: torch.device,
     artifact_root: Path,
+    context_cache: _ContextCache | None = None,
 ) -> list[dict[str, Any]]:
     dependencies: dict[str, list[tuple[_CandidateClip, int]]] = defaultdict(list)
     context_records: dict[str, Mapping[str, Any]] = {}
@@ -570,11 +689,30 @@ def _fill_and_score_clips(
         context_records.values(),
         key=lambda item: (tuple(item["frame_indices"]), str(item["sample_id"])),
     )
+    # Context frames cached from earlier chunks of the same video fill their
+    # clip slots directly; only cache misses are decoded and inferred.
+    cached_count = 0
+    uncached_context: list[Mapping[str, Any]] = []
+    for record in ordered_context:
+        sample_id = str(record["sample_id"])
+        entry = None if context_cache is None else context_cache.get(sample_id)
+        if entry is None:
+            uncached_context.append(record)
+            continue
+        prediction, gt = entry
+        _fill_clip_slots(
+            dependencies,
+            sample_id,
+            prediction=prediction,
+            gt=gt,
+            config=config,
+        )
+        cached_count += 1
     reconstruction_device = _resolve_reconstruction_device(config, model_device)
     buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
-    completed = 0
+    completed = cached_count
     for items in _prefetched_diagnostic_batches(
-        ordered_context,
+        uncached_context,
         batch_size=config.model.batch_size,
         prefetch=config.runtime.prefetch,
         max_cache=config.runtime.chunk_triplets + 2,
@@ -597,39 +735,36 @@ def _fill_and_score_clips(
             micro_end = min(len(items), micro_start + microbatch)
             item_slice = list(items[micro_start:micro_end])
             prepared = _prepare_reconstruction_microbatch(item_slice)
-            reconstructed = _reconstruct_outputs(
+            predictions = _reconstruct_predictions_cpu(
                 prepared.img0_tensor,
                 prepared.img1_tensor,
                 _slice_model_outputs(
                     inference_batch.outputs, micro_start, micro_end
                 ),
-                model_config=config.model,
+                config=config,
                 device=reconstruction_device,
             )
             for local, (record, _img0, gt, _img1) in enumerate(
                 prepared.items
             ):
-                prediction = _hwc(reconstructed.prediction[local])
+                prediction = _hwc(predictions[local])
                 sample_id = str(record["sample_id"])
-                for clip, slot in dependencies[sample_id]:
-                    if clip.region_mask is None:
-                        clip.region_mask = _region_mask_in_crop(
-                            clip.box,
-                            image_shape=gt.shape,
-                            crop_size=config.cgvqm.crop_size,
-                        )
-                    clip.distorted[slot] = _crop_resize_uint8(
-                        prediction, clip.box, config.cgvqm.crop_size
+                if context_cache is not None:
+                    context_cache.put(
+                        sample_id, prediction, np.asarray(gt)
                     )
-                    clip.reference[slot] = _crop_resize_uint8(
-                        gt, clip.box, config.cgvqm.crop_size
-                    )
-                    clip.filled[slot] = True
+                _fill_clip_slots(
+                    dependencies,
+                    sample_id,
+                    prediction=prediction,
+                    gt=np.asarray(gt),
+                    config=config,
+                )
                 completed += 1
             del prepared
         print(
             f"[cgvqm] reconstructed {completed}/{len(ordered_context)} "
-            f"context samples",
+            f"context samples ({cached_count} from context cache)",
             file=sys.stderr,
             flush=True,
         )
@@ -696,9 +831,30 @@ def _valid_part(
     return records
 
 
-def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
-    path = Path(config_path).resolve()
-    config = load_config(path)
+@dataclass(slots=True)
+class _CgvqmRunContext:
+    """CPU-only stage inputs shared by the claim loop and finalization."""
+
+    config: AppConfig
+    source_records: list[dict[str, Any]]
+    by_video_source: dict[str, list[dict[str, Any]]]
+    by_video_index: dict[str, list[dict[str, Any]]]
+    execution: str
+    output_path: Path
+    materializer: GradedMaterializer | None
+    candidates_total: int
+    state_path: Path
+    initially_done: set[str]
+
+
+def _prepare_cgvqm_context(config: AppConfig) -> _CgvqmRunContext:
+    """Validate the frozen source results and ready the durable task state.
+
+    Idempotent and torch-free: the parent runs it before spawning per-device
+    workers, and every worker runs it again in its own address space
+    (``_prepare_state`` skips tasks that already exist).
+    """
+
     source_records = list(read_jsonl(_source_result_path(config)))
     index_records = load_index_records(config)
     output_path = run_directory(config) / "graded_results.jsonl"
@@ -745,36 +901,6 @@ def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
         else None
     )
 
-    if not config.cgvqm.enabled:
-        graded = [apply_grade(record, None, config) for record in source_records]
-        write_jsonl_part(output_path, graded)
-        if materializer is not None:
-            materializer.materialize_all(graded)
-        return CGVQMStageSummary(
-            False,
-            None,
-            0,
-            0,
-            len(by_video_source),
-            0,
-            {"pending": 0, "running": 0, "done": 0, "failed": 0},
-            {},
-            output_path,
-            None if materializer is None else materializer.summary(),
-        )
-
-    model_device = _model_device(config)
-    torch.set_num_threads(config.runtime.cpu_threads_per_worker)
-    adapter = ModelAdapter.from_config(
-        config.model, device=model_device, validate_values=False
-    )
-    scorer, scorer_backend = _load_scorer(config, model_device)
-    parts_dir = run_directory(config) / "cgvqm_parts"
-    artifacts_dir = run_directory(config) / "cgvqm_artifacts"
-    parts_dir.mkdir(parents=True, exist_ok=True)
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    evidence_by_sample: dict[str, dict[str, Any]] = {}
-    graded_by_sample: dict[str, dict[str, Any]] = {}
     candidates_total = sum(
         _candidate_record(record, config) for record in source_records
     )
@@ -799,6 +925,86 @@ def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
             ) is not None:
                 initially_done.add(video_id)
 
+    return _CgvqmRunContext(
+        config=config,
+        source_records=source_records,
+        by_video_source=by_video_source,
+        by_video_index=by_video_index,
+        execution=execution,
+        output_path=output_path,
+        materializer=materializer,
+        candidates_total=candidates_total,
+        state_path=state_path,
+        initially_done=initially_done,
+    )
+
+
+def _write_disabled_cgvqm_output(
+    context: _CgvqmRunContext,
+) -> CGVQMStageSummary:
+    config = context.config
+    graded = [
+        apply_grade(record, None, config) for record in context.source_records
+    ]
+    write_jsonl_part(context.output_path, graded)
+    if context.materializer is not None:
+        context.materializer.materialize_all(graded)
+    return CGVQMStageSummary(
+        False,
+        None,
+        0,
+        0,
+        len(context.by_video_source),
+        0,
+        {"pending": 0, "running": 0, "done": 0, "failed": 0},
+        {},
+        context.output_path,
+        None if context.materializer is None else context.materializer.summary(),
+    )
+
+
+def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
+    config = load_config(Path(config_path).resolve())
+    context = _prepare_cgvqm_context(config)
+    if not config.cgvqm.enabled:
+        return _write_disabled_cgvqm_output(context)
+    backend_label = _run_cgvqm_claim_loop(context)
+    return _finalize_cgvqm_stage(context, backend_label=backend_label)
+
+
+def _run_cgvqm_claim_loop(
+    context: _CgvqmRunContext, *, device_index: int | None = None
+) -> str:
+    """Claim per-video tasks until the queue is empty.
+
+    One call owns one accelerator device; several processes may run it
+    concurrently against the shared SQLite state (the owner string is
+    device- and pid-suffixed).  Returns the scorer backend label.
+    """
+
+    config = context.config
+    by_video_source = context.by_video_source
+    by_video_index = context.by_video_index
+    execution = context.execution
+    materializer = context.materializer
+    state_path = context.state_path
+    context_cache = (
+        _ContextCache(int(config.cgvqm.context_cache_mb) * 1024 * 1024)
+        if int(config.cgvqm.context_cache_mb) > 0
+        else None
+    )
+    model_device = _model_device(config, device_index=device_index)
+    torch.set_num_threads(config.runtime.cpu_threads_per_worker)
+    adapter = ModelAdapter.from_config(
+        config.model, device=model_device, validate_values=False
+    )
+    scorer, scorer_backend = _load_scorer(
+        config, model_device, device_index=device_index
+    )
+    parts_dir = run_directory(config) / "cgvqm_parts"
+    artifacts_dir = run_directory(config) / "cgvqm_artifacts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     owner = f"{socket.gethostname()}:{os.getpid()}:cgvqm:{model_device}"
     with TaskStore(state_path) as store:
         while task := store.claim(
@@ -806,6 +1012,8 @@ def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
             lease_seconds=config.runtime.lease_seconds,
         ):
             video_id = str(task.payload["video_id"])
+            if context_cache is not None:
+                context_cache.clear()
             video_source = sorted(
                 by_video_source[video_id],
                 key=lambda item: (
@@ -863,6 +1071,7 @@ def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
                                     config=config,
                                     model_device=model_device,
                                     artifact_root=artifact_root,
+                                    context_cache=context_cache,
                                 )
                             )
                         lease.check()
@@ -935,7 +1144,25 @@ def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
                 and video_id not in materializer.completed_video_ids()
             ):
                 materializer.materialize_video(video_id, graded_video)
+    return scorer_backend
 
+
+def _finalize_cgvqm_stage(
+    context: _CgvqmRunContext, *, backend_label: str | None
+) -> CGVQMStageSummary:
+    """Grade every completed video from the shared state (torch-free)."""
+
+    config = context.config
+    by_video_source = context.by_video_source
+    execution = context.execution
+    output_path = context.output_path
+    materializer = context.materializer
+    initially_done = context.initially_done
+    candidates_total = context.candidates_total
+    source_records = context.source_records
+    state_path = context.state_path
+    evidence_by_sample: dict[str, dict[str, Any]] = {}
+    graded_by_sample: dict[str, dict[str, Any]] = {}
     with TaskStore(state_path) as store:
         counts = store.counts()
         if counts["failed"] or counts["pending"] or counts["running"]:
@@ -997,7 +1224,7 @@ def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
     write_jsonl_part(output_path, graded)
     return CGVQMStageSummary(
         True,
-        scorer_backend,
+        backend_label,
         candidates_total,
         refined,
         len(by_video_source),
@@ -1036,85 +1263,77 @@ def _write_summary(path: Path, summary: CGVQMStageSummary) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _cgvqm_stage_entry(config_path: str, summary_path: str) -> None:
-    summary = _run_cgvqm_stage_local(config_path)
-    _write_summary(Path(summary_path), summary)
+def _cgvqm_stage_work_entry(config_path: str, device_index: int) -> None:
+    """Spawn target: run the claim loop for exactly one accelerator device.
 
+    Finalization (grading, materialization, summary) is the parent's job:
+    it needs no torch context and reads the shared SQLite state after all
+    workers have joined.
+    """
 
-def _read_summary(path: Path) -> CGVQMStageSummary:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    materialization_payload = payload.get("materialization")
-    materialization = None
-    if isinstance(materialization_payload, Mapping):
-        materialization = GradedMaterializationSummary(
-            strategy=str(materialization_payload["strategy"]),
-            staging_path=Path(str(materialization_payload["staging_path"])),
-            videos=int(materialization_payload["videos"]),
-            centers={
-                str(key): int(value)
-                for key, value in materialization_payload["centers"].items()
-            },
-            frames={
-                str(key): int(value)
-                for key, value in materialization_payload["frames"].items()
-            },
-            copy_counts={
-                str(key): int(value)
-                for key, value in materialization_payload["copy_counts"].items()
-            },
-        )
-    return CGVQMStageSummary(
-        enabled=bool(payload["enabled"]),
-        backend=None if payload["backend"] is None else str(payload["backend"]),
-        candidates=int(payload["candidates"]),
-        refined=int(payload["refined"]),
-        videos=int(payload["videos"]),
-        reused_videos=int(payload["reused_videos"]),
-        counts={
-            str(key): int(value) for key, value in payload["counts"].items()
-        },
-        error_summary={
-            str(key): float(value)
-            for key, value in payload["error_summary"].items()
-        },
-        manifest_path=Path(str(payload["manifest_path"])),
-        materialization=materialization,
-    )
+    config = load_config(config_path)
+    context = _prepare_cgvqm_context(config)
+    if not config.cgvqm.enabled:
+        return
+    _run_cgvqm_claim_loop(context, device_index=device_index)
 
 
 def run_cgvqm_stage(config_path: str | Path) -> CGVQMStageSummary:
-    """Run CGVQM in a clean child process when the main model uses an accelerator."""
+    """Run CGVQM with one worker process per accelerator device.
+
+    Accelerator stages spawn one clean child process per configured device
+    (each loads the model and R3D-18 once and claims videos from the shared
+    SQLite state); the parent then finalizes from the shared state without
+    initializing torch itself.  CPU runs stay in-process.
+    """
 
     path = Path(config_path).resolve()
     config = load_config(path)
-    if config.runtime.backend == "cpu":
+    if config.runtime.backend == "cpu" or not config.cgvqm.enabled:
         return _run_cgvqm_stage_local(path)
-    summary_path = run_directory(config) / "cgvqm_stage_summary.json"
-    summary_path.unlink(missing_ok=True)
-    context = get_spawn_context()
-    process = context.Process(
-        target=_cgvqm_stage_entry,
-        args=(str(path), str(summary_path)),
-        name="vfi-cgvqm-refine",
-    )
-    process.start()
+
+    # Prepared before spawning so initially_done reflects the stage start.
+    stage_context = _prepare_cgvqm_context(config)
+
+    spawn = get_spawn_context()
+    processes: list[tuple[int, Any]] = []
+    for device_index in config.runtime.devices:
+        device_index = int(device_index)
+        process = spawn.Process(
+            target=_cgvqm_stage_work_entry,
+            args=(str(path), device_index),
+            name=f"vfi-cgvqm-refine-{device_index}",
+        )
+        processes.append((device_index, process))
+    for _, process in processes:
+        process.start()
     last_log = time.monotonic()
-    while process.is_alive():
-        process.join(timeout=1.0)
+    while any(process.is_alive() for _, process in processes):
+        for _, process in processes:
+            process.join(timeout=1.0)
         if time.monotonic() - last_log >= 30.0:
+            running = sum(1 for _, process in processes if process.is_alive())
             print(
-                "[cgvqm] refinement worker is still running",
+                f"[cgvqm] {running} refinement workers still running",
                 file=sys.stderr,
                 flush=True,
             )
             last_log = time.monotonic()
-    if process.exitcode != 0:
-        raise RuntimeError(
-            f"CGVQM refinement worker failed with exit code {process.exitcode}"
-        )
-    if not summary_path.is_file():
-        raise RuntimeError("CGVQM refinement worker did not write its summary")
-    return _read_summary(summary_path)
+    failed = sorted(
+        device_index
+        for device_index, process in processes
+        if process.exitcode != 0
+    )
+    if failed:
+        raise RuntimeError(f"CGVQM refinement workers failed on devices {failed}")
+
+    summary = _finalize_cgvqm_stage(
+        stage_context, backend_label=_scorer_backend_label(config)
+    )
+    _write_summary(
+        run_directory(config) / "cgvqm_stage_summary.json", summary
+    )
+    return summary
 
 
 __all__ = [
