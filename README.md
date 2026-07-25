@@ -37,7 +37,7 @@ cp configs/example.json configs/my_game.json
 - `model.factory` 指向实际适配器的 `module:function`。
 - `model.checkpoint` 指向已经存在的当前模型权重。
 - `runtime.run_dir` 使用本次实验独立目录。
-- NPU 生产配置使用 `backend: "npu"`、设备 `0..7`、`workers: 8`、`precision: "float32"` 和 `model.batch_size: 64`。吞吐调优项：`runtime.postproc_workers`（CPU 评分线程数，0 为自动且每个 NPU worker 最多 2 个）、`runtime.postproc_buffer_mb`（每 worker 在途重建、输入引用和评分 scratch 的完整预留预算，默认 1024 MB）、`runtime.decode_cache_mb`（uint8 帧缓存上限）和 `runtime.reconstruction`。模型 batch 与重建/CPU 后处理微批次相互独立。
+- NPU 生产配置使用 `backend: "npu"`、设备 `0..7`、`workers: 8` 和 `precision: "float32"`。`model.batch_size: 64` 是首轮起点，应在 A3 用相同 chunk 对比 16/32/64 的完整墙钟时间后选择。推理 batch 只包含网络分辨率 Tensor；原分辨率帧在解码队列中保持 uint8，并只为当前 reconstruction 微批次转换 float32。吞吐调优项包括 `runtime.postproc_workers`（0 为自动且每个 NPU worker 最多 2 个）、`runtime.postproc_buffer_mb`（覆盖 Future retained、评分 scratch 与 reconstruction transient，默认 1024 MB）、`runtime.decode_cache_mb` 和 `runtime.reconstruction`。
 - `cgvqm.backbone_checkpoint` 和 `cgvqm.calibration_checkpoint` 指向离线包中已登记的 R3D-18 与 CGVQM-2 权重；A3 Conv3D 不可用时，只有 `allow_cpu_fallback=true` 才会明确记录并回退 CPU。
 
 工具不会猜测 checkpoint key、网络输出顺序或 `mask0` 方向；接入契约见 `docs/model_adapter.md`。  
@@ -154,7 +154,8 @@ CGVQM 分级完成后，`finalize` 会自动启动诊断阶段，无需单独的
 
 - 仅为 A/B 困难中心生成诊断图；`output.save_review=true` 时也包括具有完整 CGVQM 证据的 Review 样本。
 - 任务会动态切成足够多的小块，最多启动 `runtime.workers` 个独立设备进程；8 卡配置下最多一张卡一个 worker，任务不足时自动减少 worker 数。
-- 每个 worker 只绑定自己的 NPU，并只加载一次当前模型；图片解码、NPU 推理+重建（默认在卡上，见 `runtime.reconstruction`）和 CPU 评分/拼图通过预取流水线重叠。CPU 诊断对同一 GT、warp、flow 和 mask 只构建一次共享证据，region 循环只执行局部聚合；自动后处理并发按 CPU 公平份额计算并限制为每 worker 最多 2 个，避免全分辨率扫描争抢内存带宽。
+- 每个 worker 只绑定自己的 NPU，并只加载一次当前模型；图片解码、NPU 推理+重建（默认在卡上，见 `runtime.reconstruction`）和 CPU 评分/拼图通过预取流水线重叠。低分辨率推理 batch 不再持有整批原分辨率 float32 副本；明确 invalid、out-of-scope 或低 wrongness 的样本会跳过 branch diagnosis，任何训练级样本仍必须完成完整诊断。warp/endpoint branch 只在带 1 px halo 的候选区域计算，flow scope 保持全分辨率。自动后处理并发按 CPU 公平份额计算并限制为每 worker 最多 2 个。
+- main/teacher/diagnostic 进度显示 `decode_uint8`、`network`、`reconstruction_transient`、pending retained/reserved 和 `resident_estimate`。每完成约 16 个 scored 样本及 chunk 结束时会输出 decode、inference、reconstruction、Future wait 与四个 CPU 子阶段的 `ms/sample`；`resident_estimate` 是程序可归因估算，不等于进程 RSS。
 - CGVQM 和诊断任务各自使用独立 SQLite 状态、后台 lease heartbeat、attempt-scoped part 和 artifact 目录。过期、失败或产物缺失的任务可在重跑时恢复，过期 attempt 不会覆盖 winning attempt。
 
 最终诊断仍要求经过校准的 FP32 基线；Windows/CUDA 结果只能用于通用功能与数值检查，不能代替 Ascend 910B 上的算子和吞吐验证。

@@ -42,13 +42,14 @@
     "checkpoint": null,
 
     // 网络固定输入尺寸（高×宽，单位像素）。
-    // ModelAdapter 会在推理前自动将原始帧双线性缩放到此尺寸，
-    // 因此网络始终以此固定分辨率运行，与输入帧的实际分辨率无关。
+    // worker 会逐帧双线性缩放并直接写入网络尺寸 batch；不会先 stack
+    // 整个原分辨率 float32 batch。ModelAdapter 仍会校验最终输入尺寸。
     "input_height": 540,
     "input_width": 960,
 
-    // NPU 主推理批大小。A3 已验证 64 明显提升吞吐；全分辨率重建与
-    // CPU 评分会按 postproc_buffer_mb 自动拆成微批次，不跟随此值堆积。
+    // NPU 主推理批大小，只影响网络分辨率输入与低分辨率模型输出。
+    // 原分辨率 uint8/float32 生命周期已与该值解耦。64 是首轮起点；
+    // A3 应用同一 chunk 对比 16/32/64 的总耗时后选择，而非只看 NPU 前向。
     "batch_size": 64,
 
     // mask0 的语义角色，决定后处理时如何将 mask0/mask1 用于融合：
@@ -191,7 +192,7 @@
 
     // 预取队列深度：图片解码与 NPU 推理的流水线并发深度。
     // 2 表示在 NPU 处理当前批的同时，CPU 已在解码下一批。
-    // 内存充足时可适当增大（4～8）以提高吞吐；内存紧张时设为 1。
+    // 大分辨率数据建议从 1～2 开始；队列批次保持 uint8，不持有 float32。
     "prefetch": 2,
 
     // 每个 worker 的图片解码缓存上限（MB）。帧以 uint8 缓存（比 float32
@@ -211,9 +212,9 @@
     "postproc_workers": 0,
 
     // 每个 worker 的 CPU 后处理完整预留上限（MB），覆盖 18 通道重建结果、
-    // Future 持有的三张输入帧以及每个活跃 Future 的评分 scratch。模型 batch
-    // 与后处理微批次解耦；提交 reconstruction 前即完成预留检查。单样本超过
-    // 预算时会独占执行并记录 oversize=1，不会与其他 Future 并发。
+    // Future 持有的 9 通道 float32 输入、24 plane 评分 scratch、当前微批次
+    // 6 通道 endpoint stack transient 和固定开销。准入在原分辨率 float32
+    // 转换与 reconstruction 之前完成；单样本超预算时独占并记录 oversize=1。
     "postproc_buffer_mb": 1024,
 
     // 每个 worker 在正式推理前运行的预热批数。

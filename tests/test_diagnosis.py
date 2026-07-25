@@ -6,10 +6,16 @@ import pytest
 import vfi_hard_miner.diagnosis as diagnosis_module
 from vfi_hard_miner.diagnosis import (
     REASON_LABELS,
+    _branch_region_errors,
     diagnose_sample,
     estimate_solvability,
 )
-from vfi_hard_miner.scoring import score_local_errors
+from vfi_hard_miner.scoring import (
+    build_image_basis,
+    compute_structure_map,
+    score_local_errors,
+    score_region,
+)
 
 
 def test_teacher_that_recovers_local_error_raises_solvability():
@@ -123,11 +129,11 @@ def test_precomputed_local_score_avoids_rescoring_and_matches_legacy_path(monkey
     assert actual == expected
 
 
-@pytest.mark.parametrize(("with_teacher", "expected_calls"), [(False, 5), (True, 6)])
-def test_branch_full_frame_work_is_constant_across_eight_regions(
+@pytest.mark.parametrize(("with_teacher", "branch_count"), [(False, 5), (True, 6)])
+def test_branch_work_is_limited_to_candidate_crops(
     monkeypatch,
     with_teacher,
-    expected_calls,
+    branch_count,
 ):
     gt = np.zeros((96, 96, 3), dtype=np.float32)
     gt[12:84, 46:50] = 1.0
@@ -138,12 +144,11 @@ def test_branch_full_frame_work_is_constant_across_eight_regions(
         for row in range(2)
         for column in range(4)
     ]
-    calls = 0
+    shapes = []
     original = diagnosis_module.compute_structure_map
 
     def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
+        shapes.append(tuple(np.asarray(args[0]).shape[:2]))
         return original(*args, **kwargs)
 
     monkeypatch.setattr(diagnosis_module, "compute_structure_map", counted)
@@ -159,7 +164,38 @@ def test_branch_full_frame_work_is_constant_across_eight_regions(
         scoring_result=scoring,
     )
 
-    assert calls == expected_calls
+    assert len(shapes) == branch_count * len(boxes)
+    assert all(height <= 32 and width <= 20 for height, width in shapes)
+    assert all(shape != gt.shape[:2] for shape in shapes)
+
+
+def test_branch_crop_scores_match_full_frame_for_edges_and_corners():
+    rng = np.random.default_rng(19)
+    reference_image = rng.random((37, 41, 3), dtype=np.float32)
+    branch = rng.random((37, 41, 3), dtype=np.float32)
+    boxes = (
+        (0, 0, 5, 6),
+        (36, 0, 41, 4),
+        (0, 32, 4, 37),
+        (35, 31, 41, 37),
+        (7, 8, 23, 29),
+    )
+    basis = build_image_basis(reference_image)
+    full_structure = compute_structure_map(branch, basis)
+    expected = tuple(score_region(full_structure, box) for box in boxes)
+
+    actual = _branch_region_errors(branch, basis, boxes)
+    actual_from_cropped_reference = _branch_region_errors(
+        branch, reference_image, boxes
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-7)
+    np.testing.assert_allclose(
+        actual_from_cropped_reference,
+        expected,
+        rtol=0.0,
+        atol=1e-7,
+    )
 
 
 def test_primary_region_prefers_central_structure_over_static_edge_hud():

@@ -95,6 +95,19 @@ def grade_candidate(
         blocking.append("solvability_not_accepted")
     if wrong < thresholds.wrong_accept_at:
         blocking.append("traditional_error_not_accepted")
+    record_metrics = record.get("metrics", {})
+    diagnosis_metrics = (
+        record_metrics.get("diagnosis", {})
+        if isinstance(record_metrics, Mapping)
+        else {}
+    )
+    if isinstance(diagnosis_metrics, Mapping):
+        try:
+            diagnosis_skipped = float(diagnosis_metrics.get("skipped", 0.0))
+        except (TypeError, ValueError):
+            diagnosis_skipped = 1.0
+        if not np.isfinite(diagnosis_skipped) or diagnosis_skipped >= 0.5:
+            blocking.append("diagnosis_not_completed")
     if not record.get("regions"):
         blocking.append("localized_evidence_missing")
     if blocking:

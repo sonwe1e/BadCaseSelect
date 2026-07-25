@@ -41,6 +41,7 @@ from .state import LeaseHeartbeat, LeaseLostError, TaskRecord, TaskStore
 from .worker import (
     _infer_model_batch,
     _postproc_microbatch_size,
+    _prepare_reconstruction_microbatch,
     _reconstruct_outputs,
     _resolve_reconstruction_device,
     _slice_model_outputs,
@@ -579,7 +580,7 @@ def _fill_and_score_clips(
         max_cache=config.runtime.chunk_triplets + 2,
         cache_budget_bytes=int(config.runtime.decode_cache_mb) * 1024 * 1024,
     ):
-        img0_tensor, img1_tensor, outputs = _infer_model_batch(
+        inference_batch = _infer_model_batch(
             items,
             adapter=adapter,
             production_batch=config.model.batch_size,
@@ -588,20 +589,25 @@ def _fill_and_score_clips(
             items,
             buffer_bytes=buffer_bytes,
             # This loop is synchronous and owns no CPU Future pool.  Use the
-            # whole stage budget instead of dividing it by main-stage workers.
+            # whole stage budget and no main-stage scoring scratch.
             postproc_workers=1,
+            scratch_channels=0,
         )
         for micro_start in range(0, len(items), microbatch):
             micro_end = min(len(items), micro_start + microbatch)
+            item_slice = list(items[micro_start:micro_end])
+            prepared = _prepare_reconstruction_microbatch(item_slice)
             reconstructed = _reconstruct_outputs(
-                img0_tensor[micro_start:micro_end],
-                img1_tensor[micro_start:micro_end],
-                _slice_model_outputs(outputs, micro_start, micro_end),
+                prepared.img0_tensor,
+                prepared.img1_tensor,
+                _slice_model_outputs(
+                    inference_batch.outputs, micro_start, micro_end
+                ),
                 model_config=config.model,
                 device=reconstruction_device,
             )
             for local, (record, _img0, gt, _img1) in enumerate(
-                items[micro_start:micro_end]
+                prepared.items
             ):
                 prediction = _hwc(reconstructed.prediction[local])
                 sample_id = str(record["sample_id"])
@@ -620,6 +626,7 @@ def _fill_and_score_clips(
                     )
                     clip.filled[slot] = True
                 completed += 1
+            del prepared
         print(
             f"[cgvqm] reconstructed {completed}/{len(ordered_context)} "
             f"context samples",

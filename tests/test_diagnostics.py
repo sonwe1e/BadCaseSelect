@@ -93,7 +93,7 @@ def test_diagnostic_large_batch_uses_memory_bounded_microbatches(
         f"sample-{index}" for index in range(65)
     ]
     assert sum(reconstructed_sizes) == 65
-    assert max(reconstructed_sizes) == 6
+    assert max(reconstructed_sizes) == 5
     progress = capsys.readouterr().err
     assert "inferred 65/65" in progress
     assert "scored 65/65" in progress

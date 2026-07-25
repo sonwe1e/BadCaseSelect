@@ -49,15 +49,60 @@ from .state import LeaseHeartbeat, LeaseLostError, TaskStore
 
 ImageCache = OrderedDict[str, np.ndarray]
 DecodedItem = tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]
+ScoringItem = tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]
 DecodeEvent = tuple[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedBatch:
+    items: tuple[DecodedItem, ...]
+    decode_seconds: float
+    uint8_bytes: int
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __getitem__(self, index: int | slice) -> DecodedItem | tuple[DecodedItem, ...]:
+        return self.items[index]
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceBatch:
+    outputs: ModelOutputs
+    input_bytes: int
+    output_bytes: int
+
+    @property
+    def network_bytes(self) -> int:
+        return self.input_bytes + self.output_bytes
+
+
+@dataclass(slots=True)
+class PreparedMicrobatch:
+    items: list[ScoringItem]
+    img0_tensor: torch.Tensor
+    img1_tensor: torch.Tensor
+    float32_bytes: int
+    stack_bytes: int
 
 
 @dataclass
 class CpuTimingTotals:
+    decode_seconds: float = 0.0
+    inference_seconds: float = 0.0
+    reconstruction_seconds: float = 0.0
+    future_wait_seconds: float = 0.0
     scoring_seconds: float = 0.0
     branch_evidence_seconds: float = 0.0
     motion_gates_seconds: float = 0.0
     serialization_seconds: float = 0.0
+    decode_samples: int = 0
+    inference_samples: int = 0
+    reconstruction_samples: int = 0
+    future_wait_samples: int = 0
     samples: int = 0
 
     def __post_init__(self) -> None:
@@ -78,9 +123,250 @@ class CpuTimingTotals:
             self.serialization_seconds += float(serialization)
             self.samples += 1
 
+    def add_decode(self, seconds: float, samples: int) -> None:
+        with self._lock:
+            self.decode_seconds += float(seconds)
+            self.decode_samples += int(samples)
+
+    def add_inference(self, seconds: float, samples: int) -> None:
+        with self._lock:
+            self.inference_seconds += float(seconds)
+            self.inference_samples += int(samples)
+
+    def add_reconstruction(self, seconds: float, samples: int) -> None:
+        with self._lock:
+            self.reconstruction_seconds += float(seconds)
+            self.reconstruction_samples += int(samples)
+
+    def add_future_wait(self, seconds: float, samples: int) -> None:
+        with self._lock:
+            self.future_wait_seconds += float(seconds)
+            self.future_wait_samples += int(samples)
+
+    def milliseconds_per_sample(self) -> dict[str, float]:
+        with self._lock:
+            values = {
+                "decode": (
+                    self.decode_seconds,
+                    self.decode_samples,
+                ),
+                "inference": (
+                    self.inference_seconds,
+                    self.inference_samples,
+                ),
+                "reconstruction": (
+                    self.reconstruction_seconds,
+                    self.reconstruction_samples,
+                ),
+                "future_wait": (
+                    self.future_wait_seconds,
+                    self.future_wait_samples,
+                ),
+                "scoring": (self.scoring_seconds, self.samples),
+                "branch_evidence": (
+                    self.branch_evidence_seconds,
+                    self.samples,
+                ),
+                "motion_gates": (
+                    self.motion_gates_seconds,
+                    self.samples,
+                ),
+                "serialization": (
+                    self.serialization_seconds,
+                    self.samples,
+                ),
+            }
+        return {
+            name: (seconds * 1000.0 / count if count > 0 else 0.0)
+            for name, (seconds, count) in values.items()
+        }
+
+
+_TIMING_REPORT_SAMPLES = 16
+
+
+def _print_timing_summary(
+    prefix: str,
+    timings: CpuTimingTotals,
+    *,
+    scored: int,
+    final: bool,
+) -> None:
+    if not prefix:
+        return
+    values = timings.milliseconds_per_sample()
+    label = "final" if final else "periodic"
+    print(
+        f"{prefix}  timing {label} scored={scored}"
+        f"  decode_ms/sample={values['decode']:.1f}"
+        f"  inference_ms/sample={values['inference']:.1f}"
+        f"  reconstruction_ms/sample={values['reconstruction']:.1f}"
+        f"  future_wait_ms/sample={values['future_wait']:.1f}"
+        f"  scoring_ms/sample={values['scoring']:.1f}"
+        f"  branch_evidence_ms/sample={values['branch_evidence']:.1f}"
+        f"  motion_gates_ms/sample={values['motion_gates']:.1f}"
+        f"  serialization_ms/sample={values['serialization']:.1f}",
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 def _tensor_from_hwc(image: np.ndarray) -> torch.Tensor:
-    return torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1)
+    array = np.asarray(image)
+    if not array.flags.c_contiguous or not array.flags.writeable:
+        array = np.array(array, copy=True, order="C")
+    return torch.from_numpy(array).permute(2, 0, 1)
+
+
+def _validate_source_frame(image: np.ndarray, *, name: str) -> np.ndarray:
+    array = np.asarray(image)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError(f"{name} must have shape [H,W,3], got {array.shape}")
+    if array.shape[0] < 1 or array.shape[1] < 1:
+        raise ValueError(f"{name} spatial dimensions must be positive")
+    if array.dtype == np.uint8:
+        return array
+    if not np.issubdtype(array.dtype, np.floating):
+        raise TypeError(f"{name} must be uint8 or normalized floating point")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} contains NaN or infinite values")
+    if array.size and (
+        float(array.min()) < -1e-6 or float(array.max()) > 1.0 + 1e-6
+    ):
+        raise ValueError(f"{name} floating values must be normalized to [0,1]")
+    return array
+
+
+def _decoded_batch_uint8_bytes(items: Sequence[DecodedItem]) -> int:
+    """Count unique uint8 frame allocations referenced by a decoded batch."""
+
+    seen: set[int] = set()
+    total = 0
+    for _, img0, gt, img1 in items:
+        for image in (img0, gt, img1):
+            identity = id(image)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += int(image.nbytes)
+    return total
+
+
+def _network_frame_tensor(
+    image: np.ndarray,
+    *,
+    network_size: tuple[int, int],
+) -> torch.Tensor:
+    """Convert one uint8 frame directly into one network-sized CHW tensor."""
+
+    array = _validate_source_frame(image, name="network input")
+    tensor = _tensor_from_hwc(array).to(dtype=torch.float32)
+    if array.dtype == np.uint8:
+        tensor.div_(255.0)
+    if tuple(tensor.shape[-2:]) != tuple(network_size):
+        tensor = F.interpolate(
+            tensor.unsqueeze(0),
+            size=network_size,
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+    return tensor
+
+
+def _network_input_batch(
+    items: Sequence[DecodedItem],
+    *,
+    production_batch: int,
+    network_size: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build only fixed-resolution model inputs, one source frame at a time."""
+
+    if not items:
+        raise ValueError("inference batch must not be empty")
+    if production_batch < len(items):
+        raise ValueError(
+            f"production batch {production_batch} is smaller than "
+            f"valid item count {len(items)}"
+        )
+    height, width = (int(network_size[0]), int(network_size[1]))
+    if height < 1 or width < 1:
+        raise ValueError(f"network_size must be positive, got {network_size}")
+    img0_batch = torch.empty(
+        (production_batch, 3, height, width),
+        dtype=torch.float32,
+    )
+    img1_batch = torch.empty_like(img0_batch)
+    for index, item in enumerate(items):
+        img0 = _validate_source_frame(item[1], name=f"items[{index}].img0")
+        img1 = _validate_source_frame(item[3], name=f"items[{index}].img1")
+        if img0.shape != img1.shape:
+            raise ValueError(
+                f"items[{index}] endpoint shapes differ: "
+                f"{img0.shape} and {img1.shape}"
+            )
+        img0_batch[index].copy_(
+            _network_frame_tensor(img0, network_size=(height, width))
+        )
+        img1_batch[index].copy_(
+            _network_frame_tensor(img1, network_size=(height, width))
+        )
+    valid_count = len(items)
+    if valid_count < production_batch:
+        img0_batch[valid_count:].copy_(img0_batch[valid_count - 1])
+        img1_batch[valid_count:].copy_(img1_batch[valid_count - 1])
+    return img0_batch, img1_batch
+
+
+def _prepare_reconstruction_microbatch(
+    items: Sequence[DecodedItem],
+) -> PreparedMicrobatch:
+    """Convert only the current reconstruction slice to native float32."""
+
+    if not items:
+        raise ValueError("reconstruction microbatch must not be empty")
+    converted: dict[int, np.ndarray] = {}
+
+    def as_float32(image: np.ndarray, *, name: str) -> np.ndarray:
+        array = _validate_source_frame(image, name=name)
+        identity = id(array)
+        cached = converted.get(identity)
+        if cached is not None:
+            return cached
+        value = (
+            rgb_uint8_to_float32(array)
+            if array.dtype == np.uint8
+            else np.ascontiguousarray(array, dtype=np.float32)
+        )
+        converted[identity] = value
+        return value
+
+    scoring_items: list[ScoringItem] = []
+    for index, (record, img0, gt, img1) in enumerate(items):
+        first = as_float32(img0, name=f"items[{index}].img0")
+        middle = as_float32(gt, name=f"items[{index}].gt")
+        last = as_float32(img1, name=f"items[{index}].img1")
+        if first.shape != middle.shape or first.shape != last.shape:
+            raise ValueError(
+                f"items[{index}] triplet shapes differ: "
+                f"{first.shape}, {middle.shape}, {last.shape}"
+            )
+        scoring_items.append((record, first, middle, last))
+    img0_tensor = torch.stack(
+        [_tensor_from_hwc(item[1]) for item in scoring_items]
+    )
+    img1_tensor = torch.stack(
+        [_tensor_from_hwc(item[3]) for item in scoring_items]
+    )
+    return PreparedMicrobatch(
+        items=scoring_items,
+        img0_tensor=img0_tensor,
+        img1_tensor=img1_tensor,
+        float32_bytes=sum(int(value.nbytes) for value in converted.values()),
+        stack_bytes=(
+            int(img0_tensor.numel() * img0_tensor.element_size())
+            + int(img1_tensor.numel() * img1_tensor.element_size())
+        ),
+    )
 
 
 def _hwc(tensor: torch.Tensor) -> np.ndarray:
@@ -144,56 +430,20 @@ def _sample_record(
     thresholds: Any,
     timings: CpuTimingTotals | None = None,
 ) -> dict[str, Any]:
-    scoring_started = time.perf_counter()
-    prediction = _hwc(reconstructed.prediction[batch_index])
-    warp0 = _hwc(reconstructed.warp0[batch_index])
-    warp1 = _hwc(reconstructed.warp1[batch_index])
-    warp_blend = _hwc(reconstructed.warp_blend[batch_index])
+    scoring_basis_started = time.perf_counter()
     gt_basis = build_image_basis(gt, name="gt")
-    img1_basis = build_image_basis(img1, name="img1")
     img0_luminance = luminance(img0)
+    img1_luminance = luminance(img1)
     endpoint_change = np.asarray(
         np.abs(img0 - img1).mean(axis=-1),
         dtype=np.float32,
     )
-    scoring = score_local_errors(
-        prediction,
-        gt,
-        thresholds,
-        img0=img0,
-        img1=img1,
-        reference_basis=gt_basis,
-        endpoint_change_map=endpoint_change,
-    )
-    scoring_elapsed = time.perf_counter() - scoring_started
+    scoring_basis_elapsed = time.perf_counter() - scoring_basis_started
 
-    motion_started = time.perf_counter()
+    motion_gates_started = time.perf_counter()
     flow_t0 = _hwc(reconstructed.flow_t0[batch_index])
     flow_t1 = _hwc(reconstructed.flow_t1[batch_index])
     motion_evidence = compute_motion_evidence(flow_t0, flow_t1)
-    motion_elapsed = time.perf_counter() - motion_started
-
-    branch_started = time.perf_counter()
-    diagnosis = diagnose_sample(
-        prediction,
-        gt,
-        warp0=warp0,
-        warp1=warp1,
-        warp_blend=warp_blend,
-        img0=img0,
-        img1=img1,
-        flow_discontinuity_map=motion_evidence.flow_discontinuity_map,
-        mask0=_hwc(reconstructed.mask0[batch_index]),
-        mask1=_hwc(reconstructed.mask1[batch_index]),
-        regions=scoring.regions,
-        scoring_config=thresholds,
-        scoring_result=scoring,
-        img1_basis=img1_basis,
-        config=thresholds,
-    )
-    branch_elapsed = time.perf_counter() - branch_started
-
-    gates_started = time.perf_counter()
     indices = tuple(int(value) for value in source["frame_indices"])
     stride = int(source["stride"])
     contiguous = indices == (indices[0], indices[0] + stride, indices[0] + 2 * stride)
@@ -205,20 +455,99 @@ def _sample_record(
         luminance_triplet=(
             img0_luminance,
             gt_basis.luminance,
-            img1_basis.luminance,
+            img1_luminance,
         ),
     )
     validity = evaluate_validity(validity_metrics, thresholds)
     scope_metrics = motion_evidence.scope_metrics
     scope = evaluate_in_scope(scope_metrics, thresholds)
+    motion_gates_elapsed = time.perf_counter() - motion_gates_started
+
+    scoring_started = time.perf_counter()
+    prediction = _hwc(reconstructed.prediction[batch_index])
+    scoring = score_local_errors(
+        prediction,
+        gt,
+        thresholds,
+        img0=img0,
+        img1=img1,
+        reference_basis=gt_basis,
+        endpoint_change_map=endpoint_change,
+    )
+    scoring_elapsed = (
+        scoring_basis_elapsed + time.perf_counter() - scoring_started
+    )
+
+    fast_reject_reason: str | None = None
+    if validity.label == "reject":
+        fast_reject_reason = "validity_reject"
+    elif scope.label == "reject":
+        fast_reject_reason = "scope_reject"
+    elif scoring.mining_p_wrong < float(thresholds.wrong_reject_below):
+        fast_reject_reason = "prediction_not_wrong"
+
+    branch_started = time.perf_counter()
+    if fast_reject_reason is None:
+        diagnosis = diagnose_sample(
+            prediction,
+            gt,
+            warp0=_hwc(reconstructed.warp0[batch_index]),
+            warp1=_hwc(reconstructed.warp1[batch_index]),
+            warp_blend=_hwc(reconstructed.warp_blend[batch_index]),
+            img0=img0,
+            img1=img1,
+            flow_discontinuity_map=motion_evidence.flow_discontinuity_map,
+            mask0=_hwc(reconstructed.mask0[batch_index]),
+            mask1=_hwc(reconstructed.mask1[batch_index]),
+            regions=scoring.regions,
+            scoring_config=thresholds,
+            scoring_result=scoring,
+            config=thresholds,
+        )
+        p_wrong = float(diagnosis.p_wrong)
+        mining_p_wrong = float(diagnosis.mining_p_wrong)
+        p_solvable = float(diagnosis.p_solvable)
+        diagnosis_reasons = diagnosis.reasons
+        diagnosis_regions = [region.to_dict() for region in diagnosis.regions]
+        diagnosis_metrics: dict[str, Any] = dict(diagnosis.metrics)
+        primary_region_index = diagnosis.primary_region_index
+    else:
+        p_wrong = float(scoring.p_wrong)
+        mining_p_wrong = float(scoring.mining_p_wrong)
+        p_solvable = 0.0
+        diagnosis_reasons = ()
+        diagnosis_regions = []
+        primary_region_index = None
+        priority_weight = float(
+            np.clip(
+                mining_p_wrong / max(p_wrong, 1e-8)
+                if p_wrong > 0.0
+                else 1.0,
+                0.0,
+                1.0,
+            )
+        )
+        diagnosis_metrics = {
+            "candidate_region_count": 0.0,
+            "scoring_p_wrong": p_wrong,
+            "scoring_mining_p_wrong": mining_p_wrong,
+            "selected_p_wrong": p_wrong,
+            "selected_mining_p_wrong": mining_p_wrong,
+            "selected_priority_weight": priority_weight,
+            "selected_ui_likelihood": 0.0,
+            "selected_p_solvable": 0.0,
+            "skipped": 1.0,
+            "skip_reason": fast_reject_reason,
+        }
+    branch_elapsed = time.perf_counter() - branch_started
+
     decision = decide_hard_case(
         validity,
         scope,
-        diagnosis.mining_p_wrong,
-        diagnosis.p_solvable,
+        mining_p_wrong,
+        p_solvable,
         thresholds,
     )
-    motion_gates_elapsed = motion_elapsed + (time.perf_counter() - gates_started)
 
     serialization_started = time.perf_counter()
     if validity.label == "reject":
@@ -228,7 +557,14 @@ def _sample_record(
     else:
         status = decision.label
     reasons = list(
-        dict.fromkeys((*diagnosis.reasons, *validity.reasons, *scope.reasons, *decision.reasons))
+        dict.fromkeys(
+            (
+                *diagnosis_reasons,
+                *validity.reasons,
+                *scope.reasons,
+                *decision.reasons,
+            )
+        )
     )
     result = {
         **dict(source),
@@ -237,19 +573,19 @@ def _sample_record(
         "in_scope_label": scope.label,
         "valid": _label_value(validity.label),
         "in_scope": _label_value(scope.label),
-        "p_wrong": float(diagnosis.p_wrong),
-        "mining_p_wrong": float(diagnosis.mining_p_wrong),
-        "p_solvable": float(diagnosis.p_solvable),
+        "p_wrong": p_wrong,
+        "mining_p_wrong": mining_p_wrong,
+        "p_solvable": p_solvable,
         "reasons": reasons,
-        "regions": [region.to_dict() for region in diagnosis.regions],
+        "regions": diagnosis_regions,
         "metrics": {
             "scoring": scoring.metrics,
-            "diagnosis": diagnosis.metrics,
+            "diagnosis": diagnosis_metrics,
             "validity": validity.metrics,
             "scope": scope.metrics,
             "decision": decision.metrics,
         },
-        "primary_region_index": diagnosis.primary_region_index,
+        "primary_region_index": primary_region_index,
         "error": None,
     }
     serialization_elapsed = time.perf_counter() - serialization_started
@@ -380,6 +716,21 @@ def _resolve_postproc_workers(config: AppConfig) -> int:
     return min(2, cpu_budget, bandwidth_share)
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryEstimate:
+    decode_uint8_bytes: int = 0
+    network_bytes: int = 0
+    reconstruction_transient_bytes: int = 0
+
+    def resident_bytes(self, pending_reserved_bytes: int) -> int:
+        return (
+            max(0, int(self.decode_uint8_bytes))
+            + max(0, int(self.network_bytes))
+            + max(0, int(self.reconstruction_transient_bytes))
+            + max(0, int(pending_reserved_bytes))
+        )
+
+
 class _ProgressLog:
     """Periodic stderr progress reporter, safe for concurrent worker processes.
 
@@ -412,12 +763,14 @@ class _ProgressLog:
         pending_batches: int,
         pending_bytes: int,
         pending_retained_bytes: int | None = None,
+        memory: MemoryEstimate | None = None,
     ) -> None:
         self._inferred += n
         self._maybe_emit(
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
             pending_retained_bytes=pending_retained_bytes,
+            memory=memory,
         )
 
     def update_scored(
@@ -427,12 +780,14 @@ class _ProgressLog:
         pending_batches: int,
         pending_bytes: int,
         pending_retained_bytes: int | None = None,
+        memory: MemoryEstimate | None = None,
     ) -> None:
         self._scored += n
         self._maybe_emit(
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
             pending_retained_bytes=pending_retained_bytes,
+            memory=memory,
         )
 
     def update_invalid(
@@ -442,6 +797,7 @@ class _ProgressLog:
         pending_batches: int,
         pending_bytes: int,
         pending_retained_bytes: int | None = None,
+        memory: MemoryEstimate | None = None,
     ) -> None:
         self._inferred += n
         self._scored += n
@@ -449,6 +805,7 @@ class _ProgressLog:
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
             pending_retained_bytes=pending_retained_bytes,
+            memory=memory,
         )
 
     def waiting(
@@ -457,11 +814,13 @@ class _ProgressLog:
         pending_batches: int,
         pending_bytes: int,
         pending_retained_bytes: int | None = None,
+        memory: MemoryEstimate | None = None,
     ) -> None:
         self._maybe_emit(
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
             pending_retained_bytes=pending_retained_bytes,
+            memory=memory,
         )
 
     def _maybe_emit(
@@ -470,6 +829,7 @@ class _ProgressLog:
         pending_batches: int,
         pending_bytes: int,
         pending_retained_bytes: int | None = None,
+        memory: MemoryEstimate | None = None,
     ) -> None:
         now = time.monotonic()
         if now - self._last >= self._INTERVAL:
@@ -478,6 +838,7 @@ class _ProgressLog:
                 pending_batches=pending_batches,
                 pending_bytes=pending_bytes,
                 pending_retained_bytes=pending_retained_bytes,
+                memory=memory,
             )
             self._last = now
 
@@ -487,12 +848,14 @@ class _ProgressLog:
         pending_batches: int = 0,
         pending_bytes: int = 0,
         pending_retained_bytes: int | None = None,
+        memory: MemoryEstimate | None = None,
     ) -> None:
         self._emit(
             time.monotonic(),
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
             pending_retained_bytes=pending_retained_bytes,
+            memory=memory,
             final=True,
         )
 
@@ -503,6 +866,7 @@ class _ProgressLog:
         pending_batches: int,
         pending_bytes: int,
         pending_retained_bytes: int | None = None,
+        memory: MemoryEstimate | None = None,
         final: bool = False,
     ) -> None:
         elapsed = now - self._start
@@ -513,13 +877,21 @@ class _ProgressLog:
             if pending_retained_bytes is None
             else pending_retained_bytes
         )
+        resolved_memory = memory or MemoryEstimate()
+        resident_estimate = resolved_memory.resident_bytes(pending_bytes)
         print(
             f"{self._prefix}  inferred {self._inferred}/{self._total}"
             f"  scored {self._scored}/{self._total}"
             f"  pending {pending_batches} batches"
             f"  retained {retained_bytes / (1024 * 1024):.0f} MiB"
             f"  reserved {pending_bytes / (1024 * 1024):.0f} MiB"
-            f"  {elapsed:.0f}s  {rate:.1f}/s  {label}",
+            f"  decode_uint8 "
+            f"{resolved_memory.decode_uint8_bytes / (1024 * 1024):.0f} MiB"
+            f"  network {resolved_memory.network_bytes / (1024 * 1024):.0f} MiB"
+            f"  reconstruction_transient "
+            f"{resolved_memory.reconstruction_transient_bytes / (1024 * 1024):.0f} MiB"
+            f"  resident_estimate {resident_estimate / (1024 * 1024):.0f} MiB"
+            f"  {elapsed:.0f}s  {rate:.2f}/s  {label}",
             file=sys.stderr,
             flush=True,
         )
@@ -539,11 +911,10 @@ def _prefetched_decode_batches(
     remain on the worker's main thread, so the producer never touches a CANN,
     CUDA, or NPU context.
 
-    Frames are cached as uint8 (a quarter of float32 memory) so a large cache
-    can cover a whole stride=1 chunk; conversion to float32 happens when each
-    triplet item is built, so downstream consumers still see the usual
-    float32 arrays.  ``cache_budget_bytes`` caps cache memory once the first
-    frame's size is known.
+    Frames and queued batches remain uint8.  Native-resolution float32
+    conversion happens only for the reconstruction microbatch that has already
+    passed memory admission.  ``cache_budget_bytes`` caps the uint8 LRU once
+    the first frame's size is known.
     """
 
     queue: Queue[DecodeEvent] = Queue(maxsize=max(1, prefetch))
@@ -560,25 +931,14 @@ def _prefetched_decode_batches(
 
     def produce() -> None:
         cache: ImageCache = OrderedDict()
-        # Separate float32 layer so stride=1 frames aren't re-converted on each
-        # triplet overlap.  For stride=1 data each unique frame appears in up to
-        # three consecutive triplets; without this cache the uint8 LRU hit still
-        # costs one full-frame float32 allocation + divide per access.
-        f32_cache: ImageCache = OrderedDict()
         pending: list[DecodedItem] = []
         pending_shape: tuple[int, int, int] | None = None
+        pending_decode_seconds = 0.0
         capacity = max(1, int(max_cache))
-        # float32 is 4x larger than uint8; keep proportionally fewer entries.
-        f32_capacity = max(4, capacity // 4)
         budget_resolved = cache_budget_bytes is None
 
         def load(path: str) -> np.ndarray:
-            nonlocal capacity, f32_capacity, budget_resolved
-            # Fast path: float32 already computed for this path (stride=1 hit).
-            existing = f32_cache.pop(path, None)
-            if existing is not None:
-                f32_cache[path] = existing
-                return existing
+            nonlocal capacity, budget_resolved
             image = _load_cached_uint8(cache, path, max_items=capacity)
             if not budget_resolved:
                 budget_resolved = True
@@ -586,28 +946,29 @@ def _prefetched_decode_batches(
                     1,
                     min(capacity, max(8, int(cache_budget_bytes) // max(1, image.nbytes))),
                 )
-                # Re-derive f32 capacity now that per-frame size is known.
-                f32_capacity = max(4, capacity // 4)
-            f32 = rgb_uint8_to_float32(image)
-            f32_cache[path] = f32
-            while len(f32_cache) > f32_capacity:
-                f32_cache.popitem(last=False)
-            return f32
+            return image
 
         def flush() -> bool:
-            nonlocal pending, pending_shape
+            nonlocal pending, pending_shape, pending_decode_seconds
             if not pending:
                 return True
-            batch = pending
+            batch = tuple(pending)
+            event = DecodedBatch(
+                items=batch,
+                decode_seconds=pending_decode_seconds,
+                uint8_bytes=_decoded_batch_uint8_bytes(batch),
+            )
             pending = []
             pending_shape = None
-            return put(("batch", batch))
+            pending_decode_seconds = 0.0
+            return put(("batch", event))
 
         try:
             for record in records:
                 if stopped.is_set():
                     return
                 try:
+                    decode_started = time.perf_counter()
                     first = load(str(record["img0"]["path"]))
                     middle = load(str(record["gt"]["path"]))
                     last = load(str(record["img1"]["path"]))
@@ -616,6 +977,7 @@ def _prefetched_decode_batches(
                             "triplet image shapes differ: "
                             f"{first.shape}, {middle.shape}, {last.shape}"
                         )
+                    record_decode_seconds = time.perf_counter() - decode_started
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     if not flush() or not put(("invalid", (record, exc))):
                         return
@@ -623,6 +985,7 @@ def _prefetched_decode_batches(
                 if pending and first.shape != pending_shape and not flush():
                     return
                 pending_shape = first.shape
+                pending_decode_seconds += record_decode_seconds
                 pending.append((record, first, middle, last))
                 if len(pending) == batch_size and not flush():
                     return
@@ -658,11 +1021,16 @@ def _infer_output_batch(
     if not items:
         raise ValueError("inference batch must not be empty")
     valid_count = len(items)
-    padded = list(items)
-    while len(padded) < production_batch:
-        padded.append(padded[-1])
-    img0_tensor = torch.stack([_tensor_from_hwc(item[1]) for item in padded])
-    img1_tensor = torch.stack([_tensor_from_hwc(item[3]) for item in padded])
+    source_shape = tuple(int(value) for value in items[0][1].shape[:2])
+    network_size = tuple(
+        int(value)
+        for value in getattr(adapter, "network_size", source_shape)
+    )
+    img0_tensor, img1_tensor = _network_input_batch(
+        items,
+        production_batch=production_batch,
+        network_size=network_size,
+    )
     outputs = _pack_outputs_to_cpu(
         adapter.infer(img0_tensor, img1_tensor),
         valid_count,
@@ -738,19 +1106,16 @@ def _infer_and_reconstruct(
 
     if not items:
         raise ValueError("inference batch must not be empty")
-    valid_count = len(items)
-    padded = list(items)
-    while len(padded) < production_batch:
-        padded.append(padded[-1])
-    img0_tensor = torch.stack([_tensor_from_hwc(item[1]) for item in padded])
-    img1_tensor = torch.stack([_tensor_from_hwc(item[3]) for item in padded])
-    outputs = _trim_model_outputs(
-        adapter.infer(img0_tensor, img1_tensor), valid_count
+    inference_batch = _infer_model_batch(
+        items,
+        adapter=adapter,
+        production_batch=production_batch,
     )
+    prepared = _prepare_reconstruction_microbatch(items)
     return _reconstruct_outputs(
-        img0_tensor[:valid_count],
-        img1_tensor[:valid_count],
-        outputs,
+        prepared.img0_tensor,
+        prepared.img1_tensor,
+        inference_batch.outputs,
         model_config=model_config,
         device=reconstruction_device,
     )
@@ -758,6 +1123,7 @@ def _infer_and_reconstruct(
 
 _INPUT_FRAME_CHANNELS = 9
 _MAIN_SCRATCH_CHANNELS = 24
+_RECONSTRUCTION_TRANSIENT_CHANNELS = 6
 _FUTURE_FIXED_BYTES = 1024 * 1024
 _FUTURE_WAIT_SECONDS = 5.0
 
@@ -771,6 +1137,8 @@ class PendingReservation:
     scratch_bytes: int
     fixed_bytes: int
     reserved_bytes: int
+    reconstruction_transient_bytes: int
+    pipeline_bytes: int
     oversize: bool = False
 
 
@@ -785,22 +1153,44 @@ def _infer_model_batch(
     *,
     adapter: ModelAdapter,
     production_batch: int,
-) -> tuple[torch.Tensor, torch.Tensor, ModelOutputs]:
-    """Run one production-sized model batch without full-resolution reconstruction."""
+) -> InferenceBatch:
+    """Infer from a production-sized fixed-network-resolution input batch."""
 
     if not items:
         raise ValueError("inference batch must not be empty")
     valid_count = len(items)
-    padded = list(items)
-    while len(padded) < production_batch:
-        padded.append(padded[-1])
-    img0_tensor = torch.stack([_tensor_from_hwc(item[1]) for item in padded])
-    img1_tensor = torch.stack([_tensor_from_hwc(item[3]) for item in padded])
+    source_shape = tuple(int(value) for value in items[0][1].shape[:2])
+    network_size = tuple(
+        int(value)
+        for value in getattr(adapter, "network_size", source_shape)
+    )
+    img0_tensor, img1_tensor = _network_input_batch(
+        items,
+        production_batch=production_batch,
+        network_size=network_size,
+    )
     outputs = _trim_model_outputs(
         adapter.infer(img0_tensor, img1_tensor),
         valid_count,
     )
-    return img0_tensor[:valid_count], img1_tensor[:valid_count], outputs
+    input_bytes = int(
+        img0_tensor.numel() * img0_tensor.element_size()
+        + img1_tensor.numel() * img1_tensor.element_size()
+    )
+    output_bytes = sum(
+        int(tensor.numel() * tensor.element_size())
+        for tensor in (
+            outputs.flow_t0,
+            outputs.flow_t1,
+            outputs.mask0,
+            outputs.mask1,
+        )
+    )
+    return InferenceBatch(
+        outputs=outputs,
+        input_bytes=input_bytes,
+        output_bytes=output_bytes,
+    )
 
 
 def _slice_model_outputs(
@@ -841,14 +1231,20 @@ def _postproc_reservation(
     )
     scratch_bytes = plane_bytes * max(0, int(scratch_channels))
     reserved_bytes = retained_bytes + scratch_bytes + _FUTURE_FIXED_BYTES
+    reconstruction_transient_bytes = (
+        count * plane_bytes * _RECONSTRUCTION_TRANSIENT_CHANNELS
+    )
+    pipeline_bytes = reserved_bytes + reconstruction_transient_bytes
     return PendingReservation(
         sample_count=count,
         retained_bytes=retained_bytes,
         scratch_bytes=scratch_bytes,
         fixed_bytes=_FUTURE_FIXED_BYTES,
         reserved_bytes=reserved_bytes,
+        reconstruction_transient_bytes=reconstruction_transient_bytes,
+        pipeline_bytes=pipeline_bytes,
         oversize=(
-            buffer_bytes is not None and reserved_bytes > max(0, int(buffer_bytes))
+            buffer_bytes is not None and pipeline_bytes > max(0, int(buffer_bytes))
         ),
     )
 
@@ -858,6 +1254,7 @@ def _postproc_microbatch_size(
     *,
     buffer_bytes: int,
     postproc_workers: int,
+    scratch_channels: int = _MAIN_SCRATCH_CHANNELS,
 ) -> int:
     """Choose a slice whose complete Future reservation fits its fair share."""
 
@@ -868,15 +1265,17 @@ def _postproc_microbatch_size(
         items,
         sample_count=1,
         buffer_bytes=per_future_budget,
+        scratch_channels=scratch_channels,
     )
     retained_per_sample = single.retained_bytes
+    transient_per_sample = single.reconstruction_transient_bytes
     fixed_and_scratch = single.scratch_bytes + single.fixed_bytes
     available = max(0, per_future_budget - fixed_and_scratch)
     return max(
         1,
         min(
             len(items),
-            available // max(1, retained_per_sample),
+            available // max(1, retained_per_sample + transient_per_sample),
         ),
     )
 
@@ -904,12 +1303,48 @@ def _process_payload_records(
     pending_retained_bytes = 0
     timings = CpuTimingTotals()
     oversize_logged = False
+    scored_count = 0
+    next_timing_report = _TIMING_REPORT_SAMPLES
+    decode_uint8_bytes = 0
+    network_bytes = 0
+    reconstruction_transient_bytes = 0
     bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
 
+    def memory_estimate() -> MemoryEstimate:
+        return MemoryEstimate(
+            decode_uint8_bytes=decode_uint8_bytes,
+            network_bytes=network_bytes,
+            reconstruction_transient_bytes=reconstruction_transient_bytes,
+        )
+
+    def maybe_report_timings(*, force: bool = False) -> None:
+        nonlocal next_timing_report
+        if not progress_prefix:
+            return
+        if force:
+            _print_timing_summary(
+                progress_prefix,
+                timings,
+                scored=scored_count,
+                final=True,
+            )
+            return
+        if scored_count < next_timing_report:
+            return
+        _print_timing_summary(
+            progress_prefix,
+            timings,
+            scored=scored_count,
+            final=False,
+        )
+        while next_timing_report <= scored_count:
+            next_timing_report += _TIMING_REPORT_SAMPLES
+
     def drain_one() -> None:
-        nonlocal pending_reserved_bytes, pending_retained_bytes
+        nonlocal pending_reserved_bytes, pending_retained_bytes, scored_count
         current = pending.pop(0)
         reservation = current.reservation
+        wait_started = time.perf_counter()
         while True:
             try:
                 completed = current.future.result(timeout=_FUTURE_WAIT_SECONDS)
@@ -922,10 +1357,16 @@ def _process_payload_records(
                         pending_batches=len(pending) + 1,
                         pending_bytes=pending_reserved_bytes,
                         pending_retained_bytes=pending_retained_bytes,
+                        memory=memory_estimate(),
                     )
+        timings.add_future_wait(
+            time.perf_counter() - wait_started,
+            reservation.sample_count,
+        )
         output.extend(completed)
         pending_reserved_bytes -= reservation.reserved_bytes
         pending_retained_bytes -= reservation.retained_bytes
+        scored_count += reservation.sample_count
         if heartbeat is not None:
             heartbeat()
         if bar is not None:
@@ -934,7 +1375,9 @@ def _process_payload_records(
                 pending_batches=len(pending),
                 pending_bytes=pending_reserved_bytes,
                 pending_retained_bytes=pending_retained_bytes,
+                memory=memory_estimate(),
             )
+        maybe_report_timings()
 
     with ThreadPoolExecutor(
         max_workers=postproc_workers,
@@ -948,19 +1391,40 @@ def _process_payload_records(
             cache_budget_bytes=cache_budget_bytes,
         ):
             if kind == "batch":
-                items: Sequence[DecodedItem] = value
-                img0_tensor, img1_tensor, outputs = _infer_model_batch(
+                decoded_batch = (
+                    value
+                    if isinstance(value, DecodedBatch)
+                    else DecodedBatch(
+                        items=tuple(value),
+                        decode_seconds=0.0,
+                        uint8_bytes=_decoded_batch_uint8_bytes(value),
+                    )
+                )
+                items = decoded_batch.items
+                decode_uint8_bytes = decoded_batch.uint8_bytes
+                timings.add_decode(decoded_batch.decode_seconds, len(items))
+                inference_started = time.perf_counter()
+                inference_batch = _infer_model_batch(
                     items,
                     adapter=adapter,
                     production_batch=model_config.batch_size,
                 )
+                timings.add_inference(
+                    time.perf_counter() - inference_started,
+                    len(items),
+                )
+                network_bytes = inference_batch.network_bytes
                 if bar is not None:
                     bar.update_inferred(
                         len(items),
                         pending_batches=len(pending),
                         pending_bytes=pending_reserved_bytes,
                         pending_retained_bytes=pending_retained_bytes,
+                        memory=memory_estimate(),
                     )
+                # Network-size input tensors are released when inference
+                # returns; only low-resolution outputs survive reconstruction.
+                network_bytes = inference_batch.output_bytes
                 microbatch_size = _postproc_microbatch_size(
                     items,
                     buffer_bytes=postproc_buffer_bytes,
@@ -976,26 +1440,44 @@ def _process_payload_records(
                     while pending and (
                         len(pending) >= postproc_workers
                         or reservation.oversize
-                        or pending_reserved_bytes + reservation.reserved_bytes
+                        or pending_reserved_bytes + reservation.pipeline_bytes
                         > postproc_buffer_bytes
                     ):
                         drain_one()
+                    reconstruction_transient_bytes = (
+                        reservation.reconstruction_transient_bytes
+                    )
+                    if bar is not None:
+                        bar.waiting(
+                            pending_batches=len(pending),
+                            pending_bytes=pending_reserved_bytes,
+                            pending_retained_bytes=pending_retained_bytes,
+                            memory=memory_estimate(),
+                        )
+                    reconstruction_started = time.perf_counter()
+                    prepared = _prepare_reconstruction_microbatch(item_slice)
                     reconstructed = _reconstruct_outputs(
-                        img0_tensor[start:end],
-                        img1_tensor[start:end],
-                        _slice_model_outputs(outputs, start, end),
+                        prepared.img0_tensor,
+                        prepared.img1_tensor,
+                        _slice_model_outputs(inference_batch.outputs, start, end),
                         model_config=model_config,
                         device=reconstruction_device,
+                    )
+                    timings.add_reconstruction(
+                        time.perf_counter() - reconstruction_started,
+                        len(item_slice),
                     )
                     finish_kwargs: dict[str, Any] = {"config": config}
                     if finish_batch is _ORIGINAL_FINISH_MAIN_BATCH:
                         finish_kwargs["timings"] = timings
                     future = executor.submit(
                         finish_batch,
-                        item_slice,
+                        prepared.items,
                         reconstructed,
                         **finish_kwargs,
                     )
+                    del prepared
+                    reconstruction_transient_bytes = 0
                     pending.append(
                         PendingPostprocess(
                             future=future,
@@ -1007,7 +1489,7 @@ def _process_payload_records(
                     if reservation.oversize and not oversize_logged:
                         print(
                             f"{progress_prefix}  pending reservation "
-                            f"{reservation.reserved_bytes / (1024 * 1024):.0f} MiB "
+                            f"{reservation.pipeline_bytes / (1024 * 1024):.0f} MiB "
                             f"exceeds budget "
                             f"{postproc_buffer_bytes / (1024 * 1024):.0f} MiB; "
                             "running one sample exclusively (oversize=1)",
@@ -1015,18 +1497,23 @@ def _process_payload_records(
                             flush=True,
                         )
                         oversize_logged = True
+                network_bytes = 0
+                decode_uint8_bytes = 0
             elif kind == "invalid":
                 while pending:
                     drain_one()
                 record, error = value
                 output.append(invalid_record(record, error))
+                scored_count += 1
                 if bar is not None:
                     bar.update_invalid(
                         1,
                         pending_batches=0,
                         pending_bytes=0,
                         pending_retained_bytes=0,
+                        memory=memory_estimate(),
                     )
+                maybe_report_timings()
             else:  # pragma: no cover - producer owns this internal protocol
                 raise RuntimeError(f"unexpected decode event {kind!r}")
             if heartbeat is not None:
@@ -1034,18 +1521,13 @@ def _process_payload_records(
         while pending:
             drain_one()
     if bar is not None:
-        bar.close()
-    if progress_prefix and timings.samples:
-        scale = 1000.0 / timings.samples
-        print(
-            f"{progress_prefix}  cpu_ms/sample"
-            f"  scoring={timings.scoring_seconds * scale:.1f}"
-            f"  branch_evidence={timings.branch_evidence_seconds * scale:.1f}"
-            f"  motion_gates={timings.motion_gates_seconds * scale:.1f}"
-            f"  serialization={timings.serialization_seconds * scale:.1f}",
-            file=sys.stderr,
-            flush=True,
+        bar.close(
+            pending_batches=0,
+            pending_bytes=0,
+            pending_retained_bytes=0,
+            memory=memory_estimate(),
         )
+    maybe_report_timings(force=True)
     return output
 
 

@@ -228,7 +228,9 @@ vfi-hard-miner run --config configs/my_game.json
 
 `run` 内部执行 index → main → 可选 teacher → CGVQM → finalize。main、可选 teacher 与 CGVQM 阶段使用独立 SQLite lease 状态。CGVQM 在干净子进程中绑定加速卡，避免协调进程导入 `torch_npu`；每个视频精判完成后即可把 A/B 帧复制到运行暂存区。分阶段命令仍可用于恢复。
 
-诊断任务按视频排序后动态切块，目标是让 8 卡配置拥有足够任务并行度；实际 worker 数为 `min(runtime.workers, 当前任务数)`。每个进程只绑定一张 NPU、加载一次当前模型，并利用解码预取和受内存预算约束的 CPU Future 重叠 NPU 推理、FP32 原图重建、局部评分和拼图生成。自动模式每个 NPU worker 最多使用两个评分 Future；完整 reservation 在 reconstruction 前检查，覆盖 18 通道重建结果、输入帧引用和评分 scratch。这里不使用 DDP、HCCL 或跨卡梯度同步。
+诊断任务按视频排序后动态切块，目标是让 8 卡配置拥有足够任务并行度；实际 worker 数为 `min(runtime.workers, 当前任务数)`。每个进程只绑定一张 NPU、加载一次当前模型。解码队列保持 uint8，推理只 stack 固定网络分辨率 Tensor，原分辨率 float32 只在当前 reconstruction 微批次中创建。自动模式每个 NPU worker 最多使用两个评分 Future；准入在 float32 转换前检查，覆盖 Future retained、24 plane 评分 scratch、6 通道 endpoint stack transient 与固定开销。这里不使用 DDP、HCCL 或跨卡梯度同步。
+
+main/teacher/diagnostic 日志会分别报告 `decode_uint8`、`network`、`reconstruction_transient`、retained、reserved 和 `resident_estimate`，并周期输出八阶段 `ms/sample`。`resident_estimate` 只是程序可归因内存，不等同 RSS。A3 应对同一 chunk 测试 batch 16/32/64 以及 postproc worker 1/2，以完整 chunk 时间最短且无持续 swap 的组合为准。
 
 状态恢复使用 execution-scoped SQLite、后台 lease heartbeat 和 attempt fencing。每次尝试写入独立的 part/artifact 目录；完成记录会绑定 winning task/attempt，缺失或无效产物在重跑时重新排队，旧 attempt 不会进入最终 `diagnostic_results.jsonl`。
 

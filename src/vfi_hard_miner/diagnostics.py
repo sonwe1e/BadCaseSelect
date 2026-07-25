@@ -20,6 +20,7 @@ from queue import Full, Queue
 import socket
 import sys
 from threading import Event, Thread
+import time
 import traceback
 from typing import Any
 
@@ -27,7 +28,7 @@ import numpy as np
 import torch
 
 from .config import AppConfig, load_config
-from .image_io import read_rgb_uint8, rgb_uint8_to_float32, write_image_atomic
+from .image_io import read_rgb_uint8, write_image_atomic
 from .manifest import merge_jsonl_parts, read_jsonl, write_jsonl_part
 from .model_adapter import ModelAdapter, ModelOutputs
 from .pipeline import execution_id, run_directory, run_state_path
@@ -38,11 +39,18 @@ from .state import LeaseHeartbeat, LeaseLostError, TaskRecord, TaskStore
 from .visualization import make_diagnostic_grid
 from .worker import (
     _FUTURE_WAIT_SECONDS,
+    _TIMING_REPORT_SAMPLES,
+    CpuTimingTotals,
+    DecodedBatch,
+    MemoryEstimate,
     PendingPostprocess,
     _ProgressLog,
+    _decoded_batch_uint8_bytes,
     _infer_model_batch,
     _postproc_microbatch_size,
     _postproc_reservation,
+    _prepare_reconstruction_microbatch,
+    _print_timing_summary,
     _reconstruct_outputs,
     _resolve_postproc_workers,
     _resolve_reconstruction_device,
@@ -222,11 +230,11 @@ def _prefetched_diagnostic_batches(
     prefetch: int,
     max_cache: int,
     cache_budget_bytes: int | None = None,
-) -> Iterator[list[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]]]:
+) -> Iterator[DecodedBatch]:
     """Decode and shape-group on a bounded CPU-only producer thread.
 
-    Frames are cached as uint8 (a quarter of float32 memory) and converted to
-    float32 when each triplet item is built.
+    Frames and queued batches remain uint8.  Native float32 conversion happens
+    only after a reconstruction microbatch passes memory admission.
     """
 
     queue: Queue[tuple[str, Any]] = Queue(maxsize=max(1, prefetch))
@@ -245,6 +253,7 @@ def _prefetched_diagnostic_batches(
         cache: ImageCache = OrderedDict()
         pending: list[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]] = []
         pending_shape: tuple[int, int, int] | None = None
+        pending_decode_seconds = 0.0
         capacity = max(1, int(max_cache))
         budget_resolved = cache_budget_bytes is None
 
@@ -257,21 +266,28 @@ def _prefetched_diagnostic_batches(
                     1,
                     min(capacity, max(8, int(cache_budget_bytes) // max(1, image.nbytes))),
                 )
-            return rgb_uint8_to_float32(image)
+            return image
 
         def flush() -> bool:
-            nonlocal pending, pending_shape
+            nonlocal pending, pending_shape, pending_decode_seconds
             if not pending:
                 return True
-            batch = pending
+            batch = tuple(pending)
+            event = DecodedBatch(
+                items=batch,
+                decode_seconds=pending_decode_seconds,
+                uint8_bytes=_decoded_batch_uint8_bytes(batch),
+            )
             pending = []
             pending_shape = None
-            return put(("batch", batch))
+            pending_decode_seconds = 0.0
+            return put(("batch", event))
 
         try:
             for record in records:
                 if stopped.is_set():
                     return
+                decode_started = time.perf_counter()
                 first = load(str(record["img0"]["path"]))
                 middle = load(str(record["gt"]["path"]))
                 last = load(str(record["img1"]["path"]))
@@ -280,9 +296,11 @@ def _prefetched_diagnostic_batches(
                         f"diagnostic triplet shapes differ for {record.get('sample_id')}: "
                         f"{first.shape}, {middle.shape}, {last.shape}"
                     )
+                record_decode_seconds = time.perf_counter() - decode_started
                 if pending and first.shape != pending_shape and not flush():
                     return
                 pending_shape = first.shape
+                pending_decode_seconds += record_decode_seconds
                 pending.append((record, first, middle, last))
                 if len(pending) == batch_size and not flush():
                     return
@@ -337,12 +355,49 @@ def process_diagnostic_payload(
     pending_reserved_bytes = 0
     pending_retained_bytes = 0
     oversize_logged = False
+    timings = CpuTimingTotals()
+    scored_count = 0
+    next_timing_report = _TIMING_REPORT_SAMPLES
+    decode_uint8_bytes = 0
+    network_bytes = 0
+    reconstruction_transient_bytes = 0
     bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
 
+    def memory_estimate() -> MemoryEstimate:
+        return MemoryEstimate(
+            decode_uint8_bytes=decode_uint8_bytes,
+            network_bytes=network_bytes,
+            reconstruction_transient_bytes=reconstruction_transient_bytes,
+        )
+
+    def maybe_report_timings(*, force: bool = False) -> None:
+        nonlocal next_timing_report
+        if not progress_prefix:
+            return
+        if force:
+            _print_timing_summary(
+                progress_prefix,
+                timings,
+                scored=scored_count,
+                final=True,
+            )
+            return
+        if scored_count < next_timing_report:
+            return
+        _print_timing_summary(
+            progress_prefix,
+            timings,
+            scored=scored_count,
+            final=False,
+        )
+        while next_timing_report <= scored_count:
+            next_timing_report += _TIMING_REPORT_SAMPLES
+
     def drain_one() -> None:
-        nonlocal pending_reserved_bytes, pending_retained_bytes
+        nonlocal pending_reserved_bytes, pending_retained_bytes, scored_count
         current = pending_futures.pop(0)
         reservation = current.reservation
+        wait_started = time.perf_counter()
         while True:
             try:
                 completed = current.future.result(timeout=_FUTURE_WAIT_SECONDS)
@@ -355,10 +410,16 @@ def process_diagnostic_payload(
                         pending_batches=len(pending_futures) + 1,
                         pending_bytes=pending_reserved_bytes,
                         pending_retained_bytes=pending_retained_bytes,
+                        memory=memory_estimate(),
                     )
+        timings.add_future_wait(
+            time.perf_counter() - wait_started,
+            reservation.sample_count,
+        )
         output.extend(completed)
         pending_reserved_bytes -= reservation.reserved_bytes
         pending_retained_bytes -= reservation.retained_bytes
+        scored_count += reservation.sample_count
         if heartbeat is not None:
             heartbeat()
         if bar is not None:
@@ -367,30 +428,52 @@ def process_diagnostic_payload(
                 pending_batches=len(pending_futures),
                 pending_bytes=pending_reserved_bytes,
                 pending_retained_bytes=pending_retained_bytes,
+                memory=memory_estimate(),
             )
+        maybe_report_timings()
 
     with ThreadPoolExecutor(
         max_workers=postproc_workers, thread_name_prefix="vfi-diagnostic-cpu"
     ) as executor:
-        for items in _prefetched_diagnostic_batches(
+        for decoded_value in _prefetched_diagnostic_batches(
             records,
             batch_size=config.model.batch_size,
             prefetch=config.runtime.prefetch,
             max_cache=max_cache,
             cache_budget_bytes=cache_budget_bytes,
         ):
-            img0_tensor, img1_tensor, outputs = _infer_model_batch(
+            decoded_batch = (
+                decoded_value
+                if isinstance(decoded_value, DecodedBatch)
+                else DecodedBatch(
+                    items=tuple(decoded_value),
+                    decode_seconds=0.0,
+                    uint8_bytes=_decoded_batch_uint8_bytes(decoded_value),
+                )
+            )
+            items = decoded_batch.items
+            decode_uint8_bytes = decoded_batch.uint8_bytes
+            timings.add_decode(decoded_batch.decode_seconds, len(items))
+            inference_started = time.perf_counter()
+            inference_batch = _infer_model_batch(
                 items,
                 adapter=adapter,
                 production_batch=config.model.batch_size,
             )
+            timings.add_inference(
+                time.perf_counter() - inference_started,
+                len(items),
+            )
+            network_bytes = inference_batch.network_bytes
             if bar is not None:
                 bar.update_inferred(
                     len(items),
                     pending_batches=len(pending_futures),
                     pending_bytes=pending_reserved_bytes,
                     pending_retained_bytes=pending_retained_bytes,
+                    memory=memory_estimate(),
                 )
+            network_bytes = inference_batch.output_bytes
             microbatch_size = _postproc_microbatch_size(
                 items,
                 buffer_bytes=postproc_buffer_bytes,
@@ -406,24 +489,42 @@ def process_diagnostic_payload(
                 while pending_futures and (
                     len(pending_futures) >= postproc_workers
                     or reservation.oversize
-                    or pending_reserved_bytes + reservation.reserved_bytes
+                    or pending_reserved_bytes + reservation.pipeline_bytes
                     > postproc_buffer_bytes
                 ):
                     drain_one()
+                reconstruction_transient_bytes = (
+                    reservation.reconstruction_transient_bytes
+                )
+                if bar is not None:
+                    bar.waiting(
+                        pending_batches=len(pending_futures),
+                        pending_bytes=pending_reserved_bytes,
+                        pending_retained_bytes=pending_retained_bytes,
+                        memory=memory_estimate(),
+                    )
+                reconstruction_started = time.perf_counter()
+                prepared = _prepare_reconstruction_microbatch(item_slice)
                 reconstructed = _reconstruct_outputs(
-                    img0_tensor[start:end],
-                    img1_tensor[start:end],
-                    _slice_model_outputs(outputs, start, end),
+                    prepared.img0_tensor,
+                    prepared.img1_tensor,
+                    _slice_model_outputs(inference_batch.outputs, start, end),
                     model_config=config.model,
                     device=reconstruction_device,
                 )
+                timings.add_reconstruction(
+                    time.perf_counter() - reconstruction_started,
+                    len(item_slice),
+                )
                 future = executor.submit(
                     _finish_batch_diagnostics,
-                    item_slice,
+                    prepared.items,
                     reconstructed,
                     config=config,
                     artifact_root=artifact_root,
                 )
+                del prepared
+                reconstruction_transient_bytes = 0
                 pending_futures.append(
                     PendingPostprocess(
                         future=future,
@@ -435,7 +536,7 @@ def process_diagnostic_payload(
                 if reservation.oversize and not oversize_logged:
                     print(
                         f"{progress_prefix}  pending reservation "
-                        f"{reservation.reserved_bytes / (1024 * 1024):.0f} MiB "
+                        f"{reservation.pipeline_bytes / (1024 * 1024):.0f} MiB "
                         f"exceeds budget "
                         f"{postproc_buffer_bytes / (1024 * 1024):.0f} MiB; "
                         "running one sample exclusively (oversize=1)",
@@ -443,10 +544,13 @@ def process_diagnostic_payload(
                         flush=True,
                     )
                     oversize_logged = True
+            network_bytes = 0
+            decode_uint8_bytes = 0
         while pending_futures:
             drain_one()
     if bar is not None:
-        bar.close()
+        bar.close(memory=memory_estimate())
+    maybe_report_timings(force=True)
     return output
 
 

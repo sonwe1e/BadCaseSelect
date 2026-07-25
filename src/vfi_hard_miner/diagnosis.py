@@ -341,11 +341,11 @@ def _crop(values: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
     return values[y0:y1, x0:x1]
 
 
-def _gradient_support_map(
+def _gradient_magnitude_and_scale(
     value: Any | None,
     *,
     shape: tuple[int, int],
-) -> np.ndarray | None:
+) -> tuple[np.ndarray, float] | None:
     if value is None:
         return None
     array = np.asarray(_to_numpy(value), dtype=np.float32)
@@ -367,9 +367,41 @@ def _gradient_support_map(
     magnitude = np.sqrt(gradient_squared)
     positive = magnitude[magnitude > 0]
     if not positive.size:
-        return np.zeros(shape, dtype=np.float32)
+        return magnitude, 1.0
     scale = max(float(np.quantile(positive, 0.95)), 1e-8)
+    return magnitude, scale
+
+
+def _gradient_support_map(
+    value: Any | None,
+    *,
+    shape: tuple[int, int],
+) -> np.ndarray | None:
+    resolved = _gradient_magnitude_and_scale(value, shape=shape)
+    if resolved is None:
+        return None
+    magnitude, scale = resolved
     return np.asarray(np.clip(magnitude / scale, 0.0, 1.0), dtype=np.float32)
+
+
+def _gradient_support_crops(
+    value: Any | None,
+    *,
+    shape: tuple[int, int],
+    boxes: Sequence[tuple[int, int, int, int]],
+    threshold: float,
+) -> tuple[np.ndarray | None, ...]:
+    """Return thresholded candidate support without a normalized full map."""
+
+    resolved = _gradient_magnitude_and_scale(value, shape=shape)
+    if resolved is None:
+        return tuple(None for _ in boxes)
+    magnitude, scale = resolved
+    cutoff = float(threshold) * scale
+    return tuple(
+        np.asarray(_crop(magnitude, box) >= cutoff, dtype=bool)
+        for box in boxes
+    )
 
 
 _NEIGHBOR_KERNEL_3X3 = np.ones((3, 3), dtype=np.int32)
@@ -403,17 +435,79 @@ def _binary_component_count(edge_map: np.ndarray, threshold: float) -> int:
     return int(count)
 
 
+def _spatial_image_view(value: Any, *, name: str) -> np.ndarray:
+    array = _to_numpy(value)
+    if array.ndim == 4:
+        if array.shape[0] != 1:
+            raise ValueError(
+                f"{name} must be one image, got batch {array.shape[0]}"
+            )
+        array = array[0]
+    if array.ndim == 3 and array.shape[-1] not in (1, 3, 4):
+        if array.shape[0] in (1, 3, 4):
+            array = np.moveaxis(array, 0, -1)
+    if array.ndim not in (2, 3):
+        raise ValueError(f"{name} must be a 2-D or 3-D image, got {array.shape}")
+    return array
+
+
 def _branch_region_errors(
     branch: Any | None,
-    reference: ImageBasis | None,
+    reference: ImageBasis | Any | None,
     boxes: Sequence[tuple[int, int, int, int]],
 ) -> tuple[float | None, ...]:
     if branch is None:
         return tuple(None for _ in boxes)
     if reference is None:
         raise ValueError("branch reference evidence is required")
-    structure = compute_structure_map(branch, reference)
-    return tuple(score_region(structure, box) for box in boxes)
+    array = _spatial_image_view(branch, name="branch")
+    reference_array = (
+        None
+        if isinstance(reference, ImageBasis)
+        else _spatial_image_view(reference, name="branch reference")
+    )
+    reference_shape = (
+        reference.rgb.shape[:2]
+        if isinstance(reference, ImageBasis)
+        else reference_array.shape[:2]
+    )
+    if tuple(array.shape[:2]) != tuple(reference_shape):
+        raise ValueError(
+            "branch and reference must have the same spatial shape, got "
+            f"{array.shape[:2]} and {reference_shape}"
+        )
+
+    height, width = reference_shape
+    errors: list[float] = []
+    for x0, y0, x1, y1 in boxes:
+        halo_x0 = max(0, x0 - 1)
+        halo_y0 = max(0, y0 - 1)
+        halo_x1 = min(width, x1 + 1)
+        halo_y1 = min(height, y1 + 1)
+        branch_crop = array[halo_y0:halo_y1, halo_x0:halo_x1]
+        reference_crop = (
+            ImageBasis(
+                rgb=reference.rgb[halo_y0:halo_y1, halo_x0:halo_x1],
+                luminance=reference.luminance[
+                    halo_y0:halo_y1, halo_x0:halo_x1
+                ],
+                sobel=reference.sobel[halo_y0:halo_y1, halo_x0:halo_x1],
+            )
+            if isinstance(reference, ImageBasis)
+            else build_image_basis(
+                reference_array[halo_y0:halo_y1, halo_x0:halo_x1],
+                name="branch reference crop",
+            )
+        )
+        structure = compute_structure_map(branch_crop, reference_crop)
+        core = (
+            x0 - halo_x0,
+            y0 - halo_y0,
+            x1 - halo_x0,
+            y1 - halo_y0,
+        )
+        errors.append(score_region(structure, core))
+    return tuple(errors)
 
 
 def prepare_diagnosis_evidence(
@@ -438,17 +532,18 @@ def prepare_diagnosis_evidence(
     shape: tuple[int, int],
     config: DiagnosisConfig,
 ) -> SampleDiagnosisEvidence:
-    """Build full-resolution branch and motion evidence once per sample."""
+    """Build branch and motion evidence once per sample.
+
+    Branch structure is evaluated only in candidate crops with a one-pixel
+    Sobel halo.  Current-model and motion maps are reused from their existing
+    full-frame computations.
+    """
 
     normalized_boxes = tuple(tuple(int(value) for value in box) for box in boxes)
     resolved_gt_basis = (
         build_image_basis(gt, name="gt") if gt_basis is None else gt_basis
     )
-    resolved_img1_basis = (
-        build_image_basis(img1, name="img1")
-        if img1 is not None and img1_basis is None
-        else img1_basis
-    )
+    resolved_img1_reference = img1_basis if img1_basis is not None else img1
     teacher_errors = _branch_region_errors(
         teacher_prediction, resolved_gt_basis, normalized_boxes
     )
@@ -462,7 +557,7 @@ def prepare_diagnosis_evidence(
     )
     endpoint_copy_errors = _branch_region_errors(
         prediction if img1 is not None else None,
-        resolved_img1_basis,
+        resolved_img1_reference,
         normalized_boxes,
     )
     branches = tuple(
@@ -500,15 +595,24 @@ def prepare_diagnosis_evidence(
                 "flow_discontinuity_map must match image shape "
                 f"{shape}, got {resolved_flow_map.shape}"
             )
-    resolved_mask_map: np.ndarray | None = None
+    mask_supports: list[np.ndarray | None] = [
+        None for _ in normalized_boxes
+    ]
     for mask in (mask0, mask1):
-        support = _gradient_support_map(mask, shape=shape)
-        if support is None:
-            continue
-        if resolved_mask_map is None:
-            resolved_mask_map = support
-        else:
-            np.maximum(resolved_mask_map, support, out=resolved_mask_map)
+        crop_supports = _gradient_support_crops(
+            mask,
+            shape=shape,
+            boxes=normalized_boxes,
+            threshold=0.60,
+        )
+        for index, support in enumerate(crop_supports):
+            if support is None:
+                continue
+            existing = mask_supports[index]
+            if existing is None:
+                mask_supports[index] = support
+            else:
+                np.logical_or(existing, support, out=existing)
     if current_scores is None:
         score_values: tuple[float | None, ...] = tuple(None for _ in normalized_boxes)
     else:
@@ -516,7 +620,11 @@ def prepare_diagnosis_evidence(
         if len(score_values) != len(normalized_boxes):
             raise ValueError("current_scores must match candidate regions")
     region_maps: list[RegionMapEvidence] = []
-    for box, current_score in zip(normalized_boxes, score_values):
+    for box, current_score, mask_support in zip(
+        normalized_boxes,
+        score_values,
+        mask_supports,
+    ):
         structure = _crop(maps.structure, box)
         missing_map = _crop(maps.gt_only_edges, box)
         extra_map = _crop(maps.pred_only_edges, box)
@@ -530,10 +638,8 @@ def prepare_diagnosis_evidence(
             tearing_support |= (
                 _crop(resolved_flow_map, box) >= 0.60
             )
-        if resolved_mask_map is not None:
-            tearing_support |= (
-                _crop(resolved_mask_map, box) >= 0.60
-            )
+        if mask_support is not None:
+            tearing_support |= mask_support
         tearing_overlap = float(
             np.logical_and(edge_support, tearing_support).sum()
             / max(1, int(edge_support.sum()))

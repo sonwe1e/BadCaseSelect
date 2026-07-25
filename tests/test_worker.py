@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 import pytest
 import torch
+import torch.nn.functional as F
 
 import vfi_hard_miner.worker as worker_module
 from vfi_hard_miner.config import (
@@ -95,6 +96,47 @@ def test_process_main_payload_finds_solvable_endpoint_copy(tmp_path, monkeypatch
     assert "endpoint_copy" in results[0]["reasons"]
 
 
+def test_easy_sample_fast_reject_skips_branch_diagnosis(monkeypatch):
+    image = np.zeros((32, 40, 3), dtype=np.float32)
+    flow = torch.zeros((1, 2, 32, 40), dtype=torch.float32)
+    mask = torch.full((1, 1, 32, 40), 0.5, dtype=torch.float32)
+    frame = torch.zeros((1, 3, 32, 40), dtype=torch.float32)
+    reconstructed = ReconstructionResult(
+        flow_t0=flow,
+        flow_t1=flow,
+        mask0=mask,
+        mask1=mask,
+        warp0=frame,
+        warp1=frame,
+        warp_blend=frame,
+        prediction=frame,
+    )
+
+    def unexpected_diagnosis(*args, **kwargs):
+        raise AssertionError("fast-reject must skip branch diagnosis")
+
+    monkeypatch.setattr(worker_module, "diagnose_sample", unexpected_diagnosis)
+    result = worker_module._sample_record(
+        {
+            "sample_id": "easy",
+            "frame_indices": [1, 2, 3],
+            "stride": 1,
+        },
+        img0=image,
+        gt=image,
+        img1=image,
+        reconstructed=reconstructed,
+        batch_index=0,
+        thresholds=ThresholdConfig(),
+    )
+
+    assert result["status"] in {"invalid", "reject"}
+    assert result["regions"] == []
+    assert result["primary_region_index"] is None
+    assert result["p_solvable"] == 0.0
+    assert result["metrics"]["diagnosis"]["skipped"] == 1.0
+
+
 def test_packed_output_transfer_truncates_tail_and_splits_on_cpu():
     batch = 4
     outputs = ModelOutputs(
@@ -172,8 +214,85 @@ def test_decode_prefetch_preserves_batch_and_invalid_record_order(tmp_path):
 
     assert [kind for kind, _ in events] == ["batch", "invalid", "batch"]
     assert events[0][1][0][0]["sample_id"] == "first"
+    assert events[0][1][0][1].dtype == np.uint8
     assert events[1][1][0]["sample_id"] == "missing"
     assert events[2][1][0][0]["sample_id"] == "last"
+
+
+def test_network_input_batch_matches_legacy_full_resolution_resize():
+    rng = np.random.default_rng(14)
+    items = []
+    for index in range(3):
+        first = rng.integers(0, 256, size=(19, 27, 3), dtype=np.uint8)
+        middle = rng.integers(0, 256, size=(19, 27, 3), dtype=np.uint8)
+        last = rng.integers(0, 256, size=(19, 27, 3), dtype=np.uint8)
+        items.append(({"sample_id": str(index)}, first, middle, last))
+
+    actual0, actual1 = worker_module._network_input_batch(
+        items,
+        production_batch=4,
+        network_size=(7, 11),
+    )
+    legacy0 = torch.stack(
+        [
+            worker_module._tensor_from_hwc(item[1]).to(torch.float32) / 255.0
+            for item in (*items, items[-1])
+        ]
+    )
+    legacy1 = torch.stack(
+        [
+            worker_module._tensor_from_hwc(item[3]).to(torch.float32) / 255.0
+            for item in (*items, items[-1])
+        ]
+    )
+    expected0 = F.interpolate(
+        legacy0, size=(7, 11), mode="bilinear", align_corners=False
+    )
+    expected1 = F.interpolate(
+        legacy1, size=(7, 11), mode="bilinear", align_corners=False
+    )
+
+    torch.testing.assert_close(actual0, expected0, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(actual1, expected1, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("production_batch", [16, 32, 64])
+def test_network_input_batch_keeps_only_network_resolution(production_batch):
+    image = np.zeros((180, 320, 3), dtype=np.uint8)
+    items = [({"sample_id": "one"}, image, image, image)]
+
+    img0, img1 = worker_module._network_input_batch(
+        items,
+        production_batch=production_batch,
+        network_size=(18, 32),
+    )
+
+    assert img0.shape == img1.shape == (production_batch, 3, 18, 32)
+    assert img0.numel() < production_batch * 3 * 180 * 320
+
+
+def test_reconstruction_microbatch_converts_only_selected_uint8_items(monkeypatch):
+    arrays = [
+        np.full((8, 10, 3), value, dtype=np.uint8)
+        for value in (10, 20, 30, 40, 50, 60)
+    ]
+    items = [
+        ({"sample_id": "a"}, arrays[0], arrays[1], arrays[2]),
+        ({"sample_id": "b"}, arrays[3], arrays[4], arrays[5]),
+    ]
+    converted = []
+    original = worker_module.rgb_uint8_to_float32
+
+    def counted(image):
+        converted.append(id(image))
+        return original(image)
+
+    monkeypatch.setattr(worker_module, "rgb_uint8_to_float32", counted)
+    prepared = worker_module._prepare_reconstruction_microbatch(items[:1])
+
+    assert set(converted) == {id(value) for value in arrays[:3]}
+    assert prepared.img0_tensor.shape == prepared.img1_tensor.shape == (1, 3, 8, 10)
+    assert all(item.dtype == np.float32 for item in prepared.items[0][1:])
 
 
 def _decoded_item(sample_id, marker):
@@ -729,11 +848,16 @@ def test_postproc_reservation_counts_reconstruction_inputs_and_scratch():
     assert worker_module.RECONSTRUCTION_CHANNELS == 18
     assert reservation.retained_bytes == plane_bytes * (18 + 9)
     assert reservation.scratch_bytes == plane_bytes * 24
+    assert reservation.reconstruction_transient_bytes == plane_bytes * 6
     assert reservation.fixed_bytes == 1024 * 1024
     assert reservation.reserved_bytes == (
         reservation.retained_bytes
         + reservation.scratch_bytes
         + reservation.fixed_bytes
+    )
+    assert reservation.pipeline_bytes == (
+        reservation.reserved_bytes
+        + reservation.reconstruction_transient_bytes
     )
     assert reservation.oversize is False
 
@@ -854,10 +978,12 @@ def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
         f"sample-{index}" for index in range(record_count)
     ]
     assert sum(reconstructed_sizes) == record_count
-    assert max(reconstructed_sizes) == 6
+    assert max(reconstructed_sizes) == 5
     progress = capsys.readouterr().err
     assert f"inferred {record_count}/{record_count}" in progress
     assert f"scored {record_count}/{record_count}" in progress
+    assert "timing periodic" in progress
+    assert "decode_ms/sample" in progress
 
 
 def test_slow_postprocess_wait_emits_progress_and_heartbeat(monkeypatch, capsys):
@@ -898,6 +1024,10 @@ def test_slow_postprocess_wait_emits_progress_and_heartbeat(monkeypatch, capsys)
     assert "pending 1 batches" in progress
     assert "retained" in progress
     assert "reserved" in progress
+    assert "decode_uint8" in progress
+    assert "resident_estimate" in progress
+    assert "future_wait_ms/sample" in progress
+    assert "reconstruction_ms/sample" in progress
     assert "scored 1/1" in progress
 
 
@@ -922,4 +1052,5 @@ def test_decode_prefetch_respects_cache_budget_and_still_yields_batches(tmp_path
     assert [kind for kind, _ in events] == ["batch"]
     batch = events[0][1]
     assert [item[0]["sample_id"] for item in batch] == ["a", "b"]
-    assert batch[0][1].dtype == np.float32
+    assert batch[0][1].dtype == np.uint8
+    assert batch.uint8_bytes == 8 * 8 * 3

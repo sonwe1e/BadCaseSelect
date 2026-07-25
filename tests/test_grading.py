@@ -102,3 +102,23 @@ def test_invalid_or_unsolvable_sample_is_rejected_before_cgvqm(tmp_path):
     )
     assert invalid.grade == "Reject"
     assert unsolvable.grade == "Review"
+
+
+def test_skipped_diagnosis_cannot_enter_training_grade(tmp_path):
+    record = _record(
+        metrics={"diagnosis": {"skipped": 1.0, "skip_reason": "prediction_not_wrong"}}
+    )
+
+    decision = grade_candidate(record, _evidence(), _config(tmp_path))
+
+    assert decision.grade == "Review"
+    assert "diagnosis_not_completed" in decision.reasons
+
+
+def test_malformed_diagnosis_skip_marker_fails_closed(tmp_path):
+    record = _record(metrics={"diagnosis": {"skipped": "unknown"}})
+
+    decision = grade_candidate(record, _evidence(), _config(tmp_path))
+
+    assert decision.grade == "Review"
+    assert "diagnosis_not_completed" in decision.reasons
