@@ -17,8 +17,11 @@ from scipy.ndimage import label as _nd_label
 from .schemas import RegionBox
 from .scoring import (
     ErrorMaps,
+    ImageBasis,
     LocalScoreResult,
+    build_image_basis,
     compute_error_maps,
+    compute_structure_map,
     robust_local_score,
     score_local_errors,
     score_region,
@@ -152,6 +155,43 @@ class DiagnosisResult:
             "metrics": dict(self.metrics),
             "primary_region_index": self.primary_region_index,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class RegionBranchEvidence:
+    """Precomputed alternative-branch errors for one candidate region."""
+
+    teacher_error: float | None
+    warp0_error: float | None
+    warp1_error: float | None
+    warp_blend_error: float | None
+    endpoint1_error: float | None
+    endpoint_copy_distance: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class RegionMapEvidence:
+    """Current-model structure and topology statistics for one region."""
+
+    current_error: float
+    missing_error: float
+    extra_error: float
+    gt_edge_strength: float
+    prediction_edge_strength: float
+    gt_edge_endpoints: int
+    prediction_edge_endpoints: int
+    gt_edge_components: int
+    prediction_edge_components: int
+    tearing_overlap: float
+
+
+@dataclass(frozen=True, slots=True)
+class SampleDiagnosisEvidence:
+    """Full-image evidence computed once and shared by every candidate region."""
+
+    boxes: tuple[tuple[int, int, int, int], ...]
+    regions: tuple[RegionMapEvidence, ...]
+    branches: tuple[RegionBranchEvidence, ...]
 
 
 def _to_numpy(value: Any) -> np.ndarray:
@@ -317,11 +357,14 @@ def _gradient_support_map(
         raise ValueError(
             f"flow/mask evidence must match image shape {shape}, got {array.shape}"
         )
-    dx = np.zeros_like(array)
-    dy = np.zeros_like(array)
-    dx[:, 1:] = array[:, 1:] - array[:, :-1]
-    dy[1:, :] = array[1:, :] - array[:-1, :]
-    magnitude = np.sqrt(np.square(dx).sum(axis=2) + np.square(dy).sum(axis=2))
+    gradient_squared = np.zeros(shape, dtype=np.float32)
+    horizontal = np.diff(array, axis=1)
+    gradient_squared[:, 1:] += np.square(horizontal).sum(axis=2)
+    del horizontal
+    vertical = np.diff(array, axis=0)
+    gradient_squared[1:, :] += np.square(vertical).sum(axis=2)
+    del vertical
+    magnitude = np.sqrt(gradient_squared)
     positive = magnitude[magnitude > 0]
     if not positive.size:
         return np.zeros(shape, dtype=np.float32)
@@ -360,14 +403,178 @@ def _binary_component_count(edge_map: np.ndarray, threshold: float) -> int:
     return int(count)
 
 
-def _branch_error(
+def _branch_region_errors(
     branch: Any | None,
-    gt: Any,
-    box: tuple[int, int, int, int],
-) -> float | None:
+    reference: ImageBasis | None,
+    boxes: Sequence[tuple[int, int, int, int]],
+) -> tuple[float | None, ...]:
     if branch is None:
-        return None
-    return localized_error_score(branch, gt, box)
+        return tuple(None for _ in boxes)
+    if reference is None:
+        raise ValueError("branch reference evidence is required")
+    structure = compute_structure_map(branch, reference)
+    return tuple(score_region(structure, box) for box in boxes)
+
+
+def prepare_diagnosis_evidence(
+    prediction: Any,
+    gt: Any,
+    *,
+    maps: ErrorMaps,
+    boxes: Sequence[tuple[int, int, int, int]],
+    current_scores: Sequence[float | None] | None = None,
+    gt_basis: ImageBasis | None = None,
+    img1_basis: ImageBasis | None = None,
+    teacher_prediction: Any | None = None,
+    warp0: Any | None = None,
+    warp1: Any | None = None,
+    warp_blend: Any | None = None,
+    img1: Any | None = None,
+    flow_t0: Any | None = None,
+    flow_t1: Any | None = None,
+    flow_discontinuity_map: np.ndarray | None = None,
+    mask0: Any | None = None,
+    mask1: Any | None = None,
+    shape: tuple[int, int],
+    config: DiagnosisConfig,
+) -> SampleDiagnosisEvidence:
+    """Build full-resolution branch and motion evidence once per sample."""
+
+    normalized_boxes = tuple(tuple(int(value) for value in box) for box in boxes)
+    resolved_gt_basis = (
+        build_image_basis(gt, name="gt") if gt_basis is None else gt_basis
+    )
+    resolved_img1_basis = (
+        build_image_basis(img1, name="img1")
+        if img1 is not None and img1_basis is None
+        else img1_basis
+    )
+    teacher_errors = _branch_region_errors(
+        teacher_prediction, resolved_gt_basis, normalized_boxes
+    )
+    warp0_errors = _branch_region_errors(warp0, resolved_gt_basis, normalized_boxes)
+    warp1_errors = _branch_region_errors(warp1, resolved_gt_basis, normalized_boxes)
+    blend_errors = _branch_region_errors(
+        warp_blend, resolved_gt_basis, normalized_boxes
+    )
+    endpoint1_errors = _branch_region_errors(
+        img1, resolved_gt_basis, normalized_boxes
+    )
+    endpoint_copy_errors = _branch_region_errors(
+        prediction if img1 is not None else None,
+        resolved_img1_basis,
+        normalized_boxes,
+    )
+    branches = tuple(
+        RegionBranchEvidence(
+            teacher_error=teacher_error,
+            warp0_error=warp0_error,
+            warp1_error=warp1_error,
+            warp_blend_error=blend_error,
+            endpoint1_error=endpoint1_error,
+            endpoint_copy_distance=endpoint_copy,
+        )
+        for teacher_error, warp0_error, warp1_error, blend_error, endpoint1_error, endpoint_copy in zip(
+            teacher_errors,
+            warp0_errors,
+            warp1_errors,
+            blend_errors,
+            endpoint1_errors,
+            endpoint_copy_errors,
+        )
+    )
+    if flow_discontinuity_map is None:
+        flow_maps = [
+            support
+            for support in (
+                _gradient_support_map(flow_t0, shape=shape),
+                _gradient_support_map(flow_t1, shape=shape),
+            )
+            if support is not None
+        ]
+        resolved_flow_map = np.maximum.reduce(flow_maps) if flow_maps else None
+    else:
+        resolved_flow_map = np.asarray(flow_discontinuity_map, dtype=np.float32)
+        if resolved_flow_map.shape != shape:
+            raise ValueError(
+                "flow_discontinuity_map must match image shape "
+                f"{shape}, got {resolved_flow_map.shape}"
+            )
+    resolved_mask_map: np.ndarray | None = None
+    for mask in (mask0, mask1):
+        support = _gradient_support_map(mask, shape=shape)
+        if support is None:
+            continue
+        if resolved_mask_map is None:
+            resolved_mask_map = support
+        else:
+            np.maximum(resolved_mask_map, support, out=resolved_mask_map)
+    if current_scores is None:
+        score_values: tuple[float | None, ...] = tuple(None for _ in normalized_boxes)
+    else:
+        score_values = tuple(current_scores)
+        if len(score_values) != len(normalized_boxes):
+            raise ValueError("current_scores must match candidate regions")
+    region_maps: list[RegionMapEvidence] = []
+    for box, current_score in zip(normalized_boxes, score_values):
+        structure = _crop(maps.structure, box)
+        missing_map = _crop(maps.gt_only_edges, box)
+        extra_map = _crop(maps.pred_only_edges, box)
+        gt_edge_map = _crop(maps.sobel_gt, box)
+        pred_edge_map = _crop(maps.sobel_prediction, box)
+        edge_support = (
+            np.maximum(missing_map, extra_map) >= config.edge_reason_threshold
+        )
+        tearing_support = np.zeros_like(edge_support, dtype=bool)
+        if resolved_flow_map is not None:
+            tearing_support |= (
+                _crop(resolved_flow_map, box) >= 0.60
+            )
+        if resolved_mask_map is not None:
+            tearing_support |= (
+                _crop(resolved_mask_map, box) >= 0.60
+            )
+        tearing_overlap = float(
+            np.logical_and(edge_support, tearing_support).sum()
+            / max(1, int(edge_support.sum()))
+        )
+        region_maps.append(
+            RegionMapEvidence(
+                current_error=(
+                    robust_local_score(structure)
+                    if current_score is None
+                    else float(current_score)
+                ),
+                missing_error=robust_local_score(missing_map),
+                extra_error=robust_local_score(extra_map),
+                gt_edge_strength=(
+                    top_area_mean(gt_edge_map, 0.05) if gt_edge_map.size else 0.0
+                ),
+                prediction_edge_strength=(
+                    top_area_mean(pred_edge_map, 0.05)
+                    if pred_edge_map.size
+                    else 0.0
+                ),
+                gt_edge_endpoints=_edge_endpoint_count(
+                    gt_edge_map, config.edge_reason_threshold
+                ),
+                prediction_edge_endpoints=_edge_endpoint_count(
+                    pred_edge_map, config.edge_reason_threshold
+                ),
+                gt_edge_components=_binary_component_count(
+                    gt_edge_map, config.edge_reason_threshold
+                ),
+                prediction_edge_components=_binary_component_count(
+                    pred_edge_map, config.edge_reason_threshold
+                ),
+                tearing_overlap=tearing_overlap,
+            )
+        )
+    return SampleDiagnosisEvidence(
+        boxes=normalized_boxes,
+        regions=tuple(region_maps),
+        branches=branches,
+    )
 
 
 def _ordered_labels(labels: Sequence[str]) -> tuple[str, ...]:
@@ -376,46 +583,31 @@ def _ordered_labels(labels: Sequence[str]) -> tuple[str, ...]:
 
 
 def _diagnose_region(
-    maps: ErrorMaps,
     box: tuple[int, int, int, int],
     *,
-    prediction: Any,
-    gt: Any,
-    teacher_prediction: Any | None,
-    warp0: Any | None,
-    warp1: Any | None,
-    warp_blend: Any | None,
-    img1: Any | None,
+    map_evidence: RegionMapEvidence,
+    branch_evidence: RegionBranchEvidence,
     temporal_error: float | None,
-    flow_discontinuity_map: np.ndarray | None,
-    mask_gradient_map: np.ndarray | None,
     priority_metrics: Mapping[str, float] | None,
     cfg: DiagnosisConfig,
 ) -> RegionDiagnosis:
-    structure = _crop(maps.structure, box)
-    missing_map = _crop(maps.gt_only_edges, box)
-    extra_map = _crop(maps.pred_only_edges, box)
-    gt_edge_map = _crop(maps.sobel_gt, box)
-    pred_edge_map = _crop(maps.sobel_prediction, box)
-    current_error = robust_local_score(structure)
-    missing = robust_local_score(missing_map)
-    extra = robust_local_score(extra_map)
+    current_error = map_evidence.current_error
+    missing = map_evidence.missing_error
+    extra = map_evidence.extra_error
     edge_error = max(missing, extra)
-    gt_edge = top_area_mean(gt_edge_map, 0.05) if gt_edge_map.size else 0.0
-    pred_edge = top_area_mean(pred_edge_map, 0.05) if pred_edge_map.size else 0.0
-    gt_endpoints = _edge_endpoint_count(gt_edge_map, cfg.edge_reason_threshold)
-    pred_endpoints = _edge_endpoint_count(pred_edge_map, cfg.edge_reason_threshold)
-    gt_components = _binary_component_count(gt_edge_map, cfg.edge_reason_threshold)
-    pred_components = _binary_component_count(pred_edge_map, cfg.edge_reason_threshold)
+    gt_edge = map_evidence.gt_edge_strength
+    pred_edge = map_evidence.prediction_edge_strength
+    gt_endpoints = map_evidence.gt_edge_endpoints
+    pred_endpoints = map_evidence.prediction_edge_endpoints
+    gt_components = map_evidence.gt_edge_components
+    pred_components = map_evidence.prediction_edge_components
 
-    teacher_error = _branch_error(teacher_prediction, gt, box)
-    warp0_error = _branch_error(warp0, gt, box)
-    warp1_error = _branch_error(warp1, gt, box)
-    blend_error = _branch_error(warp_blend, gt, box)
-    endpoint1_error = _branch_error(img1, gt, box)
-    endpoint_copy_distance = (
-        localized_error_score(prediction, img1, box) if img1 is not None else None
-    )
+    teacher_error = branch_evidence.teacher_error
+    warp0_error = branch_evidence.warp0_error
+    warp1_error = branch_evidence.warp1_error
+    blend_error = branch_evidence.warp_blend_error
+    endpoint1_error = branch_evidence.endpoint1_error
+    endpoint_copy_distance = branch_evidence.endpoint_copy_distance
     warp_errors = {
         name: value
         for name, value in (
@@ -454,16 +646,7 @@ def _diagnose_region(
         ratio = missing / max(extra, 1e-6)
         if 0.35 <= ratio <= 2.85:
             labels.append("ghosting")
-    edge_support = np.maximum(missing_map, extra_map) >= cfg.edge_reason_threshold
-    tearing_support = np.zeros_like(edge_support, dtype=bool)
-    if flow_discontinuity_map is not None:
-        tearing_support |= _crop(flow_discontinuity_map, box) >= 0.60
-    if mask_gradient_map is not None:
-        tearing_support |= _crop(mask_gradient_map, box) >= 0.60
-    tearing_overlap = float(
-        np.logical_and(edge_support, tearing_support).sum()
-        / max(1, int(edge_support.sum()))
-    )
+    tearing_overlap = map_evidence.tearing_overlap
     if (
         edge_error >= cfg.edge_reason_threshold
         and tearing_overlap >= cfg.tearing_overlap_threshold
@@ -559,12 +742,15 @@ def diagnose_sample(
     img1: Any | None = None,
     flow_t0: Any | None = None,
     flow_t1: Any | None = None,
+    flow_discontinuity_map: np.ndarray | None = None,
     mask0: Any | None = None,
     mask1: Any | None = None,
     regions: Sequence[RegionBox | Sequence[int]] | None = None,
     temporal_error: float | None = None,
     scoring_config: Any | None = None,
     scoring_result: LocalScoreResult | None = None,
+    diagnosis_evidence: SampleDiagnosisEvidence | None = None,
+    img1_basis: ImageBasis | None = None,
     config: DiagnosisConfig | Mapping[str, Any] | Any | None = None,
 ) -> DiagnosisResult:
     """Diagnose candidate regions and select the best wrong-and-solvable one."""
@@ -580,51 +766,56 @@ def diagnose_sample(
         img1=img1 if img0 is not None and img1 is not None else None,
     )
     height, width = scoring.maps.structure.shape
-    flow_maps = [
-        support
-        for support in (
-            _gradient_support_map(flow_t0, shape=(height, width)),
-            _gradient_support_map(flow_t1, shape=(height, width)),
-        )
-        if support is not None
-    ]
-    mask_maps = [
-        support
-        for support in (
-            _gradient_support_map(mask0, shape=(height, width)),
-            _gradient_support_map(mask1, shape=(height, width)),
-        )
-        if support is not None
-    ]
-    flow_discontinuity_map = (
-        np.maximum.reduce(flow_maps) if flow_maps else None
-    )
-    mask_gradient_map = np.maximum.reduce(mask_maps) if mask_maps else None
     source_regions: Sequence[RegionBox | Sequence[int]]
     source_regions = scoring.regions if regions is None else regions
     boxes = tuple(_normalize_box(region, (height, width)) for region in source_regions)
+    current_scores = tuple(
+        float(region.score) if isinstance(region, RegionBox) else None
+        for region in source_regions
+    )
+    evidence = diagnosis_evidence or prepare_diagnosis_evidence(
+        prediction,
+        gt,
+        maps=scoring.maps,
+        boxes=boxes,
+        current_scores=current_scores,
+        gt_basis=scoring.reference_basis,
+        img1_basis=img1_basis,
+        teacher_prediction=teacher_prediction,
+        warp0=warp0,
+        warp1=warp1,
+        warp_blend=warp_blend,
+        img1=img1,
+        flow_t0=flow_t0,
+        flow_t1=flow_t1,
+        flow_discontinuity_map=flow_discontinuity_map,
+        mask0=mask0,
+        mask1=mask1,
+        shape=(height, width),
+        config=cfg,
+    )
+    if (
+        evidence.boxes != boxes
+        or len(evidence.regions) != len(boxes)
+        or len(evidence.branches) != len(boxes)
+    ):
+        raise ValueError("diagnosis_evidence does not match candidate regions")
     priority_metrics = tuple(
         dict(region.metrics) if isinstance(region, RegionBox) else {}
         for region in source_regions
     )
     region_results = tuple(
         _diagnose_region(
-            scoring.maps,
             box,
-            prediction=prediction,
-            gt=gt,
-            teacher_prediction=teacher_prediction,
-            warp0=warp0,
-            warp1=warp1,
-            warp_blend=warp_blend,
-            img1=img1,
+            map_evidence=map_evidence,
+            branch_evidence=branch_evidence,
             temporal_error=temporal_error,
-            flow_discontinuity_map=flow_discontinuity_map,
-            mask_gradient_map=mask_gradient_map,
             priority_metrics=region_priority,
             cfg=cfg,
         )
-        for box, region_priority in zip(boxes, priority_metrics)
+        for box, map_evidence, branch_evidence, region_priority in zip(
+            boxes, evidence.regions, evidence.branches, priority_metrics
+        )
     )
 
     if region_results:
@@ -697,11 +888,15 @@ __all__ = [
     "DiagnosisResult",
     "REASON_LABELS",
     "RegionDiagnosis",
+    "RegionBranchEvidence",
+    "RegionMapEvidence",
+    "SampleDiagnosisEvidence",
     "SolvabilityResult",
     "compute_p_solvable",
     "diagnose",
     "diagnose_sample",
     "estimate_solvability",
     "localized_error_score",
+    "prepare_diagnosis_evidence",
     "solvability_from_errors",
 ]

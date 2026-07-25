@@ -179,6 +179,14 @@ class ScopeMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class MotionEvidence:
+    """Scope metrics plus the normalized flow-gradient map used by diagnosis."""
+
+    scope_metrics: ScopeMetrics
+    flow_discontinuity_map: np.ndarray | None
+
+
+@dataclass(frozen=True, slots=True)
 class GateResult:
     label: Decision
     reasons: tuple[str, ...]
@@ -375,12 +383,22 @@ def compute_validity_metrics(
     decode_ok: bool = True,
     sequence_contiguous: bool = True,
     menu_transition_score: float | None = None,
+    luminance_triplet: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> FrameValidityMetrics:
     """Compute cheap temporal validity evidence from an aligned triplet."""
 
-    first = _luma(img0)
-    middle = _luma(gt)
-    last = _luma(img1)
+    if luminance_triplet is None:
+        first = _luma(img0)
+        middle = _luma(gt)
+        last = _luma(img1)
+    else:
+        first, middle, last = (
+            np.asarray(value, dtype=np.float32) for value in luminance_triplet
+        )
+        if any(value.ndim != 2 for value in (first, middle, last)):
+            raise ValueError("luminance_triplet values must be 2-D")
+        if not all(np.isfinite(value).all() for value in (first, middle, last)):
+            raise ValueError("luminance_triplet contains NaN or infinite values")
     if first.shape != middle.shape or first.shape != last.shape:
         raise ValueError("img0, gt, and img1 must have the same spatial shape")
 
@@ -536,8 +554,10 @@ def _flow_metrics(flow: np.ndarray) -> dict[str, float | np.ndarray]:
         | (sample_y > height - 1)
     )
     diagonal = max(1.0, float(np.hypot(height, width)))
-    dx = np.linalg.norm(np.diff(flow, axis=1), axis=-1) / diagonal
-    dy = np.linalg.norm(np.diff(flow, axis=0), axis=-1) / diagonal
+    raw_dx = np.diff(flow, axis=1)
+    raw_dy = np.diff(flow, axis=0)
+    dx = np.linalg.norm(raw_dx, axis=-1) / diagonal
+    dy = np.linalg.norm(raw_dy, axis=-1) / diagonal
     discontinuous_count = int(np.count_nonzero(dx > 0.02)) + int(
         np.count_nonzero(dy > 0.02)
     )
@@ -556,6 +576,19 @@ def _flow_metrics(flow: np.ndarray) -> dict[str, float | np.ndarray]:
     background_mask[:, -border:] = True
     background_motion = np.median(flow[background_mask], axis=0)
     residual = np.linalg.norm(flow - background_motion, axis=-1) / diagonal
+    gradient_squared = np.zeros((height, width), dtype=np.float32)
+    gradient_squared[:, 1:] += np.square(raw_dx).sum(axis=-1)
+    gradient_squared[1:, :] += np.square(raw_dy).sum(axis=-1)
+    gradient_magnitude = np.sqrt(gradient_squared)
+    positive = gradient_magnitude[gradient_magnitude > 0]
+    if positive.size:
+        scale = max(float(np.quantile(positive, 0.95)), 1e-8)
+        gradient_support = np.asarray(
+            np.clip(gradient_magnitude / scale, 0.0, 1.0),
+            dtype=np.float32,
+        )
+    else:
+        gradient_support = np.zeros((height, width), dtype=np.float32)
     # A camera pan naturally sends a border band outside the source image.
     # Only OOB pixels whose motion differs from the boundary/background model
     # are evidence of unsupported foreground motion or occlusion.
@@ -570,26 +603,53 @@ def _flow_metrics(flow: np.ndarray) -> dict[str, float | np.ndarray]:
         ),
         "residual": residual,
         "background_motion": float(np.linalg.norm(background_motion) / diagonal),
+        "gradient_support": gradient_support,
     }
 
 
-def compute_scope_metrics(
+def compute_motion_evidence(
     flow_t0: Any,
     flow_t1: Any | None = None,
     *,
     foreground_mask: Any | None = None,
     occlusion_mask: Any | None = None,
-) -> ScopeMetrics:
-    """Compute scope evidence while explicitly allowing global camera motion."""
+) -> MotionEvidence:
+    """Compute scope and diagnostic flow evidence in one shared scan."""
 
     flows = [_as_flow(flow_t0, name="flow_t0")]
     if flow_t1 is not None:
         flows.append(_as_flow(flow_t1, name="flow_t1"))
     if any(item.shape != flows[0].shape for item in flows[1:]):
         raise ValueError("flow_t0 and flow_t1 must have the same shape")
-    per_flow = [_flow_metrics(item) for item in flows]
-    residual = np.maximum.reduce([item["residual"] for item in per_flow])
     shape = flows[0].shape[:2]
+    residual: np.ndarray | None = None
+    out_of_bounds: np.ndarray | None = None
+    flow_support: np.ndarray | None = None
+    out_of_bounds_ratios: list[float] = []
+    discontinuity_ratios: list[float] = []
+    background_motions: list[float] = []
+    for flow in flows:
+        derived = _flow_metrics(flow)
+        current_residual = np.asarray(derived["residual"], dtype=np.float32)
+        current_out_of_bounds = np.asarray(derived["out_of_bounds"], dtype=bool)
+        current_support = np.asarray(derived["gradient_support"], dtype=np.float32)
+        if residual is None:
+            residual = current_residual
+            out_of_bounds = current_out_of_bounds
+            flow_support = current_support
+        else:
+            np.maximum(residual, current_residual, out=residual)
+            np.logical_or(
+                out_of_bounds,
+                current_out_of_bounds,
+                out=out_of_bounds,
+            )
+            np.maximum(flow_support, current_support, out=flow_support)
+        out_of_bounds_ratios.append(float(derived["out_of_bounds_ratio"]))
+        discontinuity_ratios.append(float(derived["flow_discontinuity_ratio"]))
+        background_motions.append(float(derived["background_motion"]))
+    if residual is None or out_of_bounds is None or flow_support is None:
+        raise RuntimeError("motion evidence requires at least one flow")
 
     if foreground_mask is None:
         # Boundary-median translation is a robust camera/background estimate.
@@ -613,9 +673,6 @@ def compute_scope_metrics(
         backward_inconsistency = (
             np.linalg.norm(flows[0] + flows[1], axis=-1) / diagonal
         )
-        out_of_bounds = np.logical_or.reduce(
-            [item["out_of_bounds"] for item in per_flow]
-        )
         occlusion_ratio = float(
             np.mean(
                 (backward_inconsistency > _LARGE_MOTION_NORMALIZED)
@@ -625,18 +682,37 @@ def compute_scope_metrics(
     else:
         occlusion_ratio = None
 
-    return ScopeMetrics(
-        out_of_bounds_ratio=max(float(item["out_of_bounds_ratio"]) for item in per_flow),
-        flow_discontinuity_ratio=max(
-            float(item["flow_discontinuity_ratio"]) for item in per_flow
-        ),
+    scope_metrics = ScopeMetrics(
+        out_of_bounds_ratio=max(out_of_bounds_ratios),
+        flow_discontinuity_ratio=max(discontinuity_ratios),
         foreground_large_motion_ratio=foreground_ratio,
         occlusion_ratio=occlusion_ratio,
         unexplained_motion_ratio=float(
             np.mean(residual > _LARGE_MOTION_NORMALIZED)
         ),
-        background_motion=max(float(item["background_motion"]) for item in per_flow),
+        background_motion=max(background_motions),
     )
+    return MotionEvidence(
+        scope_metrics=scope_metrics,
+        flow_discontinuity_map=flow_support,
+    )
+
+
+def compute_scope_metrics(
+    flow_t0: Any,
+    flow_t1: Any | None = None,
+    *,
+    foreground_mask: Any | None = None,
+    occlusion_mask: Any | None = None,
+) -> ScopeMetrics:
+    """Compute scope evidence while explicitly allowing global camera motion."""
+
+    return compute_motion_evidence(
+        flow_t0,
+        flow_t1,
+        foreground_mask=foreground_mask,
+        occlusion_mask=occlusion_mask,
+    ).scope_metrics
 
 
 def evaluate_in_scope(
@@ -793,9 +869,11 @@ __all__ = [
     "FrameValidityMetrics",
     "GateConfig",
     "GateResult",
+    "MotionEvidence",
     "ScopeMetrics",
     "classify_sample",
     "combine_gates",
+    "compute_motion_evidence",
     "compute_scope_metrics",
     "compute_validity_metrics",
     "decide_hard_case",

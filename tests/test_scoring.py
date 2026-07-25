@@ -3,9 +3,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import vfi_hard_miner.scoring as scoring_module
 from vfi_hard_miner.scoring import (
     ScoringConfig,
+    build_image_basis,
     compute_error_maps,
+    compute_structure_map,
     score_local_errors,
     top_area_mean,
 )
@@ -48,6 +51,38 @@ def test_extra_structure_is_recorded_as_prediction_only_edge():
     maps = compute_error_maps(prediction, gt)
     assert float(maps.pred_only_edges.max()) > 0.5
     assert float(maps.gt_only_edges.max()) == 0.0
+
+
+def test_structure_only_branch_map_matches_full_error_maps():
+    rng = np.random.default_rng(7)
+    prediction = rng.random((48, 64, 3), dtype=np.float32)
+    gt = rng.random((48, 64, 3), dtype=np.float32)
+
+    expected = compute_error_maps(prediction, gt).structure
+    actual = compute_structure_map(prediction, build_image_basis(gt, name="gt"))
+
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-7)
+
+
+def test_window_integral_grid_is_built_once_per_unique_size(monkeypatch):
+    gt = np.zeros((128, 128, 3), dtype=np.float32)
+    gt[20:108, 62:66] = 1.0
+    prediction = np.zeros_like(gt)
+    calls: list[int] = []
+    original = scoring_module._window_grid
+
+    def counted(values, window):
+        calls.append(int(window))
+        return original(values, window)
+
+    monkeypatch.setattr(scoring_module, "_window_grid", counted)
+    score_local_errors(
+        prediction,
+        gt,
+        ScoringConfig(window_sizes=(16, 32, 64, 128, 128)),
+    )
+
+    assert calls == [16, 32, 64, 128]
 
 
 def test_high_confidence_two_pixel_structure_survives_area_filter():

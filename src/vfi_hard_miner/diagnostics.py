@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import hashlib
 import json
@@ -38,11 +38,12 @@ from .state import LeaseHeartbeat, LeaseLostError, TaskRecord, TaskStore
 from .visualization import make_diagnostic_grid
 from .worker import (
     _FUTURE_WAIT_SECONDS,
+    PendingPostprocess,
     _ProgressLog,
     _infer_model_batch,
     _postproc_microbatch_size,
+    _postproc_reservation,
     _reconstruct_outputs,
-    _reconstruction_bytes_per_sample,
     _resolve_postproc_workers,
     _resolve_reconstruction_device,
     _slice_model_outputs,
@@ -332,18 +333,19 @@ def process_diagnostic_payload(
     postproc_buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
     output: list[dict[str, Any]] = []
     postproc_workers = _resolve_postproc_workers(config)
-    pending_futures: list[
-        tuple[Future[list[dict[str, Any]]], int, int]
-    ] = []
-    pending_bytes = 0
+    pending_futures: list[PendingPostprocess] = []
+    pending_reserved_bytes = 0
+    pending_retained_bytes = 0
+    oversize_logged = False
     bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
 
     def drain_one() -> None:
-        nonlocal pending_bytes
-        future, sample_count, estimated_bytes = pending_futures.pop(0)
+        nonlocal pending_reserved_bytes, pending_retained_bytes
+        current = pending_futures.pop(0)
+        reservation = current.reservation
         while True:
             try:
-                completed = future.result(timeout=_FUTURE_WAIT_SECONDS)
+                completed = current.future.result(timeout=_FUTURE_WAIT_SECONDS)
                 break
             except FutureTimeoutError:
                 if heartbeat is not None:
@@ -351,17 +353,20 @@ def process_diagnostic_payload(
                 if bar is not None:
                     bar.waiting(
                         pending_batches=len(pending_futures) + 1,
-                        pending_bytes=pending_bytes,
+                        pending_bytes=pending_reserved_bytes,
+                        pending_retained_bytes=pending_retained_bytes,
                     )
         output.extend(completed)
-        pending_bytes -= estimated_bytes
+        pending_reserved_bytes -= reservation.reserved_bytes
+        pending_retained_bytes -= reservation.retained_bytes
         if heartbeat is not None:
             heartbeat()
         if bar is not None:
             bar.update_scored(
-                sample_count,
+                reservation.sample_count,
                 pending_batches=len(pending_futures),
-                pending_bytes=pending_bytes,
+                pending_bytes=pending_reserved_bytes,
+                pending_retained_bytes=pending_retained_bytes,
             )
 
     with ThreadPoolExecutor(
@@ -383,21 +388,26 @@ def process_diagnostic_payload(
                 bar.update_inferred(
                     len(items),
                     pending_batches=len(pending_futures),
-                    pending_bytes=pending_bytes,
+                    pending_bytes=pending_reserved_bytes,
+                    pending_retained_bytes=pending_retained_bytes,
                 )
             microbatch_size = _postproc_microbatch_size(
                 items,
                 buffer_bytes=postproc_buffer_bytes,
                 postproc_workers=postproc_workers,
             )
-            bytes_per_sample = _reconstruction_bytes_per_sample(items)
             for start in range(0, len(items), microbatch_size):
                 end = min(len(items), start + microbatch_size)
                 item_slice = list(items[start:end])
-                estimated_bytes = len(item_slice) * bytes_per_sample
+                reservation = _postproc_reservation(
+                    item_slice,
+                    buffer_bytes=postproc_buffer_bytes,
+                )
                 while pending_futures and (
                     len(pending_futures) >= postproc_workers
-                    or pending_bytes + estimated_bytes > postproc_buffer_bytes
+                    or reservation.oversize
+                    or pending_reserved_bytes + reservation.reserved_bytes
+                    > postproc_buffer_bytes
                 ):
                     drain_one()
                 reconstructed = _reconstruct_outputs(
@@ -415,9 +425,24 @@ def process_diagnostic_payload(
                     artifact_root=artifact_root,
                 )
                 pending_futures.append(
-                    (future, len(item_slice), estimated_bytes)
+                    PendingPostprocess(
+                        future=future,
+                        reservation=reservation,
+                    )
                 )
-                pending_bytes += estimated_bytes
+                pending_reserved_bytes += reservation.reserved_bytes
+                pending_retained_bytes += reservation.retained_bytes
+                if reservation.oversize and not oversize_logged:
+                    print(
+                        f"{progress_prefix}  pending reservation "
+                        f"{reservation.reserved_bytes / (1024 * 1024):.0f} MiB "
+                        f"exceeds budget "
+                        f"{postproc_buffer_bytes / (1024 * 1024):.0f} MiB; "
+                        "running one sample exclusively (oversize=1)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    oversize_logged = True
         while pending_futures:
             drain_one()
     if bar is not None:

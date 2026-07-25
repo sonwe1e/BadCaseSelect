@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 import os
 from queue import Full, Queue
 import socket
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import sys
 import time
 import traceback
@@ -26,7 +27,7 @@ from .diagnosis import (
     estimate_solvability,
 )
 from .gates import (
-    compute_scope_metrics,
+    compute_motion_evidence,
     compute_validity_metrics,
     decide_hard_case,
     evaluate_in_scope,
@@ -37,17 +38,45 @@ from .manifest import write_jsonl_part
 from .model_adapter import ModelAdapter, ModelOutputs
 from .pipeline import run_directory
 from .reconstruction import (
+    RECONSTRUCTION_CHANNELS,
     ReconstructionResult,
     pack_reconstruction_to_cpu,
     reconstruct_midpoint,
 )
-from .scoring import score_local_errors, score_region
+from .scoring import build_image_basis, luminance, score_local_errors, score_region
 from .state import LeaseHeartbeat, LeaseLostError, TaskStore
 
 
 ImageCache = OrderedDict[str, np.ndarray]
 DecodedItem = tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]
 DecodeEvent = tuple[str, Any]
+
+
+@dataclass
+class CpuTimingTotals:
+    scoring_seconds: float = 0.0
+    branch_evidence_seconds: float = 0.0
+    motion_gates_seconds: float = 0.0
+    serialization_seconds: float = 0.0
+    samples: int = 0
+
+    def __post_init__(self) -> None:
+        self._lock = Lock()
+
+    def add(
+        self,
+        *,
+        scoring: float,
+        branch_evidence: float,
+        motion_gates: float,
+        serialization: float,
+    ) -> None:
+        with self._lock:
+            self.scoring_seconds += float(scoring)
+            self.branch_evidence_seconds += float(branch_evidence)
+            self.motion_gates_seconds += float(motion_gates)
+            self.serialization_seconds += float(serialization)
+            self.samples += 1
 
 
 def _tensor_from_hwc(image: np.ndarray) -> torch.Tensor:
@@ -113,18 +142,38 @@ def _sample_record(
     reconstructed: ReconstructionResult,
     batch_index: int,
     thresholds: Any,
+    timings: CpuTimingTotals | None = None,
 ) -> dict[str, Any]:
+    scoring_started = time.perf_counter()
     prediction = _hwc(reconstructed.prediction[batch_index])
     warp0 = _hwc(reconstructed.warp0[batch_index])
     warp1 = _hwc(reconstructed.warp1[batch_index])
     warp_blend = _hwc(reconstructed.warp_blend[batch_index])
+    gt_basis = build_image_basis(gt, name="gt")
+    img1_basis = build_image_basis(img1, name="img1")
+    img0_luminance = luminance(img0)
+    endpoint_change = np.asarray(
+        np.abs(img0 - img1).mean(axis=-1),
+        dtype=np.float32,
+    )
     scoring = score_local_errors(
         prediction,
         gt,
         thresholds,
         img0=img0,
         img1=img1,
+        reference_basis=gt_basis,
+        endpoint_change_map=endpoint_change,
     )
+    scoring_elapsed = time.perf_counter() - scoring_started
+
+    motion_started = time.perf_counter()
+    flow_t0 = _hwc(reconstructed.flow_t0[batch_index])
+    flow_t1 = _hwc(reconstructed.flow_t1[batch_index])
+    motion_evidence = compute_motion_evidence(flow_t0, flow_t1)
+    motion_elapsed = time.perf_counter() - motion_started
+
+    branch_started = time.perf_counter()
     diagnosis = diagnose_sample(
         prediction,
         gt,
@@ -133,15 +182,18 @@ def _sample_record(
         warp_blend=warp_blend,
         img0=img0,
         img1=img1,
-        flow_t0=_hwc(reconstructed.flow_t0[batch_index]),
-        flow_t1=_hwc(reconstructed.flow_t1[batch_index]),
+        flow_discontinuity_map=motion_evidence.flow_discontinuity_map,
         mask0=_hwc(reconstructed.mask0[batch_index]),
         mask1=_hwc(reconstructed.mask1[batch_index]),
         regions=scoring.regions,
         scoring_config=thresholds,
         scoring_result=scoring,
+        img1_basis=img1_basis,
         config=thresholds,
     )
+    branch_elapsed = time.perf_counter() - branch_started
+
+    gates_started = time.perf_counter()
     indices = tuple(int(value) for value in source["frame_indices"])
     stride = int(source["stride"])
     contiguous = indices == (indices[0], indices[0] + stride, indices[0] + 2 * stride)
@@ -150,12 +202,14 @@ def _sample_record(
         gt,
         img1,
         sequence_contiguous=contiguous,
+        luminance_triplet=(
+            img0_luminance,
+            gt_basis.luminance,
+            img1_basis.luminance,
+        ),
     )
     validity = evaluate_validity(validity_metrics, thresholds)
-    scope_metrics = compute_scope_metrics(
-        reconstructed.flow_t0[batch_index],
-        reconstructed.flow_t1[batch_index],
-    )
+    scope_metrics = motion_evidence.scope_metrics
     scope = evaluate_in_scope(scope_metrics, thresholds)
     decision = decide_hard_case(
         validity,
@@ -164,6 +218,9 @@ def _sample_record(
         diagnosis.p_solvable,
         thresholds,
     )
+    motion_gates_elapsed = motion_elapsed + (time.perf_counter() - gates_started)
+
+    serialization_started = time.perf_counter()
     if validity.label == "reject":
         status = "invalid"
     elif scope.label == "reject":
@@ -173,7 +230,7 @@ def _sample_record(
     reasons = list(
         dict.fromkeys((*diagnosis.reasons, *validity.reasons, *scope.reasons, *decision.reasons))
     )
-    return {
+    result = {
         **dict(source),
         "status": status,
         "validity_label": validity.label,
@@ -195,6 +252,15 @@ def _sample_record(
         "primary_region_index": diagnosis.primary_region_index,
         "error": None,
     }
+    serialization_elapsed = time.perf_counter() - serialization_started
+    if timings is not None:
+        timings.add(
+            scoring=scoring_elapsed,
+            branch_evidence=branch_elapsed,
+            motion_gates=motion_gates_elapsed,
+            serialization=serialization_elapsed,
+        )
+    return result
 
 
 def _pack_outputs_to_cpu(outputs: ModelOutputs, valid_count: int) -> ModelOutputs:
@@ -298,26 +364,20 @@ def _resolve_reconstruction_device(
 def _resolve_postproc_workers(config: AppConfig) -> int:
     """Resolve the CPU postprocess thread count for one worker process.
 
-    ``runtime.postproc_workers == 0`` selects an automatic count derived from
-    the per-worker CPU budget; scipy/numpy release the GIL on the heavy paths,
-    so these threads achieve real parallelism on reconstruction-free scoring.
-
-    When ``cpu_threads_per_worker`` is the default value of 1 (meaning the
-    user left it unconfigured), the formula ``1 // 4 == 0`` would collapse to
-    a single postproc thread and negate the entire overlap design.  Fall back
-    to the physical core count in that case so the thread pool actually fires.
+    Automatic mode is deliberately memory-bandwidth oriented.  Full-resolution
+    NumPy/SciPy diagnostics gain little from an unbounded number of concurrent
+    scans, so each accelerator worker gets at most two scoring Futures.
     """
 
     configured = int(config.runtime.postproc_workers)
     if configured > 0:
         return configured
-    cpu = int(config.runtime.cpu_threads_per_worker)
-    if cpu <= 1:
-        # cpu_threads_per_worker=1 is the "not explicitly configured" default;
-        # derive from physical cores instead of dividing 1 by 4.
-        cpu = os.cpu_count() or 4
-    automatic = max(1, cpu // 4)
-    return min(automatic, 8)
+    cpu_budget = max(1, int(config.runtime.cpu_threads_per_worker))
+    logical_cpus = max(1, int(os.cpu_count() or 1))
+    configured_workers = max(1, int(config.runtime.workers))
+    fair_share = max(1, logical_cpus // configured_workers)
+    bandwidth_share = max(1, fair_share // 8)
+    return min(2, cpu_budget, bandwidth_share)
 
 
 class _ProgressLog:
@@ -346,54 +406,93 @@ class _ProgressLog:
         )
 
     def update_inferred(
-        self, n: int, *, pending_batches: int, pending_bytes: int
+        self,
+        n: int,
+        *,
+        pending_batches: int,
+        pending_bytes: int,
+        pending_retained_bytes: int | None = None,
     ) -> None:
         self._inferred += n
         self._maybe_emit(
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
+            pending_retained_bytes=pending_retained_bytes,
         )
 
     def update_scored(
-        self, n: int, *, pending_batches: int, pending_bytes: int
+        self,
+        n: int,
+        *,
+        pending_batches: int,
+        pending_bytes: int,
+        pending_retained_bytes: int | None = None,
     ) -> None:
         self._scored += n
         self._maybe_emit(
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
+            pending_retained_bytes=pending_retained_bytes,
         )
 
     def update_invalid(
-        self, n: int, *, pending_batches: int, pending_bytes: int
+        self,
+        n: int,
+        *,
+        pending_batches: int,
+        pending_bytes: int,
+        pending_retained_bytes: int | None = None,
     ) -> None:
         self._inferred += n
         self._scored += n
         self._maybe_emit(
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
+            pending_retained_bytes=pending_retained_bytes,
         )
 
-    def waiting(self, *, pending_batches: int, pending_bytes: int) -> None:
+    def waiting(
+        self,
+        *,
+        pending_batches: int,
+        pending_bytes: int,
+        pending_retained_bytes: int | None = None,
+    ) -> None:
         self._maybe_emit(
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
+            pending_retained_bytes=pending_retained_bytes,
         )
 
-    def _maybe_emit(self, *, pending_batches: int, pending_bytes: int) -> None:
+    def _maybe_emit(
+        self,
+        *,
+        pending_batches: int,
+        pending_bytes: int,
+        pending_retained_bytes: int | None = None,
+    ) -> None:
         now = time.monotonic()
         if now - self._last >= self._INTERVAL:
             self._emit(
                 now,
                 pending_batches=pending_batches,
                 pending_bytes=pending_bytes,
+                pending_retained_bytes=pending_retained_bytes,
             )
             self._last = now
 
-    def close(self, *, pending_batches: int = 0, pending_bytes: int = 0) -> None:
+    def close(
+        self,
+        *,
+        pending_batches: int = 0,
+        pending_bytes: int = 0,
+        pending_retained_bytes: int | None = None,
+    ) -> None:
         self._emit(
             time.monotonic(),
             pending_batches=pending_batches,
             pending_bytes=pending_bytes,
+            pending_retained_bytes=pending_retained_bytes,
             final=True,
         )
 
@@ -403,15 +502,23 @@ class _ProgressLog:
         *,
         pending_batches: int,
         pending_bytes: int,
+        pending_retained_bytes: int | None = None,
         final: bool = False,
     ) -> None:
         elapsed = now - self._start
         rate = self._scored / elapsed if elapsed > 0 else 0.0
         label = "done" if final else "..."
+        retained_bytes = (
+            pending_bytes
+            if pending_retained_bytes is None
+            else pending_retained_bytes
+        )
         print(
             f"{self._prefix}  inferred {self._inferred}/{self._total}"
             f"  scored {self._scored}/{self._total}"
-            f"  pending {pending_batches} batches/{pending_bytes / (1024 * 1024):.0f} MiB"
+            f"  pending {pending_batches} batches"
+            f"  retained {retained_bytes / (1024 * 1024):.0f} MiB"
+            f"  reserved {pending_bytes / (1024 * 1024):.0f} MiB"
             f"  {elapsed:.0f}s  {rate:.1f}/s  {label}",
             file=sys.stderr,
             flush=True,
@@ -649,8 +756,28 @@ def _infer_and_reconstruct(
     )
 
 
-_RECONSTRUCTION_CHANNELS = 15
+_INPUT_FRAME_CHANNELS = 9
+_MAIN_SCRATCH_CHANNELS = 24
+_FUTURE_FIXED_BYTES = 1024 * 1024
 _FUTURE_WAIT_SECONDS = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class PendingReservation:
+    """Memory owned or temporarily required by one postprocess Future."""
+
+    sample_count: int
+    retained_bytes: int
+    scratch_bytes: int
+    fixed_bytes: int
+    reserved_bytes: int
+    oversize: bool = False
+
+
+@dataclass(slots=True)
+class PendingPostprocess:
+    future: Future[list[dict[str, Any]]]
+    reservation: PendingReservation
 
 
 def _infer_model_batch(
@@ -691,7 +818,39 @@ def _reconstruction_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
     if not items:
         raise ValueError("cannot estimate reconstruction bytes for an empty batch")
     height, width = items[0][1].shape[:2]
-    return int(height) * int(width) * _RECONSTRUCTION_CHANNELS * 4
+    return int(height) * int(width) * RECONSTRUCTION_CHANNELS * 4
+
+
+def _postproc_reservation(
+    items: Sequence[DecodedItem],
+    *,
+    sample_count: int | None = None,
+    buffer_bytes: int | None = None,
+    scratch_channels: int = _MAIN_SCRATCH_CHANNELS,
+) -> PendingReservation:
+    if not items:
+        raise ValueError("cannot reserve postprocess memory for an empty batch")
+    count = len(items) if sample_count is None else int(sample_count)
+    if count < 1 or count > len(items):
+        raise ValueError("sample_count must be within the supplied item count")
+    height, width = items[0][1].shape[:2]
+    plane_bytes = int(height) * int(width) * 4
+    retained_bytes = (
+        count * _reconstruction_bytes_per_sample(items)
+        + count * plane_bytes * _INPUT_FRAME_CHANNELS
+    )
+    scratch_bytes = plane_bytes * max(0, int(scratch_channels))
+    reserved_bytes = retained_bytes + scratch_bytes + _FUTURE_FIXED_BYTES
+    return PendingReservation(
+        sample_count=count,
+        retained_bytes=retained_bytes,
+        scratch_bytes=scratch_bytes,
+        fixed_bytes=_FUTURE_FIXED_BYTES,
+        reserved_bytes=reserved_bytes,
+        oversize=(
+            buffer_bytes is not None and reserved_bytes > max(0, int(buffer_bytes))
+        ),
+    )
 
 
 def _postproc_microbatch_size(
@@ -700,11 +859,26 @@ def _postproc_microbatch_size(
     buffer_bytes: int,
     postproc_workers: int,
 ) -> int:
-    """Choose a slice so all active CPU futures fit inside one worker budget."""
+    """Choose a slice whose complete Future reservation fits its fair share."""
 
-    bytes_per_sample = _reconstruction_bytes_per_sample(items)
+    if not items:
+        raise ValueError("cannot size an empty postprocess batch")
     per_future_budget = max(1, int(buffer_bytes) // max(1, int(postproc_workers)))
-    return max(1, min(len(items), per_future_budget // max(1, bytes_per_sample)))
+    single = _postproc_reservation(
+        items,
+        sample_count=1,
+        buffer_bytes=per_future_budget,
+    )
+    retained_per_sample = single.retained_bytes
+    fixed_and_scratch = single.scratch_bytes + single.fixed_bytes
+    available = max(0, per_future_budget - fixed_and_scratch)
+    return max(
+        1,
+        min(
+            len(items),
+            available // max(1, retained_per_sample),
+        ),
+    )
 
 
 def _process_payload_records(
@@ -725,16 +899,20 @@ def _process_payload_records(
     postproc_buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
     postproc_workers = _resolve_postproc_workers(config)
     output: list[dict[str, Any]] = []
-    pending: list[tuple[Future[list[dict[str, Any]]], int, int]] = []
-    pending_bytes = 0
+    pending: list[PendingPostprocess] = []
+    pending_reserved_bytes = 0
+    pending_retained_bytes = 0
+    timings = CpuTimingTotals()
+    oversize_logged = False
     bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
 
     def drain_one() -> None:
-        nonlocal pending_bytes
-        future, sample_count, estimated_bytes = pending.pop(0)
+        nonlocal pending_reserved_bytes, pending_retained_bytes
+        current = pending.pop(0)
+        reservation = current.reservation
         while True:
             try:
-                completed = future.result(timeout=_FUTURE_WAIT_SECONDS)
+                completed = current.future.result(timeout=_FUTURE_WAIT_SECONDS)
                 break
             except FutureTimeoutError:
                 if heartbeat is not None:
@@ -742,17 +920,20 @@ def _process_payload_records(
                 if bar is not None:
                     bar.waiting(
                         pending_batches=len(pending) + 1,
-                        pending_bytes=pending_bytes,
+                        pending_bytes=pending_reserved_bytes,
+                        pending_retained_bytes=pending_retained_bytes,
                     )
         output.extend(completed)
-        pending_bytes -= estimated_bytes
+        pending_reserved_bytes -= reservation.reserved_bytes
+        pending_retained_bytes -= reservation.retained_bytes
         if heartbeat is not None:
             heartbeat()
         if bar is not None:
             bar.update_scored(
-                sample_count,
+                reservation.sample_count,
                 pending_batches=len(pending),
-                pending_bytes=pending_bytes,
+                pending_bytes=pending_reserved_bytes,
+                pending_retained_bytes=pending_retained_bytes,
             )
 
     with ThreadPoolExecutor(
@@ -777,21 +958,26 @@ def _process_payload_records(
                     bar.update_inferred(
                         len(items),
                         pending_batches=len(pending),
-                        pending_bytes=pending_bytes,
+                        pending_bytes=pending_reserved_bytes,
+                        pending_retained_bytes=pending_retained_bytes,
                     )
                 microbatch_size = _postproc_microbatch_size(
                     items,
                     buffer_bytes=postproc_buffer_bytes,
                     postproc_workers=postproc_workers,
                 )
-                bytes_per_sample = _reconstruction_bytes_per_sample(items)
                 for start in range(0, len(items), microbatch_size):
                     end = min(len(items), start + microbatch_size)
                     item_slice = list(items[start:end])
-                    estimated_bytes = len(item_slice) * bytes_per_sample
+                    reservation = _postproc_reservation(
+                        item_slice,
+                        buffer_bytes=postproc_buffer_bytes,
+                    )
                     while pending and (
                         len(pending) >= postproc_workers
-                        or pending_bytes + estimated_bytes > postproc_buffer_bytes
+                        or reservation.oversize
+                        or pending_reserved_bytes + reservation.reserved_bytes
+                        > postproc_buffer_bytes
                     ):
                         drain_one()
                     reconstructed = _reconstruct_outputs(
@@ -801,14 +987,34 @@ def _process_payload_records(
                         model_config=model_config,
                         device=reconstruction_device,
                     )
+                    finish_kwargs: dict[str, Any] = {"config": config}
+                    if finish_batch is _ORIGINAL_FINISH_MAIN_BATCH:
+                        finish_kwargs["timings"] = timings
                     future = executor.submit(
                         finish_batch,
                         item_slice,
                         reconstructed,
-                        config=config,
+                        **finish_kwargs,
                     )
-                    pending.append((future, len(item_slice), estimated_bytes))
-                    pending_bytes += estimated_bytes
+                    pending.append(
+                        PendingPostprocess(
+                            future=future,
+                            reservation=reservation,
+                        )
+                    )
+                    pending_reserved_bytes += reservation.reserved_bytes
+                    pending_retained_bytes += reservation.retained_bytes
+                    if reservation.oversize and not oversize_logged:
+                        print(
+                            f"{progress_prefix}  pending reservation "
+                            f"{reservation.reserved_bytes / (1024 * 1024):.0f} MiB "
+                            f"exceeds budget "
+                            f"{postproc_buffer_bytes / (1024 * 1024):.0f} MiB; "
+                            "running one sample exclusively (oversize=1)",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        oversize_logged = True
             elif kind == "invalid":
                 while pending:
                     drain_one()
@@ -819,6 +1025,7 @@ def _process_payload_records(
                         1,
                         pending_batches=0,
                         pending_bytes=0,
+                        pending_retained_bytes=0,
                     )
             else:  # pragma: no cover - producer owns this internal protocol
                 raise RuntimeError(f"unexpected decode event {kind!r}")
@@ -828,6 +1035,17 @@ def _process_payload_records(
             drain_one()
     if bar is not None:
         bar.close()
+    if progress_prefix and timings.samples:
+        scale = 1000.0 / timings.samples
+        print(
+            f"{progress_prefix}  cpu_ms/sample"
+            f"  scoring={timings.scoring_seconds * scale:.1f}"
+            f"  branch_evidence={timings.branch_evidence_seconds * scale:.1f}"
+            f"  motion_gates={timings.motion_gates_seconds * scale:.1f}"
+            f"  serialization={timings.serialization_seconds * scale:.1f}",
+            file=sys.stderr,
+            flush=True,
+        )
     return output
 
 
@@ -836,6 +1054,7 @@ def _finish_main_batch(
     reconstructed: ReconstructionResult,
     *,
     config: AppConfig,
+    timings: CpuTimingTotals | None = None,
 ) -> list[dict[str, Any]]:
     return [
         _sample_record(
@@ -846,9 +1065,13 @@ def _finish_main_batch(
             reconstructed=reconstructed,
             batch_index=index,
             thresholds=config.thresholds,
+            timings=timings,
         )
         for index, item in enumerate(items)
     ]
+
+
+_ORIGINAL_FINISH_MAIN_BATCH = _finish_main_batch
 
 
 def _evaluate_batch(
@@ -1281,6 +1504,7 @@ def _finish_teacher_batch(
     reconstructed: ReconstructionResult,
     *,
     config: AppConfig,
+    timings: CpuTimingTotals | None = None,
 ) -> list[dict[str, Any]]:
     if config.teacher is None:
         raise RuntimeError("teacher postprocess requires config.teacher")

@@ -123,6 +123,45 @@ def test_precomputed_local_score_avoids_rescoring_and_matches_legacy_path(monkey
     assert actual == expected
 
 
+@pytest.mark.parametrize(("with_teacher", "expected_calls"), [(False, 5), (True, 6)])
+def test_branch_full_frame_work_is_constant_across_eight_regions(
+    monkeypatch,
+    with_teacher,
+    expected_calls,
+):
+    gt = np.zeros((96, 96, 3), dtype=np.float32)
+    gt[12:84, 46:50] = 1.0
+    prediction = np.zeros_like(gt)
+    scoring = score_local_errors(prediction, gt)
+    boxes = [
+        (4 + column * 22, 4 + row * 42, 22 + column * 22, 34 + row * 42)
+        for row in range(2)
+        for column in range(4)
+    ]
+    calls = 0
+    original = diagnosis_module.compute_structure_map
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(diagnosis_module, "compute_structure_map", counted)
+    diagnose_sample(
+        prediction,
+        gt,
+        teacher_prediction=gt if with_teacher else None,
+        warp0=gt,
+        warp1=prediction,
+        warp_blend=prediction,
+        img1=prediction,
+        regions=boxes,
+        scoring_result=scoring,
+    )
+
+    assert calls == expected_calls
+
+
 def test_primary_region_prefers_central_structure_over_static_edge_hud():
     gt = np.zeros((128, 128, 3), dtype=np.float32)
     for x0 in range(8, 120, 8):

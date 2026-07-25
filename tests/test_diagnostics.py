@@ -21,7 +21,7 @@ class _Adapter:
 
 
 def _item(index):
-    image = np.zeros((6, 8, 3), dtype=np.float32)
+    image = np.zeros((64, 64, 3), dtype=np.float32)
     return ({"sample_id": f"sample-{index}"}, image, image, image)
 
 
@@ -40,7 +40,7 @@ def test_diagnostic_large_batch_uses_memory_bounded_microbatches(
         ),
         runtime=RuntimeConfig(
             postproc_workers=2,
-            postproc_buffer_mb=1,
+            postproc_buffer_mb=8,
             warmup_batches=0,
         ),
     )
@@ -73,16 +73,6 @@ def test_diagnostic_large_batch_uses_memory_bounded_microbatches(
 
     monkeypatch.setattr(diagnostics_module, "execution_id", lambda config: "execution")
     monkeypatch.setattr(diagnostics_module, "_prefetched_diagnostic_batches", decoded)
-    monkeypatch.setattr(
-        diagnostics_module,
-        "_reconstruction_bytes_per_sample",
-        lambda items: 100 * 1024,
-    )
-    monkeypatch.setattr(
-        diagnostics_module,
-        "_postproc_microbatch_size",
-        lambda items, **kwargs: min(5, len(items)),
-    )
     monkeypatch.setattr(diagnostics_module, "_reconstruct_outputs", reconstruct)
     monkeypatch.setattr(diagnostics_module, "_finish_batch_diagnostics", finish)
 
@@ -103,7 +93,7 @@ def test_diagnostic_large_batch_uses_memory_bounded_microbatches(
         f"sample-{index}" for index in range(65)
     ]
     assert sum(reconstructed_sizes) == 65
-    assert max(reconstructed_sizes) == 5
+    assert max(reconstructed_sizes) == 6
     progress = capsys.readouterr().err
     assert "inferred 65/65" in progress
     assert "scored 65/65" in progress

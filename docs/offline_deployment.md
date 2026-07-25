@@ -228,7 +228,7 @@ vfi-hard-miner run --config configs/my_game.json
 
 `run` 内部执行 index → main → 可选 teacher → CGVQM → finalize。main、可选 teacher 与 CGVQM 阶段使用独立 SQLite lease 状态。CGVQM 在干净子进程中绑定加速卡，避免协调进程导入 `torch_npu`；每个视频精判完成后即可把 A/B 帧复制到运行暂存区。分阶段命令仍可用于恢复。
 
-诊断任务按视频排序后动态切块，目标是让 8 卡配置拥有足够任务并行度；实际 worker 数为 `min(runtime.workers, 当前任务数)`。每个进程只绑定一张 NPU、加载一次当前模型，并利用解码预取和单 CPU 后处理线程重叠 NPU 推理、FP32 原图重建、局部评分和拼图生成。这里不使用 DDP、HCCL 或跨卡梯度同步。
+诊断任务按视频排序后动态切块，目标是让 8 卡配置拥有足够任务并行度；实际 worker 数为 `min(runtime.workers, 当前任务数)`。每个进程只绑定一张 NPU、加载一次当前模型，并利用解码预取和受内存预算约束的 CPU Future 重叠 NPU 推理、FP32 原图重建、局部评分和拼图生成。自动模式每个 NPU worker 最多使用两个评分 Future；完整 reservation 在 reconstruction 前检查，覆盖 18 通道重建结果、输入帧引用和评分 scratch。这里不使用 DDP、HCCL 或跨卡梯度同步。
 
 状态恢复使用 execution-scoped SQLite、后台 lease heartbeat 和 attempt fencing。每次尝试写入独立的 part/artifact 目录；完成记录会绑定 winning task/attempt，缺失或无效产物在重跑时重新排队，旧 attempt 不会进入最终 `diagnostic_results.jsonl`。
 

@@ -202,16 +202,18 @@
 
     // 每个 worker 进程的 CPU 线程数（用于 PyTorch/OpenCV 内部并行）。
     // 多 worker 时建议 cpu_threads_per_worker × workers ≤ 物理核心数。
-    "cpu_threads_per_worker": 16,
+    "cpu_threads_per_worker": 8,
 
     // 每个 worker 的 CPU 后处理线程数（重建结果的评分与诊断）。
-    // 0 表示自动：min(8, cpu_threads_per_worker / 4)。评分热点已由 scipy/
-    // numpy 在 C 层执行并释放 GIL，多线程可获得真实并行；设为 1 可复现旧行为。
+    // 0 表示自动：结合逻辑核数、worker 数与每进程线程预算计算，并将每个
+    // NPU worker 的全分辨率评分 Future 限制为最多 2 个，避免内存带宽争用。
+    // 显式正整数仍可覆盖，但实际在途数量继续受 postproc_buffer_mb 限制。
     "postproc_workers": 0,
 
-    // 每个 worker 允许同时滞留在 CPU 后处理队列中的重建结果上限（MB）。
-    // 模型 batch 与后处理微批次解耦；程序会按实际分辨率自动切分，并在
-    // 提交新微批次前回收 Future，避免大 batch 在 chunk 尾部引发换页。
+    // 每个 worker 的 CPU 后处理完整预留上限（MB），覆盖 18 通道重建结果、
+    // Future 持有的三张输入帧以及每个活跃 Future 的评分 scratch。模型 batch
+    // 与后处理微批次解耦；提交 reconstruction 前即完成预留检查。单样本超过
+    // 预算时会独占执行并记录 oversize=1，不会与其他 Future 并发。
     "postproc_buffer_mb": 1024,
 
     // 每个 worker 在正式推理前运行的预热批数。

@@ -42,7 +42,6 @@ from .worker import (
     _infer_model_batch,
     _postproc_microbatch_size,
     _reconstruct_outputs,
-    _resolve_postproc_workers,
     _resolve_reconstruction_device,
     _slice_model_outputs,
 )
@@ -571,7 +570,6 @@ def _fill_and_score_clips(
         key=lambda item: (tuple(item["frame_indices"]), str(item["sample_id"])),
     )
     reconstruction_device = _resolve_reconstruction_device(config, model_device)
-    postproc_workers = _resolve_postproc_workers(config)
     buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
     completed = 0
     for items in _prefetched_diagnostic_batches(
@@ -589,7 +587,9 @@ def _fill_and_score_clips(
         microbatch = _postproc_microbatch_size(
             items,
             buffer_bytes=buffer_bytes,
-            postproc_workers=postproc_workers,
+            # This loop is synchronous and owns no CPU Future pool.  Use the
+            # whole stage budget instead of dividing it by main-stage workers.
+            postproc_workers=1,
         )
         for micro_start in range(0, len(items), microbatch):
             micro_end = min(len(items), micro_start + microbatch)

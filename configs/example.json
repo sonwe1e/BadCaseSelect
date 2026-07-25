@@ -57,7 +57,7 @@
     "chunk_triplets": 256,
     "prefetch": 2,
     "decode_cache_mb": 512,
-    "cpu_threads_per_worker": 16,
+    "cpu_threads_per_worker": 8,
     "postproc_workers": 0,
     "postproc_buffer_mb": 1024,
     "warmup_batches": 2,

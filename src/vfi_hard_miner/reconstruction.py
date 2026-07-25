@@ -394,6 +394,7 @@ _PACK_FIELD_CHANNELS: tuple[tuple[str, int], ...] = (
     ("warp_blend", 3),
     ("prediction", 3),
 )
+RECONSTRUCTION_CHANNELS = sum(channels for _, channels in _PACK_FIELD_CHANNELS)
 
 
 def pack_reconstruction_to_cpu(result: ReconstructionResult) -> ReconstructionResult:

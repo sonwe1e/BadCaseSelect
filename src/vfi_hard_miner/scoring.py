@@ -154,12 +154,26 @@ class ErrorMaps:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageBasis:
+    """Reusable normalized image, luminance, and Sobel reference."""
+
+    rgb: np.ndarray
+    luminance: np.ndarray
+    sobel: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
 class LocalScoreResult:
     maps: ErrorMaps
     regions: tuple[RegionBox, ...]
     metrics: dict[str, float] = field(default_factory=dict)
     p_wrong: float = 0.0
     mining_p_wrong: float = 0.0
+    reference_basis: ImageBasis | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def to_dict(self, *, include_maps: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -260,30 +274,40 @@ def sobel_magnitude(image_or_luma: ArrayLike) -> np.ndarray:
     return np.asarray(np.clip(np.hypot(gx, gy) / 4.0, 0.0, 1.0), dtype=np.float32)
 
 
-def compute_error_maps(prediction: ArrayLike, gt: ArrayLike) -> ErrorMaps:
-    """Compute aligned RGB, luminance, and directional edge evidence."""
+def build_image_basis(value: ArrayLike, *, name: str = "image") -> ImageBasis:
+    rgb = as_rgb01(value, name=name)
+    luma = np.asarray(
+        0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2],
+        dtype=np.float32,
+    )
+    return ImageBasis(rgb=rgb, luminance=luma, sobel=sobel_magnitude(luma))
 
+
+def _error_maps_against_basis(
+    prediction: ArrayLike,
+    reference: ImageBasis,
+) -> ErrorMaps:
     pred = as_rgb01(prediction, name="prediction")
-    reference = as_rgb01(gt, name="gt")
-    if pred.shape != reference.shape:
+    if pred.shape != reference.rgb.shape:
         raise ValueError(
-            f"prediction and gt must have the same shape, got {pred.shape} and {reference.shape}"
+            "prediction and gt must have the same shape, got "
+            f"{pred.shape} and {reference.rgb.shape}"
         )
-    absolute = np.abs(pred - reference)
+    absolute = np.abs(pred - reference.rgb)
     rgb_error = np.asarray(absolute.mean(axis=-1), dtype=np.float32)
     pred_luma = (
         0.2126 * pred[..., 0] + 0.7152 * pred[..., 1] + 0.0722 * pred[..., 2]
     )
-    gt_luma = (
-        0.2126 * reference[..., 0]
-        + 0.7152 * reference[..., 1]
-        + 0.0722 * reference[..., 2]
+    luma_error = np.asarray(
+        np.abs(pred_luma - reference.luminance), dtype=np.float32
     )
-    luma_error = np.asarray(np.abs(pred_luma - gt_luma), dtype=np.float32)
-    gt_edges = sobel_magnitude(gt_luma)
     pred_edges = sobel_magnitude(pred_luma)
-    gt_only = np.asarray(np.maximum(gt_edges - pred_edges, 0.0), dtype=np.float32)
-    pred_only = np.asarray(np.maximum(pred_edges - gt_edges, 0.0), dtype=np.float32)
+    gt_only = np.asarray(
+        np.maximum(reference.sobel - pred_edges, 0.0), dtype=np.float32
+    )
+    pred_only = np.asarray(
+        np.maximum(pred_edges - reference.sobel, 0.0), dtype=np.float32
+    )
     edge_error = np.maximum(gt_only, pred_only)
 
     # Max fusion intentionally preserves a thin high-confidence structure.
@@ -297,12 +321,59 @@ def compute_error_maps(prediction: ArrayLike, gt: ArrayLike) -> ErrorMaps:
     return ErrorMaps(
         rgb=rgb_error,
         luminance=luma_error,
-        sobel_gt=gt_edges,
+        sobel_gt=reference.sobel,
         sobel_prediction=pred_edges,
         gt_only_edges=gt_only,
         pred_only_edges=pred_only,
         structure=structure,
     )
+
+
+def compute_error_maps(prediction: ArrayLike, gt: ArrayLike) -> ErrorMaps:
+    """Compute aligned RGB, luminance, and directional edge evidence."""
+
+    return _error_maps_against_basis(
+        prediction,
+        build_image_basis(gt, name="gt"),
+    )
+
+
+def compute_structure_map(
+    prediction: ArrayLike,
+    reference: ImageBasis,
+) -> np.ndarray:
+    """Compute only the fused structure map against a reusable reference."""
+
+    pred = as_rgb01(prediction, name="prediction")
+    if pred.shape != reference.rgb.shape:
+        raise ValueError(
+            "prediction and gt must have the same shape, got "
+            f"{pred.shape} and {reference.rgb.shape}"
+        )
+    rgb_error = np.asarray(
+        np.abs(pred - reference.rgb).mean(axis=-1),
+        dtype=np.float32,
+    )
+    pred_luma = np.asarray(
+        0.2126 * pred[..., 0] + 0.7152 * pred[..., 1] + 0.0722 * pred[..., 2],
+        dtype=np.float32,
+    )
+    luma_error = np.asarray(
+        np.abs(pred_luma - reference.luminance),
+        dtype=np.float32,
+    )
+    pred_edges = sobel_magnitude(pred_luma)
+    edge_error = np.asarray(
+        np.abs(reference.sobel - pred_edges),
+        dtype=np.float32,
+    )
+    return np.maximum.reduce(
+        (
+            rgb_error,
+            luma_error,
+            np.clip(edge_error * 1.25, 0.0, 1.0),
+        )
+    ).astype(np.float32, copy=False)
 
 
 def top_area_mean(values: ArrayLike, fraction: float) -> float:
@@ -339,15 +410,38 @@ def summarize_error_map(
     if not np.isfinite(array).all():
         raise ValueError("error map contains NaN or infinite values")
     flat = array.reshape(-1)
+    quantiles = np.quantile(flat, (0.95, 0.99, 0.999))
     metrics = {
         "mean": float(flat.mean()),
         "max": float(flat.max()),
-        "q95": float(np.quantile(flat, 0.95)),
-        "q99": float(np.quantile(flat, 0.99)),
-        "q999": float(np.quantile(flat, 0.999)),
+        "q95": float(quantiles[0]),
+        "q99": float(quantiles[1]),
+        "q999": float(quantiles[2]),
     }
-    for fraction in top_area_fractions:
-        metrics[_fraction_name(float(fraction))] = top_area_mean(flat, float(fraction))
+    fractions = tuple(float(value) for value in top_area_fractions)
+    for fraction in fractions:
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("top-area fractions must be in (0, 1]")
+    counts = {
+        fraction: max(1, int(np.ceil(flat.size * fraction)))
+        for fraction in fractions
+    }
+    starts = sorted(
+        {
+            flat.size - count
+            for count in counts.values()
+            if count < flat.size
+        }
+    )
+    partitioned = np.partition(flat, starts) if starts else flat
+    for fraction in fractions:
+        count = counts[fraction]
+        top_values = (
+            partitioned
+            if count >= flat.size
+            else partitioned[flat.size - count :]
+        )
+        metrics[_fraction_name(fraction)] = float(top_values.mean())
     return metrics
 
 
@@ -630,7 +724,20 @@ def _region_from_box(
     metrics["source_native"] = 1.0 if source == "native_component" else 0.0
     if extra_metrics:
         metrics.update({key: float(value) for key, value in extra_metrics.items()})
-    return RegionBox(x0, y0, x1, y1, robust_local_score(crop), metrics)
+    score = max(
+        stats["mean"],
+        0.90 * stats[_fraction_name(0.10)],
+        0.95 * stats[_fraction_name(0.01)],
+        0.85 * stats["max"],
+    )
+    return RegionBox(
+        x0,
+        y0,
+        x1,
+        y1,
+        float(np.clip(score, 0.0, 1.0)),
+        metrics,
+    )
 
 
 def _intersection_metrics(left: RegionBox, right: RegionBox) -> tuple[float, float]:
@@ -901,7 +1008,7 @@ def _find_candidate_regions_and_raw_score(
     support_map: ArrayLike | None = None,
     gt_edge_map: ArrayLike | None = None,
     endpoint_change_map: ArrayLike | None = None,
-) -> tuple[tuple[RegionBox, ...], float]:
+) -> tuple[tuple[RegionBox, ...], float, dict[int, float]]:
     """Generate prioritized regions plus context-independent raw severity."""
 
     cfg = ScoringConfig.from_value(config)
@@ -911,9 +1018,9 @@ def _find_candidate_regions_and_raw_score(
     if values.size == 0 or not np.isfinite(values).all():
         if values.size and not np.isfinite(values).all():
             raise ValueError("error_map contains NaN or infinite values")
-        return (), 0.0
+        return (), 0.0, {}
     if float(values.max()) <= 0.0:
-        return (), 0.0
+        return (), 0.0, {}
     support = None
     if support_map is not None:
         support = np.asarray(_to_numpy(support_map), dtype=np.float32)
@@ -967,6 +1074,7 @@ def _find_candidate_regions_and_raw_score(
     contextual_native_candidates = raw_native_candidates
 
     window_candidates: list[RegionBox] = []
+    window_maxima: dict[int, float] = {}
     seen_sizes: set[int] = set()
     for requested_size in cfg.window_sizes:
         size = min(max(1, int(requested_size)), min(values.shape))
@@ -974,6 +1082,7 @@ def _find_candidate_regions_and_raw_score(
             continue
         seen_sizes.add(size)
         means, ys, xs, y1s, x1s = _window_grid(values, size)
+        window_maxima[size] = float(means.max())
         qualified = means >= float(cfg.window_threshold)
         for component in _extract_components(qualified, means):
             grid_x0, grid_y0 = component.x0, component.y0
@@ -1023,7 +1132,7 @@ def _find_candidate_regions_and_raw_score(
             ui_likelihood_threshold=cfg.ui_likelihood_threshold,
         )
     )
-    return regions, float(raw_region_local)
+    return regions, float(raw_region_local), window_maxima
 
 
 def find_candidate_regions(
@@ -1036,7 +1145,7 @@ def find_candidate_regions(
 ) -> tuple[RegionBox, ...]:
     """Generate native and multi-scale regions without a Top-K sample policy."""
 
-    regions, _ = _find_candidate_regions_and_raw_score(
+    regions, _, _ = _find_candidate_regions_and_raw_score(
         error_map,
         config,
         support_map=support_map,
@@ -1053,15 +1162,28 @@ def score_local_errors(
     *,
     img0: ArrayLike | None = None,
     img1: ArrayLike | None = None,
+    reference_basis: ImageBasis | None = None,
+    endpoint_change_map: ArrayLike | None = None,
 ) -> LocalScoreResult:
     """Score a prediction against GT and retain localized evidence."""
 
     cfg = ScoringConfig.from_value(config)
-    maps = compute_error_maps(prediction, gt)
+    resolved_reference = (
+        build_image_basis(gt, name="gt")
+        if reference_basis is None
+        else reference_basis
+    )
+    maps = _error_maps_against_basis(prediction, resolved_reference)
     if (img0 is None) != (img1 is None):
         raise ValueError("img0 and img1 must be supplied together for UI prioritization")
     endpoint_change: np.ndarray | None = None
-    if img0 is not None and img1 is not None:
+    if endpoint_change_map is not None:
+        endpoint_change = np.asarray(_to_numpy(endpoint_change_map), dtype=np.float32)
+        if endpoint_change.shape != maps.structure.shape:
+            raise ValueError("endpoint_change_map must match GT spatial shape")
+        if not np.isfinite(endpoint_change).all():
+            raise ValueError("endpoint_change_map contains NaN or infinite values")
+    elif img0 is not None and img1 is not None:
         first = as_rgb01(img0, name="img0")
         last = as_rgb01(img1, name="img1")
         expected_shape = (*maps.structure.shape, 3)
@@ -1071,7 +1193,7 @@ def score_local_errors(
                 f"{first.shape} and {last.shape}"
             )
         endpoint_change = np.asarray(np.abs(first - last).mean(axis=-1), dtype=np.float32)
-    regions, raw_region_local = _find_candidate_regions_and_raw_score(
+    regions, raw_region_local, window_maxima = _find_candidate_regions_and_raw_score(
         maps.structure,
         cfg,
         support_map=maps.rgb,
@@ -1092,10 +1214,8 @@ def score_local_errors(
         ).items():
             metrics[f"{map_name}_{name}"] = value
 
-    for size in cfg.window_sizes:
-        clipped_size = min(max(1, int(size)), min(maps.structure.shape))
-        window_means, *_ = _window_grid(maps.structure, clipped_size)
-        metrics[f"window_{clipped_size}_mean_max"] = float(window_means.max())
+    for clipped_size, maximum in window_maxima.items():
+        metrics[f"window_{clipped_size}_mean_max"] = maximum
 
     global_local = max(
         metrics.get("structure_top_0_01pct_mean", 0.0),
@@ -1152,6 +1272,7 @@ def score_local_errors(
         metrics=metrics,
         p_wrong=p_wrong,
         mining_p_wrong=mining_p_wrong,
+        reference_basis=resolved_reference,
     )
 
 
@@ -1164,11 +1285,14 @@ score_pair = score_local_errors
 
 __all__ = [
     "ErrorMaps",
+    "ImageBasis",
     "LocalScoreResult",
     "ScoringConfig",
     "as_rgb01",
+    "build_image_basis",
     "compute_error_maps",
     "compute_local_error_maps",
+    "compute_structure_map",
     "find_candidate_regions",
     "generate_candidate_regions",
     "luminance",

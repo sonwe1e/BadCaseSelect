@@ -7,12 +7,14 @@ from vfi_hard_miner.gates import (
     FrameValidityMetrics,
     GateResult,
     ScopeMetrics,
+    compute_motion_evidence,
     compute_scope_metrics,
     compute_validity_metrics,
     decide_hard_case,
     evaluate_in_scope,
     evaluate_validity,
 )
+from vfi_hard_miner.diagnosis import _gradient_support_map
 
 
 def _clean_validity() -> FrameValidityMetrics:
@@ -35,6 +37,25 @@ def _clean_scope() -> ScopeMetrics:
         occlusion_ratio=0.05,
         unexplained_motion_ratio=0.05,
         background_motion=0.80,
+    )
+
+
+def test_motion_evidence_reuses_flow_gradient_without_changing_support():
+    rng = np.random.default_rng(11)
+    flow0 = rng.normal(size=(48, 64, 2)).astype(np.float32)
+    flow1 = rng.normal(size=(48, 64, 2)).astype(np.float32)
+    expected = np.maximum(
+        _gradient_support_map(flow0, shape=(48, 64)),
+        _gradient_support_map(flow1, shape=(48, 64)),
+    )
+
+    evidence = compute_motion_evidence(flow0, flow1)
+
+    np.testing.assert_allclose(
+        evidence.flow_discontinuity_map,
+        expected,
+        rtol=0.0,
+        atol=1e-7,
     )
 
 

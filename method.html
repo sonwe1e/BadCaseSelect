@@ -352,7 +352,9 @@ B =
     <p>
       一条命令内部依次执行 index → main → 可选 teacher → CGVQM → finalize。main 和 CGVQM 都有独立 SQLite 状态、
       任务租约、attempt 结果与 30 秒日志心跳。大 batch 只用于 NPU 主推理；全分辨率重建与 CPU 评分依据
-      <code>postproc_buffer_mb</code> 自动微批次化，进度分别显示 inferred、scored 和 pending。
+      <code>postproc_buffer_mb</code> 按 18 通道重建结果、输入帧引用和评分 scratch
+      进行完整预留并自动微批次化。同一样本的 GT、warp、flow 与 mask 证据只生成一次，
+      region 循环只读取局部聚合值；进度分别显示 inferred、scored、retained 和 reserved。
     </p>
     <p class="small">
       分阶段命令仍保留用于故障恢复：<code>index</code>、<code>mine</code>、<code>teacher</code>、

@@ -684,8 +684,7 @@ def test_worker_payloads_reject_another_execution_snapshot(tmp_path):
 import dataclasses  # noqa: E402
 
 
-def test_resolve_postproc_workers_explicit_and_auto():
-    import os
+def test_resolve_postproc_workers_explicit_and_auto(monkeypatch):
     from vfi_hard_miner.worker import _resolve_postproc_workers
 
     def resolve(**runtime_overrides):
@@ -694,18 +693,67 @@ def test_resolve_postproc_workers_explicit_and_auto():
         return _resolve_postproc_workers(dataclasses.replace(config, runtime=runtime))
 
     assert resolve(postproc_workers=5) == 5
-    # cpu_threads_per_worker=1 is the "not configured" default: falls back to
-    # os.cpu_count() so the postproc thread pool actually provides overlap.
-    expected_auto = min(max(1, (os.cpu_count() or 4) // 4), 8)
-    assert resolve(postproc_workers=0, cpu_threads_per_worker=1) == expected_auto
-    assert resolve(postproc_workers=0, cpu_threads_per_worker=16) == 4
-    assert resolve(postproc_workers=0, cpu_threads_per_worker=128) == 8
+    monkeypatch.setattr(worker_module.os, "cpu_count", lambda: 192)
+    assert resolve(
+        postproc_workers=0,
+        cpu_threads_per_worker=1,
+        workers=8,
+    ) == 1
+    assert resolve(
+        postproc_workers=0,
+        cpu_threads_per_worker=8,
+        workers=8,
+    ) == 2
+    assert resolve(
+        postproc_workers=0,
+        cpu_threads_per_worker=128,
+        workers=8,
+    ) == 2
 
 
 def test_negative_postproc_workers_fails_validation():
     runtime = RuntimeConfig(postproc_workers=-1)
     with pytest.raises(ValueError, match="postproc_workers"):
         runtime.validate()
+
+
+def test_postproc_reservation_counts_reconstruction_inputs_and_scratch():
+    image = np.zeros((10, 20, 3), dtype=np.float32)
+    items = [({"sample_id": "a"}, image, image, image)]
+    reservation = worker_module._postproc_reservation(
+        items,
+        buffer_bytes=16 * 1024 * 1024,
+    )
+    plane_bytes = 10 * 20 * 4
+
+    assert worker_module.RECONSTRUCTION_CHANNELS == 18
+    assert reservation.retained_bytes == plane_bytes * (18 + 9)
+    assert reservation.scratch_bytes == plane_bytes * 24
+    assert reservation.fixed_bytes == 1024 * 1024
+    assert reservation.reserved_bytes == (
+        reservation.retained_bytes
+        + reservation.scratch_bytes
+        + reservation.fixed_bytes
+    )
+    assert reservation.oversize is False
+
+
+def test_single_sample_over_budget_is_exclusive_microbatch():
+    image = np.zeros((256, 256, 3), dtype=np.float32)
+    items = [({"sample_id": "large"}, image, image, image)]
+
+    reservation = worker_module._postproc_reservation(
+        items,
+        buffer_bytes=1 * 1024 * 1024,
+    )
+    microbatch = worker_module._postproc_microbatch_size(
+        items,
+        buffer_bytes=1 * 1024 * 1024,
+        postproc_workers=2,
+    )
+
+    assert reservation.oversize is True
+    assert microbatch == 1
 
 
 def test_postproc_workers_propagates_to_executor(monkeypatch):
@@ -752,10 +800,13 @@ def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
     runtime = dataclasses.replace(
         config.runtime,
         postproc_workers=2,
-        postproc_buffer_mb=1,
+        postproc_buffer_mb=8,
     )
     config = dataclasses.replace(config, runtime=runtime)
-    items = [_decoded_item(f"sample-{index}", index / 1000) for index in range(record_count)]
+    items = []
+    for index in range(record_count):
+        image = np.full((64, 64, 3), index / 1000, dtype=np.float32)
+        items.append(({"sample_id": f"sample-{index}"}, image, image, image))
     batches = [items[start : start + 64] for start in range(0, record_count, 64)]
     reconstructed_sizes = []
 
@@ -785,7 +836,6 @@ def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
 
     monkeypatch.setattr(worker_module, "_validate_payload_identity", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker_module, "_prefetched_decode_batches", decoded_batches)
-    monkeypatch.setattr(worker_module, "_reconstruction_bytes_per_sample", lambda items: 100 * 1024)
     monkeypatch.setattr(worker_module, "_reconstruct_outputs", reconstruct)
     monkeypatch.setattr(worker_module, "_finish_main_batch", finish)
 
@@ -804,7 +854,7 @@ def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
         f"sample-{index}" for index in range(record_count)
     ]
     assert sum(reconstructed_sizes) == record_count
-    assert max(reconstructed_sizes) == 5
+    assert max(reconstructed_sizes) == 6
     progress = capsys.readouterr().err
     assert f"inferred {record_count}/{record_count}" in progress
     assert f"scored {record_count}/{record_count}" in progress
@@ -846,6 +896,8 @@ def test_slow_postprocess_wait_emits_progress_and_heartbeat(monkeypatch, capsys)
     assert len(heartbeats) >= 2
     progress = capsys.readouterr().err
     assert "pending 1 batches" in progress
+    assert "retained" in progress
+    assert "reserved" in progress
     assert "scored 1/1" in progress
 
 
