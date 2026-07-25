@@ -20,7 +20,7 @@ from vfi_hard_miner.gates import GateResult
 from vfi_hard_miner.model_adapter import ModelAdapter, ModelOutputs
 from vfi_hard_miner.pipeline import build_run_index, execution_id, serialize_triplet
 from vfi_hard_miner.indexing import build_index
-from vfi_hard_miner.reconstruction import ReconstructionResult
+from vfi_hard_miner.reconstruction import ReconstructionResult, pack_tier1_to_cpu
 from vfi_hard_miner.worker import (
     _pack_outputs_to_cpu,
     _prefetched_decode_batches,
@@ -405,7 +405,7 @@ def test_inference_overlaps_cpu_finish_and_preserves_batch_order(
         yield "batch", first_batch
         yield "batch", tail_batch
 
-    def finish(items, reconstructed, *, config):
+    def finish(items, reconstructed, *, config, tier2_residue=None):
         finish_threads.append(threading.current_thread().name)
         assert reconstructed.prediction.shape[0] == len(items)
         if items[0][0]["sample_id"] == "first":
@@ -944,7 +944,7 @@ def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
         flow = torch.zeros((batch, 2, 2, 2), dtype=torch.float32)
         mask = torch.zeros((batch, 1, 2, 2), dtype=torch.float32)
         image = torch.zeros((batch, 3, 2, 2), dtype=torch.float32)
-        return ReconstructionResult(
+        result = ReconstructionResult(
             flow_t0=flow,
             flow_t1=flow,
             mask0=mask,
@@ -954,8 +954,11 @@ def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
             warp_blend=image,
             prediction=image,
         )
+        if kwargs.get("tiered"):
+            return pack_tier1_to_cpu(result)
+        return result
 
-    def finish(batch, reconstructed, *, config):
+    def finish(batch, reconstructed, *, config, tier2_residue=None):
         return [{"sample_id": item[0]["sample_id"]} for item in batch]
 
     monkeypatch.setattr(worker_module, "_validate_payload_identity", lambda *args, **kwargs: None)
@@ -1000,7 +1003,7 @@ def test_slow_postprocess_wait_emits_progress_and_heartbeat(monkeypatch, capsys)
     def decoded_batches(*args, **kwargs):
         yield "batch", [item]
 
-    def slow_finish(batch, reconstructed, *, config):
+    def slow_finish(batch, reconstructed, *, config, tier2_residue=None):
         threading.Event().wait(0.05)
         return [{"sample_id": "slow"}]
 
@@ -1054,3 +1057,133 @@ def test_decode_prefetch_respects_cache_budget_and_still_yields_batches(tmp_path
     assert [item[0]["sample_id"] for item in batch] == ["a", "b"]
     assert batch[0][1].dtype == np.uint8
     assert batch.uint8_bytes == 8 * 8 * 3
+
+
+def test_postproc_reservation_tiered_splits_cpu_and_device_retention():
+    image = np.zeros((10, 20, 3), dtype=np.float32)
+    items = [({"sample_id": "a"}, image, image, image)]
+    plane_bytes = 10 * 20 * 4
+
+    tiered = worker_module._postproc_reservation(
+        items, buffer_bytes=16 * 1024 * 1024, tiered=True
+    )
+    assert tiered.retained_bytes == plane_bytes * (7 + 9)
+    assert tiered.device_retained_bytes == plane_bytes * 11
+    assert tiered.scratch_bytes == plane_bytes * 24
+    assert tiered.pipeline_bytes == (
+        tiered.reserved_bytes
+        + tiered.reconstruction_transient_bytes
+        + tiered.device_retained_bytes
+    )
+
+    legacy = worker_module._postproc_reservation(
+        items, buffer_bytes=16 * 1024 * 1024
+    )
+    assert legacy.retained_bytes == plane_bytes * (18 + 9)
+    assert legacy.device_retained_bytes == 0
+    assert legacy.pipeline_bytes == (
+        legacy.reserved_bytes + legacy.reconstruction_transient_bytes
+    )
+
+
+def _endpoint_copy_fixture(tmp_path, *, patches=(0, 128, 255)):
+    """Three PNG frames; patch values control how wrong the prediction is."""
+
+    root = tmp_path / "game"
+    base = np.zeros((64, 64, 3), dtype=np.uint8)
+    first = base.copy()
+    middle = base.copy()
+    last = base.copy()
+    first[20:44, 20:44] = patches[0]
+    middle[20:44, 20:44] = patches[1]
+    last[20:44, 20:44] = patches[2]
+    _save(root / "0100001.png", first)
+    _save(root / "0100002.png", middle)
+    _save(root / "0100003.png", last)
+    config = AppConfig(
+        data=DataConfig(root=str(root)),
+        model=ModelConfig(
+            factory="vfi_hard_miner.mock_model:create_model",
+            input_height=64,
+            input_width=64,
+            batch_size=2,
+            factory_kwargs={"output_scale": 2, "endpoint_copy_box": [0.25, 0.25, 0.75, 0.75]},
+        ),
+        runtime=RuntimeConfig(
+            backend="cpu",
+            devices=(0,),
+            workers=1,
+            state_db=str(tmp_path / "state.sqlite3"),
+            run_dir=str(tmp_path / "run"),
+        ),
+    )
+    build_run_index(config)
+    triplet = build_index(root, frame_regex=config.data.frame_regex)[0]
+    record = serialize_triplet(triplet, run_hash=config.run_hash())
+    adapter = ModelAdapter.from_config(config.model, device="cpu")
+    return config, record, adapter
+
+
+def test_tiered_pipeline_records_match_legacy_full_pack(tmp_path, monkeypatch):
+    config, record, adapter = _endpoint_copy_fixture(tmp_path)
+    monkeypatch.setattr(
+        worker_module,
+        "evaluate_in_scope",
+        lambda *args, **kwargs: GateResult("review", ("needs_scope_review",), {}),
+    )
+
+    def run(tiered):
+        return worker_module._process_payload_records(
+            [record],
+            adapter=adapter,
+            config=config,
+            model_config=config.model,
+            finish_batch=worker_module._finish_main_batch,
+            invalid_record=worker_module._invalid_record,
+            heartbeat=None,
+            progress_prefix="",
+            reconstruction_device=None,
+            thread_name_prefix="vfi-parity",
+            tiered_reconstruction=tiered,
+        )
+
+    legacy = run(False)
+    tiered = run(True)
+
+    assert len(legacy) == 1
+    # Sanity: the sample reached branch diagnosis (candidate path exercised).
+    assert legacy[0]["p_wrong"] > 0.2
+    assert "endpoint_copy" in legacy[0]["reasons"]
+    # Bitwise record parity between the 18-channel pack and the two-tier path.
+    assert tiered == legacy
+
+
+def test_fast_rejected_samples_never_materialize_tier2(tmp_path, monkeypatch):
+    # Identical frames: the prediction is correct, so every sample is
+    # fast-rejected and the tier-2 warps/masks must never transfer.
+    config, record, adapter = _endpoint_copy_fixture(tmp_path, patches=(128, 128, 128))
+    calls = []
+    original_materialize = worker_module.Tier2Residue.materialize
+
+    def spy(self):
+        calls.append(id(self))
+        return original_materialize(self)
+
+    monkeypatch.setattr(worker_module.Tier2Residue, "materialize", spy)
+    results = worker_module._process_payload_records(
+        [record],
+        adapter=adapter,
+        config=config,
+        model_config=config.model,
+        finish_batch=worker_module._finish_main_batch,
+        invalid_record=worker_module._invalid_record,
+        heartbeat=None,
+        progress_prefix="",
+        reconstruction_device=None,
+        thread_name_prefix="vfi-spy",
+        tiered_reconstruction=True,
+    )
+
+    assert len(results) == 1
+    assert calls == []
+    assert results[0]["metrics"]["diagnosis"]["skipped"] == 1.0

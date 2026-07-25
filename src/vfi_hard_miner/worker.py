@@ -39,8 +39,13 @@ from .model_adapter import ModelAdapter, ModelOutputs
 from .pipeline import run_directory
 from .reconstruction import (
     RECONSTRUCTION_CHANNELS,
+    TIER1_CHANNELS,
+    TIER2_CHANNELS,
     ReconstructionResult,
+    Tier2Residue,
+    merge_tier2,
     pack_reconstruction_to_cpu,
+    pack_tier1_to_cpu,
     reconstruct_midpoint,
 )
 from .scoring import build_image_basis, luminance, score_local_errors, score_region
@@ -429,6 +434,7 @@ def _sample_record(
     batch_index: int,
     thresholds: Any,
     timings: CpuTimingTotals | None = None,
+    tier2_residue: Tier2Residue | None = None,
 ) -> dict[str, Any]:
     scoring_basis_started = time.perf_counter()
     gt_basis = build_image_basis(gt, name="gt")
@@ -488,6 +494,14 @@ def _sample_record(
 
     branch_started = time.perf_counter()
     if fast_reject_reason is None:
+        if tier2_residue is not None:
+            # Candidate: transfer the held-back warps + masks (11ch) now.
+            # Rejected samples never reach this line, so they never pay the
+            # tier-2 D2H.  Candidates within one microbatch share the cached
+            # materialization (single packed transfer).
+            reconstructed = merge_tier2(
+                reconstructed, tier2_residue.materialize()
+            )
         diagnosis = diagnose_sample(
             prediction,
             gt,
@@ -1064,7 +1078,8 @@ def _reconstruct_outputs(
     model_config: Any,
     device: torch.device | str | None = None,
     validate: bool = True,
-) -> ReconstructionResult:
+    tiered: bool = False,
+) -> ReconstructionResult | tuple[ReconstructionResult, Tier2Residue]:
     """Run reconstruction on ``device`` and return CPU tensors.
 
     ``device=None`` keeps the calibrated CPU reference path.  On accelerator
@@ -1073,6 +1088,11 @@ def _reconstruct_outputs(
 
     ``validate=False`` disables the device-synchronizing NaN/range scans for
     the production hot path; results are bitwise identical either way.
+
+    ``tiered=True`` returns ``(partial, residue)``: tier-1 (prediction +
+    flows, 7ch) is transferred immediately and tier-2 (warps + masks, 11ch)
+    stays resident until the scoring thread materializes it for candidates
+    that pass fast-reject.
     """
 
     reconstructed = reconstruct_midpoint(
@@ -1089,6 +1109,8 @@ def _reconstruct_outputs(
         device=device,
         validate=validate,
     )
+    if tiered:
+        return pack_tier1_to_cpu(reconstructed)
     if reconstructed.prediction.device.type != "cpu":
         reconstructed = pack_reconstruction_to_cpu(reconstructed)
     return reconstructed
@@ -1141,6 +1163,7 @@ class PendingReservation:
 
     sample_count: int
     retained_bytes: int
+    device_retained_bytes: int
     scratch_bytes: int
     fixed_bytes: int
     reserved_bytes: int
@@ -1218,13 +1241,41 @@ def _reconstruction_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
     return int(height) * int(width) * RECONSTRUCTION_CHANNELS * 4
 
 
+def _reconstruction_tier1_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
+    """CPU-held tier-1 payload (prediction + flows, 7ch float32)."""
+
+    if not items:
+        raise ValueError("cannot estimate reconstruction bytes for an empty batch")
+    height, width = items[0][1].shape[:2]
+    return int(height) * int(width) * TIER1_CHANNELS * 4
+
+
+def _reconstruction_tier2_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
+    """Device-held tier-2 payload (warps + masks, 11ch) awaiting on-demand D2H."""
+
+    if not items:
+        raise ValueError("cannot estimate reconstruction bytes for an empty batch")
+    height, width = items[0][1].shape[:2]
+    return int(height) * int(width) * TIER2_CHANNELS * 4
+
+
 def _postproc_reservation(
     items: Sequence[DecodedItem],
     *,
     sample_count: int | None = None,
     buffer_bytes: int | None = None,
     scratch_channels: int = _MAIN_SCRATCH_CHANNELS,
+    tiered: bool = False,
 ) -> PendingReservation:
+    """Budget one Future's memory.
+
+    ``tiered=True`` matches the two-tier production pipeline: only tier-1
+    (7ch) is CPU-retained per sample while tier-2 (11ch) stays on the
+    reconstruction device until candidates materialize it; both count against
+    ``pipeline_bytes``.  ``tiered=False`` keeps the legacy 18-channel
+    all-on-CPU accounting.
+    """
+
     if not items:
         raise ValueError("cannot reserve postprocess memory for an empty batch")
     count = len(items) if sample_count is None else int(sample_count)
@@ -1232,19 +1283,33 @@ def _postproc_reservation(
         raise ValueError("sample_count must be within the supplied item count")
     height, width = items[0][1].shape[:2]
     plane_bytes = int(height) * int(width) * 4
+    if tiered:
+        reconstruction_retained_bytes = (
+            count * _reconstruction_tier1_bytes_per_sample(items)
+        )
+        device_retained_bytes = (
+            count * _reconstruction_tier2_bytes_per_sample(items)
+        )
+    else:
+        reconstruction_retained_bytes = (
+            count * _reconstruction_bytes_per_sample(items)
+        )
+        device_retained_bytes = 0
     retained_bytes = (
-        count * _reconstruction_bytes_per_sample(items)
-        + count * plane_bytes * _INPUT_FRAME_CHANNELS
+        reconstruction_retained_bytes + count * plane_bytes * _INPUT_FRAME_CHANNELS
     )
     scratch_bytes = plane_bytes * max(0, int(scratch_channels))
     reserved_bytes = retained_bytes + scratch_bytes + _FUTURE_FIXED_BYTES
     reconstruction_transient_bytes = (
         count * plane_bytes * _RECONSTRUCTION_TRANSIENT_CHANNELS
     )
-    pipeline_bytes = reserved_bytes + reconstruction_transient_bytes
+    pipeline_bytes = (
+        reserved_bytes + reconstruction_transient_bytes + device_retained_bytes
+    )
     return PendingReservation(
         sample_count=count,
         retained_bytes=retained_bytes,
+        device_retained_bytes=device_retained_bytes,
         scratch_bytes=scratch_bytes,
         fixed_bytes=_FUTURE_FIXED_BYTES,
         reserved_bytes=reserved_bytes,
@@ -1262,6 +1327,7 @@ def _postproc_microbatch_size(
     buffer_bytes: int,
     postproc_workers: int,
     scratch_channels: int = _MAIN_SCRATCH_CHANNELS,
+    tiered: bool = False,
 ) -> int:
     """Choose a slice whose complete Future reservation fits its fair share."""
 
@@ -1273,16 +1339,22 @@ def _postproc_microbatch_size(
         sample_count=1,
         buffer_bytes=per_future_budget,
         scratch_channels=scratch_channels,
+        tiered=tiered,
     )
     retained_per_sample = single.retained_bytes
     transient_per_sample = single.reconstruction_transient_bytes
+    device_per_sample = single.device_retained_bytes
     fixed_and_scratch = single.scratch_bytes + single.fixed_bytes
     available = max(0, per_future_budget - fixed_and_scratch)
     return max(
         1,
         min(
             len(items),
-            available // max(1, retained_per_sample + transient_per_sample),
+            available
+            // max(
+                1,
+                retained_per_sample + transient_per_sample + device_per_sample,
+            ),
         ),
     )
 
@@ -1299,6 +1371,7 @@ def _process_payload_records(
     progress_prefix: str,
     reconstruction_device: torch.device | str | None,
     thread_name_prefix: str,
+    tiered_reconstruction: bool = False,
 ) -> list[dict[str, Any]]:
     max_cache = int(config.runtime.chunk_triplets) + 2
     cache_budget_bytes = int(config.runtime.decode_cache_mb) * 1024 * 1024
@@ -1436,6 +1509,7 @@ def _process_payload_records(
                     items,
                     buffer_bytes=postproc_buffer_bytes,
                     postproc_workers=postproc_workers,
+                    tiered=tiered_reconstruction,
                 )
                 for start in range(0, len(items), microbatch_size):
                     end = min(len(items), start + microbatch_size)
@@ -1443,6 +1517,7 @@ def _process_payload_records(
                     reservation = _postproc_reservation(
                         item_slice,
                         buffer_bytes=postproc_buffer_bytes,
+                        tiered=tiered_reconstruction,
                     )
                     while pending and (
                         len(pending) >= postproc_workers
@@ -1463,17 +1538,32 @@ def _process_payload_records(
                         )
                     reconstruction_started = time.perf_counter()
                     prepared = _prepare_reconstruction_microbatch(item_slice)
-                    reconstructed = _reconstruct_outputs(
-                        prepared.img0_tensor,
-                        prepared.img1_tensor,
-                        _slice_model_outputs(inference_batch.outputs, start, end),
-                        model_config=model_config,
-                        device=reconstruction_device,
-                        # Production hot path: skip device-synchronizing
-                        # NaN/range scans (~30 per batch).  The scoring
-                        # stage remains the NaN safety net.
-                        validate=False,
-                    )
+                    tier2_residue: Tier2Residue | None = None
+                    if tiered_reconstruction:
+                        # Two-tier D2H: only prediction + flows (7ch) leave
+                        # the device now; warps + masks (11ch) transfer on
+                        # demand for candidates that pass fast-reject.
+                        reconstructed, tier2_residue = _reconstruct_outputs(
+                            prepared.img0_tensor,
+                            prepared.img1_tensor,
+                            _slice_model_outputs(inference_batch.outputs, start, end),
+                            model_config=model_config,
+                            device=reconstruction_device,
+                            # Production hot path: skip device-synchronizing
+                            # NaN/range scans (~30 per batch).  The scoring
+                            # stage remains the NaN safety net.
+                            validate=False,
+                            tiered=True,
+                        )
+                    else:
+                        reconstructed = _reconstruct_outputs(
+                            prepared.img0_tensor,
+                            prepared.img1_tensor,
+                            _slice_model_outputs(inference_batch.outputs, start, end),
+                            model_config=model_config,
+                            device=reconstruction_device,
+                            validate=False,
+                        )
                     timings.add_reconstruction(
                         time.perf_counter() - reconstruction_started,
                         len(item_slice),
@@ -1481,6 +1571,8 @@ def _process_payload_records(
                     finish_kwargs: dict[str, Any] = {"config": config}
                     if finish_batch is _ORIGINAL_FINISH_MAIN_BATCH:
                         finish_kwargs["timings"] = timings
+                    if tier2_residue is not None:
+                        finish_kwargs["tier2_residue"] = tier2_residue
                     future = executor.submit(
                         finish_batch,
                         prepared.items,
@@ -1548,6 +1640,7 @@ def _finish_main_batch(
     *,
     config: AppConfig,
     timings: CpuTimingTotals | None = None,
+    tier2_residue: Tier2Residue | None = None,
 ) -> list[dict[str, Any]]:
     return [
         _sample_record(
@@ -1559,6 +1652,7 @@ def _finish_main_batch(
             batch_index=index,
             thresholds=config.thresholds,
             timings=timings,
+            tier2_residue=tier2_residue,
         )
         for index, item in enumerate(items)
     ]
@@ -1625,6 +1719,7 @@ def process_main_payload(
         progress_prefix=progress_prefix,
         reconstruction_device=reconstruction_device,
         thread_name_prefix="vfi-main-cpu",
+        tiered_reconstruction=True,
     )
 
 
@@ -1998,7 +2093,11 @@ def _finish_teacher_batch(
     *,
     config: AppConfig,
     timings: CpuTimingTotals | None = None,
+    tier2_residue: Tier2Residue | None = None,
 ) -> list[dict[str, Any]]:
+    # Teacher records only consume the prediction (tier-1); the residue is
+    # accepted for interface parity and released without materialization.
+    del tier2_residue
     if config.teacher is None:
         raise RuntimeError("teacher postprocess requires config.teacher")
     return [
@@ -2048,6 +2147,7 @@ def process_teacher_payload(
         progress_prefix=progress_prefix,
         reconstruction_device=reconstruction_device,
         thread_name_prefix="vfi-teacher-cpu",
+        tiered_reconstruction=True,
     )
 
 

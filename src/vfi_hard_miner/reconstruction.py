@@ -10,6 +10,8 @@ original CPU reference implementation.
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -26,16 +28,18 @@ class ReconstructionResult:
     """Original-resolution float32 tensors used for diagnosis.
 
     Tensors live on the reconstruction device until the caller transfers them
-    (see ``pack_reconstruction_to_cpu``).
+    (see ``pack_reconstruction_to_cpu`` / ``pack_tier1_to_cpu``).  A tier-1
+    partial result carries ``None`` for the warp/mask fields until tier-2 is
+    materialized and merged back (see ``Tier2Residue`` / ``merge_tier2``).
     """
 
     flow_t0: torch.Tensor
     flow_t1: torch.Tensor
-    mask0: torch.Tensor
-    mask1: torch.Tensor
-    warp0: torch.Tensor
-    warp1: torch.Tensor
-    warp_blend: torch.Tensor
+    mask0: torch.Tensor | None
+    mask1: torch.Tensor | None
+    warp0: torch.Tensor | None
+    warp1: torch.Tensor | None
+    warp_blend: torch.Tensor | None
     prediction: torch.Tensor
 
 
@@ -438,6 +442,24 @@ _PACK_FIELD_CHANNELS: tuple[tuple[str, int], ...] = (
 )
 RECONSTRUCTION_CHANNELS = sum(channels for _, channels in _PACK_FIELD_CHANNELS)
 
+# Two-tier transfer: tier-1 (prediction + flows) is needed for every sample
+# (motion gates + base scoring), tier-2 (warps + masks) only for samples that
+# pass fast-reject and reach diagnose_sample.
+_TIER1_FIELDS: tuple[tuple[str, int], ...] = (
+    ("flow_t0", 2),
+    ("flow_t1", 2),
+    ("prediction", 3),
+)
+_TIER2_FIELDS: tuple[tuple[str, int], ...] = (
+    ("mask0", 1),
+    ("mask1", 1),
+    ("warp0", 3),
+    ("warp1", 3),
+    ("warp_blend", 3),
+)
+TIER1_CHANNELS = sum(channels for _, channels in _TIER1_FIELDS)
+TIER2_CHANNELS = sum(channels for _, channels in _TIER2_FIELDS)
+
 
 def pack_reconstruction_to_cpu(result: ReconstructionResult) -> ReconstructionResult:
     """Transfer every reconstruction field to CPU in one packed copy.
@@ -456,6 +478,126 @@ def pack_reconstruction_to_cpu(result: ReconstructionResult) -> ReconstructionRe
         fields[name] = packed[:, offset : offset + channels]
         offset += channels
     return ReconstructionResult(**fields)
+
+
+class Tier2Residue:
+    """Tier-2 channels (warps + masks) held back from the main D2H transfer.
+
+    The tier-2 payload stays resident (on device as one packed tensor, or on
+    CPU as separate fields) until a scoring thread decides the sample passed
+    fast-reject.  ``materialize`` transfers it at most once per microbatch;
+    every candidate in the microbatch shares the cached CPU slices.
+    """
+
+    __slots__ = ("_packed", "_fields", "_cached", "_lock")
+
+    def __init__(
+        self,
+        packed: torch.Tensor | None = None,
+        fields: Mapping[str, torch.Tensor] | None = None,
+    ) -> None:
+        if (packed is None) == (fields is None):
+            raise ValueError("Tier2Residue requires exactly one of packed or fields")
+        self._packed = packed
+        self._fields = dict(fields) if fields is not None else None
+        self._cached: dict[str, torch.Tensor] | None = None
+        # Serializes concurrent D2H from scoring threads; torch_npu's transfer
+        # path may not tolerate overlapping host-bound copies.
+        self._lock = threading.Lock()
+
+    @property
+    def device_bytes(self) -> int:
+        if self._packed is not None:
+            return int(self._packed.numel()) * int(self._packed.element_size())
+        assert self._fields is not None
+        return sum(
+            int(tensor.numel()) * int(tensor.element_size())
+            for tensor in self._fields.values()
+        )
+
+    def materialize(self) -> dict[str, torch.Tensor]:
+        """Transfer (or slice) tier-2 to CPU once; later calls reuse the cache."""
+
+        with self._lock:
+            if self._cached is None:
+                if self._packed is not None:
+                    packed = self._packed.detach().to(
+                        device="cpu", dtype=torch.float32
+                    )
+                    fields: dict[str, torch.Tensor] = {}
+                    offset = 0
+                    for name, channels in _TIER2_FIELDS:
+                        fields[name] = packed[:, offset : offset + channels]
+                        offset += channels
+                else:
+                    fields = {
+                        name: tensor.detach().to(device="cpu", dtype=torch.float32)
+                        for name, tensor in self._fields.items()
+                    }
+                self._cached = fields
+            return self._cached
+
+
+def pack_tier1_to_cpu(
+    result: ReconstructionResult,
+) -> tuple[ReconstructionResult, Tier2Residue]:
+    """Transfer tier-1 (prediction + flows, 7ch) to CPU; hold tier-2 back.
+
+    Device path: tier-1 leaves in one packed copy and tier-2 is concatenated
+    into a single device-resident tensor inside the returned ``Tier2Residue``.
+    CPU path: no copies at all — tier-1 fields are referenced directly and the
+    residue keeps the original field tensors, so ``materialize`` degrades to
+    identity transfers.  Sliced values are bitwise identical to the legacy
+    18-channel pack either way.
+    """
+
+    if result.prediction.device.type != "cpu":
+        tier1 = torch.cat(
+            [getattr(result, name) for name, _ in _TIER1_FIELDS], dim=1
+        )
+        tier1 = tier1.detach().to(device="cpu", dtype=torch.float32)
+        tier1_fields: dict[str, torch.Tensor] = {}
+        offset = 0
+        for name, channels in _TIER1_FIELDS:
+            tier1_fields[name] = tier1[:, offset : offset + channels]
+            offset += channels
+        tier2 = torch.cat(
+            [getattr(result, name) for name, _ in _TIER2_FIELDS], dim=1
+        )
+        residue = Tier2Residue(packed=tier2)
+    else:
+        tier1_fields = {name: getattr(result, name) for name, _ in _TIER1_FIELDS}
+        residue = Tier2Residue(
+            fields={name: getattr(result, name) for name, _ in _TIER2_FIELDS}
+        )
+    partial = ReconstructionResult(
+        flow_t0=tier1_fields["flow_t0"],
+        flow_t1=tier1_fields["flow_t1"],
+        mask0=None,
+        mask1=None,
+        warp0=None,
+        warp1=None,
+        warp_blend=None,
+        prediction=tier1_fields["prediction"],
+    )
+    return partial, residue
+
+
+def merge_tier2(
+    partial: ReconstructionResult, tier2: Mapping[str, torch.Tensor]
+) -> ReconstructionResult:
+    """Reassemble a full result from a tier-1 partial and materialized tier-2."""
+
+    return ReconstructionResult(
+        flow_t0=partial.flow_t0,
+        flow_t1=partial.flow_t1,
+        mask0=tier2["mask0"],
+        mask1=tier2["mask1"],
+        warp0=tier2["warp0"],
+        warp1=tier2["warp1"],
+        warp_blend=tier2["warp_blend"],
+        prediction=partial.prediction,
+    )
 
 
 # A short, discoverable alias for callers that already know the target is t=0.5.

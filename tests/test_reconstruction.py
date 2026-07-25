@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import pytest
 import torch
 
@@ -301,3 +303,86 @@ def test_reconstruct_midpoint_matches_manual_enable_grad_reference() -> None:
     }
     for name, tensor in expected.items():
         assert torch.equal(result.__dict__[name], tensor), name
+
+
+def test_pack_tier1_to_cpu_round_trips_to_legacy_full_pack() -> None:
+    from vfi_hard_miner.reconstruction import (  # noqa: E402
+        TIER1_CHANNELS,
+        TIER2_CHANNELS,
+        merge_tier2,
+        pack_tier1_to_cpu,
+    )
+
+    assert TIER1_CHANNELS == 7
+    assert TIER2_CHANNELS == 11
+
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    full = pack_reconstruction_to_cpu(result)
+    partial, residue = pack_tier1_to_cpu(result)
+
+    for name in ("mask0", "mask1", "warp0", "warp1", "warp_blend"):
+        assert partial.__dict__[name] is None
+    for name in ("flow_t0", "flow_t1", "prediction"):
+        assert torch.equal(partial.__dict__[name], full.__dict__[name])
+
+    tier2 = residue.materialize()
+    for name in ("mask0", "mask1", "warp0", "warp1", "warp_blend"):
+        assert torch.equal(tier2[name], full.__dict__[name])
+
+    merged = merge_tier2(partial, tier2)
+    for name, tensor in full.__dict__.items():
+        assert torch.equal(merged.__dict__[name], tensor), name
+
+
+def test_pack_tier1_cpu_path_is_zero_copy() -> None:
+    from vfi_hard_miner.reconstruction import pack_tier1_to_cpu  # noqa: E402
+
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    assert result.prediction.device.type == "cpu"
+    partial, residue = pack_tier1_to_cpu(result)
+
+    # Tier-1 fields are referenced directly, no concatenation copy.
+    assert partial.flow_t0 is result.flow_t0
+    assert partial.flow_t1 is result.flow_t1
+    assert partial.prediction is result.prediction
+    # Materialization shares storage with the original fields.
+    tier2 = residue.materialize()
+    assert tier2["warp0"].data_ptr() == result.warp0.data_ptr()
+    assert tier2["mask1"].data_ptr() == result.mask1.data_ptr()
+
+
+def test_tier2_materialize_is_cached_and_thread_safe() -> None:
+    from vfi_hard_miner.reconstruction import pack_tier1_to_cpu  # noqa: E402
+
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    _, residue = pack_tier1_to_cpu(result)
+
+    outcomes: list[dict] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        fields = residue.materialize()
+        with lock:
+            outcomes.append(fields)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(outcomes) == 8
+    assert all(fields is outcomes[0] for fields in outcomes)
+    assert set(outcomes[0]) == {"mask0", "mask1", "warp0", "warp1", "warp_blend"}
