@@ -206,3 +206,98 @@ def test_pack_reconstruction_to_cpu_round_trips_all_fields() -> None:
         assert field.device.type == "cpu"
         assert field.dtype == torch.float32
         torch.testing.assert_close(field, tensor)
+
+
+def test_reconstruct_validate_false_tolerates_non_finite_inputs() -> None:
+    img0, img1, flow0, flow1, mask0, mask1 = _random_reconstruction_inputs()
+    flow0 = flow0.clone()
+    flow0[0, 0, 0, 0] = float("nan")
+
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        reconstruct_midpoint(
+            img0,
+            img1,
+            flow0,
+            flow1,
+            mask0,
+            mask1,
+            network_size=(2, 3),
+            mask0_role="warp0_weight",
+        )
+
+    # validate=False skips the device-synchronizing scans (production path);
+    # the scoring stage remains the NaN safety net.
+    result = reconstruct_midpoint(
+        img0,
+        img1,
+        flow0,
+        flow1,
+        mask0,
+        mask1,
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+        validate=False,
+    )
+    assert result.prediction.shape == img0.shape
+
+
+def test_reconstruct_validate_false_still_enforces_shape_contract() -> None:
+    img0, img1, flow0, flow1, mask0, mask1 = _random_reconstruction_inputs()
+    with pytest.raises(ValueError, match="channels"):
+        reconstruct_midpoint(
+            img0,
+            img1,
+            flow0[:, :1],
+            flow1,
+            mask0,
+            mask1,
+            network_size=(2, 3),
+            mask0_role="warp0_weight",
+            validate=False,
+        )
+
+
+def test_reconstruct_validate_flag_is_bitwise_identical() -> None:
+    inputs = _random_reconstruction_inputs()
+    kwargs = dict(network_size=(2, 3), mask0_role="warp0_weight")
+    validated = reconstruct_midpoint(*inputs, **kwargs)
+    unvalidated = reconstruct_midpoint(*inputs, validate=False, **kwargs)
+    for name, tensor in validated.__dict__.items():
+        assert torch.equal(unvalidated.__dict__[name], tensor), name
+
+
+def test_reconstruct_midpoint_matches_manual_enable_grad_reference() -> None:
+    from vfi_hard_miner.reconstruction import resize_mask  # noqa: E402
+
+    inputs = _random_reconstruction_inputs()
+    img0, img1, flow0, flow1, mask0, mask1 = inputs
+    result = reconstruct_midpoint(
+        *inputs, network_size=(2, 3), mask0_role="warp0_weight"
+    )
+
+    # The inference_mode wrap inside reconstruct_midpoint must not change any
+    # value: recompute the identical pipeline under enable_grad and require
+    # bitwise equality.
+    with torch.enable_grad():
+        original_size = tuple(img0.shape[-2:])
+        rf0 = resize_backward_flow(flow0, original_size, (2, 3))
+        rf1 = resize_backward_flow(flow1, original_size, (2, 3))
+        rm0 = resize_mask(mask0, original_size)
+        rm1 = resize_mask(mask1, original_size)
+        w0 = backward_warp(img0, rf0)
+        w1 = backward_warp(img1, rf1)
+        blend = rm0 * w0 + (1.0 - rm0) * w1
+        prediction = rm1 * img1 + (1.0 - rm1) * blend
+
+    expected = {
+        "flow_t0": rf0,
+        "flow_t1": rf1,
+        "mask0": rm0,
+        "mask1": rm1,
+        "warp0": w0,
+        "warp1": w1,
+        "warp_blend": blend,
+        "prediction": prediction,
+    }
+    for name, tensor in expected.items():
+        assert torch.equal(result.__dict__[name], tensor), name

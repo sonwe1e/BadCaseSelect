@@ -1063,12 +1063,16 @@ def _reconstruct_outputs(
     *,
     model_config: Any,
     device: torch.device | str | None = None,
+    validate: bool = True,
 ) -> ReconstructionResult:
     """Run reconstruction on ``device`` and return CPU tensors.
 
     ``device=None`` keeps the calibrated CPU reference path.  On accelerator
     devices the native-resolution warps run there and the result returns to
     the host in one packed transfer, so CPU threads only ever score.
+
+    ``validate=False`` disables the device-synchronizing NaN/range scans for
+    the production hot path; results are bitwise identical either way.
     """
 
     reconstructed = reconstruct_midpoint(
@@ -1083,6 +1087,7 @@ def _reconstruct_outputs(
         align_corners=model_config.align_corners,
         padding_mode=model_config.padding_mode,
         device=device,
+        validate=validate,
     )
     if reconstructed.prediction.device.type != "cpu":
         reconstructed = pack_reconstruction_to_cpu(reconstructed)
@@ -1096,6 +1101,7 @@ def _infer_and_reconstruct(
     model_config: Any,
     production_batch: int,
     reconstruction_device: torch.device | str | None = None,
+    validate: bool = True,
 ) -> ReconstructionResult:
     """Inference + reconstruction on the worker's main thread.
 
@@ -1118,6 +1124,7 @@ def _infer_and_reconstruct(
         inference_batch.outputs,
         model_config=model_config,
         device=reconstruction_device,
+        validate=validate,
     )
 
 
@@ -1462,6 +1469,10 @@ def _process_payload_records(
                         _slice_model_outputs(inference_batch.outputs, start, end),
                         model_config=model_config,
                         device=reconstruction_device,
+                        # Production hot path: skip device-synchronizing
+                        # NaN/range scans (~30 per batch).  The scoring
+                        # stage remains the NaN safety net.
+                        validate=False,
                     )
                     timings.add_reconstruction(
                         time.perf_counter() - reconstruction_started,

@@ -65,7 +65,11 @@ def _validate_nchw(
     channels: int,
     batch: int | None = None,
     spatial: tuple[int, int] | None = None,
+    validate: bool = True,
 ) -> None:
+    """Shape/dtype checks are unconditional; ``validate=False`` skips the
+    device-synchronizing ``isfinite`` scan (production hot path)."""
+
     if tensor.ndim != 4:
         raise ValueError(f"{name} must have shape [B,{channels},H,W], got {tuple(tensor.shape)}")
     if tensor.shape[1] != channels:
@@ -80,11 +84,19 @@ def _validate_nchw(
         raise ValueError(
             f"{name} spatial shape must be {tuple(spatial)}, got {tuple(tensor.shape[-2:])}"
         )
-    if not bool(torch.isfinite(tensor).all()):
+    if validate and not bool(torch.isfinite(tensor).all()):
         raise ValueError(f"{name} contains NaN or infinity")
 
 
-def _validate_unit_interval(tensor: torch.Tensor, name: str, tolerance: float = 1e-6) -> None:
+def _validate_unit_interval(
+    tensor: torch.Tensor,
+    name: str,
+    tolerance: float = 1e-6,
+    *,
+    validate: bool = True,
+) -> None:
+    if not validate:
+        return
     minimum = float(tensor.amin())
     maximum = float(tensor.amax())
     if minimum < -tolerance or maximum > 1.0 + tolerance:
@@ -109,6 +121,7 @@ def resize_backward_flow(
     *,
     align_corners: bool = False,
     device: DeviceLike = None,
+    validate: bool = True,
 ) -> torch.Tensor:
     """Resize backward flow and convert network-input pixels to output pixels.
 
@@ -120,19 +133,21 @@ def resize_backward_flow(
 
     target = _resolve_device(device)
     flow_device = _to_device_float32(flow, target, "flow")
-    _validate_nchw(flow_device, "flow", channels=2)
+    _validate_nchw(flow_device, "flow", channels=2, validate=validate)
     out_h, out_w = _validate_hw(output_size, "output_size")
     net_h, net_w = _validate_hw(network_size, "network_size")
 
+    # F.interpolate allocates a fresh tensor, so the in-place scaling below is
+    # safe without a clone.
     resized = F.interpolate(
         flow_device,
         size=(out_h, out_w),
         mode="bilinear",
         align_corners=align_corners,
-    ).clone()
+    )
     resized[:, 0].mul_(out_w / net_w)
     resized[:, 1].mul_(out_h / net_h)
-    if not bool(torch.isfinite(resized).all()):
+    if validate and not bool(torch.isfinite(resized).all()):
         raise ValueError("resized flow contains NaN or infinity")
     return resized
 
@@ -143,13 +158,14 @@ def resize_mask(
     *,
     align_corners: bool = False,
     device: DeviceLike = None,
+    validate: bool = True,
 ) -> torch.Tensor:
     """Resize an already-sigmoided mask without changing its values otherwise."""
 
     target = _resolve_device(device)
     mask_device = _to_device_float32(mask, target, "mask")
-    _validate_nchw(mask_device, "mask", channels=1)
-    _validate_unit_interval(mask_device, "mask")
+    _validate_nchw(mask_device, "mask", channels=1, validate=validate)
+    _validate_unit_interval(mask_device, "mask", validate=validate)
     out_h, out_w = _validate_hw(output_size, "output_size")
     resized = F.interpolate(
         mask_device,
@@ -157,7 +173,7 @@ def resize_mask(
         mode="bilinear",
         align_corners=align_corners,
     )
-    _validate_unit_interval(resized, "resized mask", tolerance=2e-6)
+    _validate_unit_interval(resized, "resized mask", tolerance=2e-6, validate=validate)
     return resized
 
 
@@ -209,6 +225,7 @@ def backward_warp(
     align_corners: bool = False,
     padding_mode: PaddingMode = "border",
     device: DeviceLike = None,
+    validate: bool = True,
 ) -> torch.Tensor:
     """Warp ``image`` using target-to-source pixel displacement.
 
@@ -224,13 +241,14 @@ def backward_warp(
     target = _resolve_device(device)
     image_device = _to_device_float32(image, target, "image")
     flow_device = _to_device_float32(backward_flow, target, "backward_flow")
-    _validate_nchw(image_device, "image", channels=3)
+    _validate_nchw(image_device, "image", channels=3, validate=validate)
     _validate_nchw(
         flow_device,
         "backward_flow",
         channels=2,
         batch=image_device.shape[0],
         spatial=tuple(image_device.shape[-2:]),
+        validate=validate,
     )
 
     batch, _, height, width = image_device.shape
@@ -251,7 +269,7 @@ def backward_warp(
         padding_mode=padding_mode,
         align_corners=align_corners,
     )
-    if not bool(torch.isfinite(warped).all()):
+    if validate and not bool(torch.isfinite(warped).all()):
         raise ValueError("warped image contains NaN or infinity")
     return warped
 
@@ -269,12 +287,17 @@ def reconstruct_midpoint(
     align_corners: bool = False,
     padding_mode: PaddingMode = "border",
     device: DeviceLike = None,
+    validate: bool = True,
 ) -> ReconstructionResult:
     """Reconstruct the midpoint prediction under the fixed model contract.
 
     ``device=None`` or ``"cpu"`` runs the calibrated CPU reference path; any
     other device runs the same operations there (result tensors stay on that
     device until the caller transfers them).
+
+    ``validate=False`` skips the device-synchronizing NaN/range scans for the
+    production hot path (shape/dtype checks still run); the scoring stage
+    remains the NaN safety net.  Results are bitwise identical either way.
     """
 
     if mask0_role not in {"warp0_weight", "warp1_weight"}:
@@ -283,105 +306,124 @@ def reconstruct_midpoint(
             f"got {mask0_role!r}"
         )
 
-    target = _resolve_device(device)
-    image0 = _to_device_float32(img0, target, "img0")
-    image1 = _to_device_float32(img1, target, "img1")
-    _validate_nchw(image0, "img0", channels=3)
-    _validate_nchw(
-        image1,
-        "img1",
-        channels=3,
-        batch=image0.shape[0],
-        spatial=tuple(image0.shape[-2:]),
-    )
-    _validate_unit_interval(image0, "img0")
-    _validate_unit_interval(image1, "img1")
+    with torch.inference_mode():
+        target = _resolve_device(device)
+        image0 = _to_device_float32(img0, target, "img0")
+        image1 = _to_device_float32(img1, target, "img1")
+        _validate_nchw(image0, "img0", channels=3, validate=validate)
+        _validate_nchw(
+            image1,
+            "img1",
+            channels=3,
+            batch=image0.shape[0],
+            spatial=tuple(image0.shape[-2:]),
+            validate=validate,
+        )
+        _validate_unit_interval(image0, "img0", validate=validate)
+        _validate_unit_interval(image1, "img1", validate=validate)
 
-    raw_flow0 = _to_device_float32(flow_t0, target, "flow_t0")
-    raw_flow1 = _to_device_float32(flow_t1, target, "flow_t1")
-    raw_mask0 = _to_device_float32(mask0, target, "mask0")
-    raw_mask1 = _to_device_float32(mask1, target, "mask1")
-    _validate_nchw(raw_flow0, "flow_t0", channels=2, batch=image0.shape[0])
-    low_resolution = tuple(raw_flow0.shape[-2:])
-    _validate_nchw(
-        raw_flow1,
-        "flow_t1",
-        channels=2,
-        batch=image0.shape[0],
-        spatial=low_resolution,
-    )
-    _validate_nchw(
-        raw_mask0,
-        "mask0",
-        channels=1,
-        batch=image0.shape[0],
-        spatial=low_resolution,
-    )
-    _validate_nchw(
-        raw_mask1,
-        "mask1",
-        channels=1,
-        batch=image0.shape[0],
-        spatial=low_resolution,
-    )
-    _validate_unit_interval(raw_mask0, "mask0")
-    _validate_unit_interval(raw_mask1, "mask1")
+        raw_flow0 = _to_device_float32(flow_t0, target, "flow_t0")
+        raw_flow1 = _to_device_float32(flow_t1, target, "flow_t1")
+        raw_mask0 = _to_device_float32(mask0, target, "mask0")
+        raw_mask1 = _to_device_float32(mask1, target, "mask1")
+        _validate_nchw(
+            raw_flow0, "flow_t0", channels=2, batch=image0.shape[0], validate=validate
+        )
+        low_resolution = tuple(raw_flow0.shape[-2:])
+        _validate_nchw(
+            raw_flow1,
+            "flow_t1",
+            channels=2,
+            batch=image0.shape[0],
+            spatial=low_resolution,
+            validate=validate,
+        )
+        _validate_nchw(
+            raw_mask0,
+            "mask0",
+            channels=1,
+            batch=image0.shape[0],
+            spatial=low_resolution,
+            validate=validate,
+        )
+        _validate_nchw(
+            raw_mask1,
+            "mask1",
+            channels=1,
+            batch=image0.shape[0],
+            spatial=low_resolution,
+            validate=validate,
+        )
+        _validate_unit_interval(raw_mask0, "mask0", validate=validate)
+        _validate_unit_interval(raw_mask1, "mask1", validate=validate)
 
-    original_size = tuple(image0.shape[-2:])
-    resized_flow0 = resize_backward_flow(
-        raw_flow0,
-        original_size,
-        network_size,
-        align_corners=align_corners,
-        device=target,
-    )
-    resized_flow1 = resize_backward_flow(
-        raw_flow1,
-        original_size,
-        network_size,
-        align_corners=align_corners,
-        device=target,
-    )
-    resized_mask0 = resize_mask(
-        raw_mask0, original_size, align_corners=align_corners, device=target
-    )
-    resized_mask1 = resize_mask(
-        raw_mask1, original_size, align_corners=align_corners, device=target
-    )
+        original_size = tuple(image0.shape[-2:])
+        resized_flow0 = resize_backward_flow(
+            raw_flow0,
+            original_size,
+            network_size,
+            align_corners=align_corners,
+            device=target,
+            validate=validate,
+        )
+        resized_flow1 = resize_backward_flow(
+            raw_flow1,
+            original_size,
+            network_size,
+            align_corners=align_corners,
+            device=target,
+            validate=validate,
+        )
+        resized_mask0 = resize_mask(
+            raw_mask0,
+            original_size,
+            align_corners=align_corners,
+            device=target,
+            validate=validate,
+        )
+        resized_mask1 = resize_mask(
+            raw_mask1,
+            original_size,
+            align_corners=align_corners,
+            device=target,
+            validate=validate,
+        )
 
-    warp0 = backward_warp(
-        image0,
-        resized_flow0,
-        align_corners=align_corners,
-        padding_mode=padding_mode,
-        device=target,
-    )
-    warp1 = backward_warp(
-        image1,
-        resized_flow1,
-        align_corners=align_corners,
-        padding_mode=padding_mode,
-        device=target,
-    )
-    if mask0_role == "warp0_weight":
-        warp_blend = resized_mask0 * warp0 + (1.0 - resized_mask0) * warp1
-    else:
-        warp_blend = resized_mask0 * warp1 + (1.0 - resized_mask0) * warp0
+        warp0 = backward_warp(
+            image0,
+            resized_flow0,
+            align_corners=align_corners,
+            padding_mode=padding_mode,
+            device=target,
+            validate=validate,
+        )
+        warp1 = backward_warp(
+            image1,
+            resized_flow1,
+            align_corners=align_corners,
+            padding_mode=padding_mode,
+            device=target,
+            validate=validate,
+        )
+        if mask0_role == "warp0_weight":
+            warp_blend = resized_mask0 * warp0 + (1.0 - resized_mask0) * warp1
+        else:
+            warp_blend = resized_mask0 * warp1 + (1.0 - resized_mask0) * warp0
 
-    prediction = resized_mask1 * image1 + (1.0 - resized_mask1) * warp_blend
-    if not bool(torch.isfinite(prediction).all()):
-        raise ValueError("prediction contains NaN or infinity")
+        prediction = resized_mask1 * image1 + (1.0 - resized_mask1) * warp_blend
+        if validate and not bool(torch.isfinite(prediction).all()):
+            raise ValueError("prediction contains NaN or infinity")
 
-    return ReconstructionResult(
-        flow_t0=resized_flow0,
-        flow_t1=resized_flow1,
-        mask0=resized_mask0,
-        mask1=resized_mask1,
-        warp0=warp0,
-        warp1=warp1,
-        warp_blend=warp_blend,
-        prediction=prediction,
-    )
+        return ReconstructionResult(
+            flow_t0=resized_flow0,
+            flow_t1=resized_flow1,
+            mask0=resized_mask0,
+            mask1=resized_mask1,
+            warp0=warp0,
+            warp1=warp1,
+            warp_blend=warp_blend,
+            prediction=prediction,
+        )
 
 
 _PACK_FIELD_CHANNELS: tuple[tuple[str, int], ...] = (

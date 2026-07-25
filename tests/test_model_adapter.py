@@ -262,3 +262,47 @@ def test_parent_safe_runtime_calls_do_not_import_torch_npu(monkeypatch) -> None:
 
     assert "torch_npu" not in sys.modules
     assert info["npu"] == {"probed": False}
+
+
+class _EchoOutputsModel:
+    """Returns contract-valid outputs regardless of input values."""
+
+    def __call__(self, img0: torch.Tensor, img1: torch.Tensor):
+        batch, _, height, width = img0.shape
+        return _valid_outputs(
+            batch=batch, height=max(1, height // 2), width=max(1, width // 2)
+        )
+
+
+def test_validate_values_false_skips_input_value_scans() -> None:
+    adapter = ModelAdapter(
+        _EchoOutputsModel(),
+        device=torch.device("cpu"),
+        network_size=(4, 6),
+        validate_values=False,
+    )
+    out_of_range = torch.full((2, 3, 4, 6), 5.0)
+    output = adapter.infer(out_of_range, out_of_range)
+    assert output.flow_t0.shape == (2, 2, 2, 3)
+
+
+def test_validate_values_true_still_rejects_out_of_range_inputs() -> None:
+    adapter = ModelAdapter(
+        _EchoOutputsModel(),
+        device=torch.device("cpu"),
+        network_size=(4, 6),
+    )
+    out_of_range = torch.full((2, 3, 4, 6), 5.0)
+    with pytest.raises(ValueError, match=r"normalized to \[0,1\]"):
+        adapter.infer(out_of_range, out_of_range)
+
+
+def test_validate_values_false_still_rejects_bad_input_shape() -> None:
+    adapter = ModelAdapter(
+        _EchoOutputsModel(),
+        device=torch.device("cpu"),
+        network_size=(4, 6),
+        validate_values=False,
+    )
+    with pytest.raises(ValueError, match=r"shape \[B,3,H,W\]"):
+        adapter.infer(torch.rand((2, 2, 4, 6)), torch.rand((2, 2, 4, 6)))

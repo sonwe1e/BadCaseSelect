@@ -225,7 +225,9 @@ def normalize_model_outputs(
     return ModelOutputs(flow0, flow1, normalized_mask0, normalized_mask1)
 
 
-def _validate_model_input(value: Any, name: str) -> torch.Tensor:
+def _validate_model_input_shape(value: Any, name: str) -> torch.Tensor:
+    """Cheap shape/dtype checks only; safe for the production hot path."""
+
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if value.ndim != 4 or value.shape[1] != 3:
@@ -234,6 +236,13 @@ def _validate_model_input(value: Any, name: str) -> torch.Tensor:
         raise ValueError(f"{name} dimensions must be positive")
     if not value.is_floating_point():
         raise TypeError(f"{name} must be floating point, got {value.dtype}")
+    return value
+
+
+def _validate_model_input(value: Any, name: str) -> torch.Tensor:
+    """Full validation including device-synchronizing value-range scans."""
+
+    value = _validate_model_input_shape(value, name)
     if not bool(torch.isfinite(value).all()):
         raise ValueError(f"{name} contains NaN or infinity")
     minimum = float(value.amin())
@@ -360,8 +369,12 @@ class ModelAdapter:
     def _prepare_inputs(
         self, img0: torch.Tensor, img1: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        image0 = _validate_model_input(img0, "img0")
-        image1 = _validate_model_input(img1, "img1")
+        # Value-range scans force a device/CPU sync per input; production
+        # callers set validate_values=False and rely on the scoring stage's
+        # NaN safety net.  Shape checks always run.
+        validator = _validate_model_input if self.validate_values else _validate_model_input_shape
+        image0 = validator(img0, "img0")
+        image1 = validator(img1, "img1")
         if image0.shape != image1.shape:
             raise ValueError(
                 f"img0 and img1 must have identical shapes, got {tuple(image0.shape)} "
