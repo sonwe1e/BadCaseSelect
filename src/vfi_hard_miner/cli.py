@@ -12,6 +12,7 @@ from typing import Any, Sequence
 
 from . import __version__
 from .config import load_config
+from .cgvqm_stage import run_cgvqm_stage
 from .finalize import finalize_run
 from .offline import (
     build_offline_archive,
@@ -56,10 +57,23 @@ def build_parser() -> argparse.ArgumentParser:
     _config_parser(subparsers, "index", "scan frames and enqueue main-stage chunks")
     _config_parser(subparsers, "mine", "run the current model on all pending chunks")
     _config_parser(subparsers, "teacher", "run optional teacher candidate refinement")
+    _config_parser(
+        subparsers,
+        "cgvqm",
+        "refine candidates with CGVQM-2 and assign A/B/Review/Reject grades",
+    )
     _config_parser(subparsers, "finalize", "merge segments and write final artifacts")
-    _config_parser(subparsers, "run", "run index, main, optional teacher, and finalize")
+    _config_parser(
+        subparsers,
+        "run",
+        "run index, main, optional teacher, CGVQM grading, and finalize",
+    )
     status = _config_parser(subparsers, "status", "show durable task counts")
-    status.add_argument("--stage", choices=("main", "teacher", "all"), default="all")
+    status.add_argument(
+        "--stage",
+        choices=("main", "teacher", "cgvqm", "all"),
+        default="all",
+    )
 
     probe = subparsers.add_parser("probe", help="report the local runtime without modifying it")
     probe.add_argument("--backend", choices=("cpu", "cuda", "npu"), default="cpu")
@@ -123,16 +137,24 @@ def _dispatch(args: argparse.Namespace) -> Any:
         return run_main_stage(args.config)
     if args.command == "teacher":
         return run_teacher_stage(args.config)
+    if args.command == "cgvqm":
+        return run_cgvqm_stage(args.config)
     if args.command == "finalize":
         return finalize_run(args.config)
     if args.command == "status":
-        stages = ("main", "teacher") if args.stage == "all" else (args.stage,)
+        stages = (
+            ("main", "teacher", "cgvqm")
+            if args.stage == "all"
+            else (args.stage,)
+        )
         return {stage: stage_counts(config, stage=stage) for stage in stages}
     if args.command == "run":
         result: dict[str, Any] = {"index": build_run_index(config)}
         result["main"] = run_main_stage(args.config)
         if config.teacher is not None:
             result["teacher"] = run_teacher_stage(args.config)
+        if config.output.layout == "graded_flat":
+            result["cgvqm"] = run_cgvqm_stage(args.config)
         result["finalize"] = finalize_run(args.config)
         return result
     raise AssertionError(args.command)

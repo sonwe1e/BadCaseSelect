@@ -42,17 +42,35 @@ def _to_uint8_rgb(array: np.ndarray) -> np.ndarray:
     return np.asarray(value, dtype=np.uint8)
 
 
-def write_image_atomic(path: str | Path, array: np.ndarray) -> None:
+def write_image_atomic(
+    path: str | Path,
+    array: np.ndarray,
+    *,
+    quality: int | None = None,
+    subsampling: int | None = None,
+) -> None:
     """Write a PNG/JPEG through a same-directory temporary file and replace."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     suffix = destination.suffix.lower() or ".png"
+    is_jpeg = suffix in {".jpg", ".jpeg"}
+    if quality is not None and not is_jpeg:
+        raise ValueError("quality is only valid for JPEG output")
+    if subsampling is not None and not is_jpeg:
+        raise ValueError("subsampling is only valid for JPEG output")
+    save_options: dict[str, int] = {}
+    if quality is not None:
+        if not 1 <= int(quality) <= 100:
+            raise ValueError("JPEG quality must be in [1,100]")
+        save_options["quality"] = int(quality)
+    if subsampling is not None:
+        save_options["subsampling"] = int(subsampling)
     with tempfile.NamedTemporaryFile(
         prefix=f".{destination.name}.", suffix=suffix, dir=destination.parent, delete=False
     ) as handle:
         temporary = Path(handle.name)
     try:
-        Image.fromarray(_to_uint8_rgb(array)).save(temporary)
+        Image.fromarray(_to_uint8_rgb(array)).save(temporary, **save_options)
         os.replace(temporary, destination)
     finally:
         if temporary.exists():

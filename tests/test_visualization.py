@@ -20,5 +20,5 @@ def test_diagnostic_grid_has_expected_width():
         panel_width=64,
     )
     assert result.ndim == 3
-    assert result.shape[1] == 256
-    assert result.shape[0] > 96
+    assert result.shape[1] == 320
+    assert result.shape[0] == 152

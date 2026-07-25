@@ -45,8 +45,21 @@ def test_missing_thin_part_gets_stable_nonsemantic_reason():
     assert result.p_wrong > 0.7
     assert result.p_solvable > 0.8
     assert "missing_part" in result.reasons
-    assert "edge_tearing" in result.reasons
+    assert "edge_tearing" not in result.reasons
     assert all(reason in REASON_LABELS for reason in result.reasons)
+
+
+def test_edge_tearing_requires_flow_or_mask_discontinuity_overlap():
+    gt = np.zeros((96, 96, 3), dtype=np.float32)
+    prediction = gt.copy()
+    gt[15:82, 47:49] = 1.0
+    flow = np.zeros((96, 96, 2), dtype=np.float32)
+    flow[:, 48:, 0] = 10.0
+
+    result = diagnose_sample(prediction, gt, flow_t0=flow)
+
+    assert "edge_tearing" in result.reasons
+    assert any(region.metrics["tearing_overlap"] >= 0.25 for region in result.regions)
 
 
 def test_endpoint_copy_and_blend_error_are_diagnosed_from_branch_evidence():

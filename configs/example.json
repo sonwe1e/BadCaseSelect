@@ -10,7 +10,7 @@
     "checkpoint": null,
     "input_height": 540,
     "input_width": 960,
-    "batch_size": 4,
+    "batch_size": 64,
     "mask0_role": "warp0_weight",
     "align_corners": false,
     "padding_mode": "border",
@@ -19,9 +19,26 @@
       "base_channels": 32
     }
   },
+  "cgvqm": {
+    "enabled": true,
+    "backbone_checkpoint": "third_party/weights/cgvqm/r3d_18-b3b3357e.pth",
+    "calibration_checkpoint": "third_party/weights/cgvqm/cgvqm-2.pickle",
+    "backend": "auto",
+    "allow_cpu_fallback": true,
+    "clip_frames": 16,
+    "crop_size": 224,
+    "batch_size": 1,
+    "candidates_per_task": 32,
+    "b_error_at": 25.0,
+    "a_error_at": 50.0,
+    "temporal_persistence_at": 0.35,
+    "spatial_overlap_at": 0.35,
+    "flicker_change_at": 10.0
+  },
   "thresholds": {
     "wrong_reject_below": 0.20,
     "wrong_accept_at": 0.45,
+    "severe_wrong_accept_at": 0.70,
     "solvable_reject_below": 0.30,
     "solvable_accept_at": 0.55,
     "menu_transition_review_at": 0.40,
@@ -54,10 +71,11 @@
     "hard_case_dir": "extremely_hard_case",
     "visualization_dir": "extremely_hard_case_visualization",
     "manifest_name": "hard_case_manifest.jsonl",
-    "link_mode": "hardlink_then_copy",
-    "layout": "segment_relative",
-    "materialize_strategy": "finalize",
+    "link_mode": "copy",
+    "layout": "graded_flat",
+    "materialize_strategy": "per_video",
     "save_review": false,
-    "visualization_width": 320
+    "visualization_width": 480,
+    "visualization_quality": 92
   }
 }

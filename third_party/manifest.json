@@ -58,6 +58,16 @@
       "size": 11359
     },
     {
+      "name": "torchvision-license",
+      "kind": "license",
+      "path": "third_party/licenses/TorchVision-BSD-3-Clause.txt",
+      "source": "https://github.com/pytorch/vision/blob/main/LICENSE",
+      "version": "r3d_18-b3b3357e",
+      "license": "BSD-3-Clause",
+      "sha256": "eaf301df4a1247bb242aa7c2e40381bae72c3c3314aadffb04dc26bda4f6cf67",
+      "size": 1524
+    },
+    {
       "name": "flip-license",
       "kind": "license",
       "path": "third_party/licenses/FLIP-BSD-3-Clause.txt",
@@ -86,6 +96,16 @@
       "license": "Apache-2.0",
       "sha256": "851ba1fcc92beddf4dd24c5bcfc1f2aa80f0f8b926b6b42fbffb2b0db7130cfd",
       "size": 4791
+    },
+    {
+      "name": "r3d-18-kinetics400-v1",
+      "kind": "weight",
+      "path": "third_party/weights/cgvqm/r3d_18-b3b3357e.pth",
+      "source": "https://download.pytorch.org/models/r3d_18-b3b3357e.pth",
+      "version": "torchvision R3D_18_Weights.KINETICS400_V1",
+      "license": "BSD-3-Clause",
+      "sha256": "b3b3357ead25631ec9c57362ff2128a92d0427e01e2cd184951a44380c3f2e9d",
+      "size": 133546016
     },
     {
       "name": "dinov2-vits14-pretrain",

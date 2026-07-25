@@ -47,7 +47,7 @@ python scripts/download_aarch64_wheels.py \
 third_party/
 ├─ downloads/                     # 固定 revision 的源码归档
 ├─ src/{flip,cgvqm,dinov2}/       # 离线源码快照
-├─ weights/{cgvqm,dinov2}/        # 可选研究模型权重
+├─ weights/{cgvqm,dinov2}/        # CGVQM 运行权重与其他研究权重
 ├─ wheelhouse/linux-aarch64/       # 目标 ABI wheels
 ├─ licenses/
 └─ manifest.json
@@ -61,9 +61,9 @@ ckpts/
 
 ### FLIP、CGVQM、DINOv2 的当前定位
 
-这三套资源目前只是离线储备，用于未来对照实验或复核研究。生产基线代码不会导入它们，也不会用它们计算 `p_wrong`、`p_solvable` 或改变 `accept/review/reject`。当前基线依赖的是项目自身的原生分辨率 RGB/亮度/边缘/局部结构评分；teacher 若配置，只用于估计当前错误是否可解。
+CGVQM-2 已接入生产候选精判：传统原生分辨率 RGB/亮度/边缘/局部结构评分先产生高召回候选，冻结 R3D-18 再对候选的连续 prediction/GT 窗口计算时空感知 error。CGVQM 不改变 `p_solvable`，但会与 `mining_p_wrong`、空间重合和时序证据共同决定 A/B/Review。FLIP 与 DINOv2 仍是未来对照实验或复核研究的离线储备。
 
-因此，把这些资源放进 bundle 不表示它们已经接入运行时。后续若要启用，必须显式增加配置、依赖和经过校准的评分路径，不能因资源存在而静默改变判分。
+R3D 主干、`cgvqm-2.pickle`、来源、许可证、大小和 SHA-256 均登记在 manifest；运行时不会通过 torchvision 联网下载。权重缺失或 probe 失败会明确终止任务；只有配置允许时才记录原因并回退 CPU。
 
 ## 3. 放入并登记实际 checkpoint
 
@@ -90,7 +90,7 @@ PYTHONPATH=src python scripts/record_offline_resource.py \
 
 如果配置了 teacher，对 `ckpts/teacher/...` 执行同样操作。准备内部模型时请把 `source`、版本和许可证值替换成组织内真实且可审计的信息。
 
-当前仓库只有 `ckpts/current/.gitkeep` 和 `ckpts/teacher/.gitkeep`，而 `configs/example.json` 引用了 `ckpts/current/model.pth`。所以当前 checkout 可以做“资源清单校验”，但完整校验和正式打包会按设计失败。必须先提供并登记该文件，或者修改 `configs/` 下所有 JSON，使它们引用真实、已登记的 bundle 内 checkpoint。
+当前示例配置把 `model.checkpoint` 留为 `null`，只适合结构和流水线调试。生产交付前必须改为实际 VFI checkpoint 并按上面的方式登记；否则即使资源清单完整，也不能把随机初始化模型的输出视为有效困难样本。
 
 ## 4. 两级离线校验
 
@@ -196,6 +196,7 @@ python scripts/probe_ascend.py --require-devices 8 --strict
 - 配置哈希；
 - 索引内容摘要（路径、编号、大小、`mtime_ns` 等索引字段）；
 - current/teacher checkpoint 的路径、大小和 SHA-256；
+- 启用 CGVQM 时，R3D 主干和 CGVQM-2 校准权重的路径、大小和 SHA-256；
 - 可定位时的 current/teacher factory 源文件 SHA-256；
 - miner Python 源码树摘要；
 - 派生的 24 位 `execution_id`。
@@ -219,17 +220,13 @@ python scripts/probe_ascend.py --require-devices 8 --strict
 }
 ```
 
-执行顺序：
+推荐只执行一条命令：
 
 ```bash
-vfi-hard-miner index --config configs/my_game.json
-vfi-hard-miner mine --config configs/my_game.json
-# 配置 teacher 时：
-vfi-hard-miner teacher --config configs/my_game.json
-vfi-hard-miner finalize --config configs/my_game.json
+vfi-hard-miner run --config configs/my_game.json
 ```
 
-main 与可选 teacher 阶段使用独立设备 worker 和各自的 SQLite lease 状态。`finalize` 合并困难区间后，会自动为 selected hard center（以及可选 review）建立诊断任务；诊断阶段没有独立 CLI 子命令。
+`run` 内部执行 index → main → 可选 teacher → CGVQM → finalize。main、可选 teacher 与 CGVQM 阶段使用独立 SQLite lease 状态。CGVQM 在干净子进程中绑定加速卡，避免协调进程导入 `torch_npu`；每个视频精判完成后即可把 A/B 帧复制到运行暂存区。分阶段命令仍可用于恢复。
 
 诊断任务按视频排序后动态切块，目标是让 8 卡配置拥有足够任务并行度；实际 worker 数为 `min(runtime.workers, 当前任务数)`。每个进程只绑定一张 NPU、加载一次当前模型，并利用解码预取和单 CPU 后处理线程重叠 NPU 推理、FP32 原图重建、局部评分和拼图生成。这里不使用 DDP、HCCL 或跨卡梯度同步。
 
@@ -237,10 +234,11 @@ main 与可选 teacher 阶段使用独立设备 worker 和各自的 SQLite lease
 
 最终输出写入：
 
-- `data.root/<hard_case_dir>/`：连续原始帧；默认 `segment_relative` 布局让每个合并 segment 独占叶目录并保留原 basename，`finalize` 会按配置的命名规则和 stride 重扫并拒绝空效 segment，训练器必须把每个叶目录当作独立视频且不得跨目录组 triplet；
-- `data.root/<visualization_dir>/`：`img0 / GT / prediction / img1` 与局部错误诊断拼图；
-- `data.root/<manifest_name>`：完整结果及 `selected`、`covered_by_segment`、`contributed_to_segment` 语义；
-- `runtime.run_dir/segments.json`：合并分段；
+- `data.root/<hard_case_dir>/A|B/`：平铺的原始训练帧，保留 basename、无视频/segment 子目录，复制后校验 SHA-256；
+- `data.root/<visualization_dir>/`：两行五列 JPEG 诊断拼图，包含两张 flow、传统误差和三张 CGVQM 视图；
+- `data.root/<manifest_name>`：完整 A/B/Review/Reject、质量门、原因置信度和 CGVQM 证据；
+- `runtime.run_dir/segments.json`：每个 A/B 中心及其三帧训练映射摘要；
+- `runtime.run_dir/graded_results.jsonl`：CGVQM overlay 后的完整分级结果；
 - `runtime.run_dir/diagnostic_results.jsonl`：winning diagnostic 记录。
 
 发布阶段使用 staging、ownership marker 和 finalize lock，将帧目录、可视化目录、manifest、segments 与 current marker 作为一个可回滚发布批次处理。

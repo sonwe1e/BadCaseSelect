@@ -47,9 +47,9 @@
     "input_height": 540,
     "input_width": 960,
 
-    // 每次推理的批大小。NPU 建议 4～8（视显存而定）；
-    // CPU 调试时可设为 1 以减少内存占用。
-    "batch_size": 4,
+    // NPU 主推理批大小。A3 已验证 64 明显提升吞吐；全分辨率重建与
+    // CPU 评分会按 postproc_buffer_mb 自动拆成微批次，不跟随此值堆积。
+    "batch_size": 64,
 
     // mask0 的语义角色，决定后处理时如何将 mask0/mask1 用于融合：
     //   "warp0_weight" — mask0 是 frame0 backward warp 的混合权重（默认）
@@ -84,6 +84,42 @@
   },
 
   // ─────────────────────────────────────────────────────
+  // cgvqm: 候选样本的 R3D 深度时空精判
+  // 只处理传统评分已确认的高召回候选，不对全量样本重复运行。
+  // ─────────────────────────────────────────────────────
+  "cgvqm": {
+    // graded_flat 训练输出必须启用，避免仅凭像素误差把简单帧放入 A/B。
+    "enabled": true,
+
+    // 所有资源必须预先放入离线包；运行时不会访问网络或自动下载。
+    "backbone_checkpoint": "third_party/weights/cgvqm/r3d_18-b3b3357e.pth",
+    "calibration_checkpoint": "third_party/weights/cgvqm/cgvqm-2.pickle",
+
+    // auto 跟随主模型后端。A3 Conv3D 探针失败时，只有 allow_cpu_fallback
+    // 为 true 才会明确记录原因并回退 CPU。
+    "backend": "auto",
+    "allow_cpu_fallback": true,
+
+    // 每个候选使用同一视频内连续 16 个 prediction/GT 中间帧。
+    // 首尾使用确定性边界 padding，不跨视频。
+    "clip_frames": 16,
+    "crop_size": 224,
+    "batch_size": 1,
+    "candidates_per_task": 32,
+
+    // CGVQM 使用 error 方向：越高表示感知劣化越明显。
+    "b_error_at": 25.0,
+    "a_error_at": 50.0,
+    "temporal_persistence_at": 0.35,
+
+    // CGVQM 高响应必须与传统候选区域具有足够空间重叠；
+    // 否则属于两种证据冲突，只进入 Review。
+    "spatial_overlap_at": 0.35,
+    // 相邻 CGVQM 帧均值变化超过该 error 值时，记录 flicker 时序证据。
+    "flicker_change_at": 10.0
+  },
+
+  // ─────────────────────────────────────────────────────
   // thresholds: 困难样本筛选阈值
   // 所有值均为概率，范围 [0, 1]。
   // reject_below < p < accept_at 的样本进入 review 队列。
@@ -94,6 +130,8 @@
     //   高于 wrong_accept_at   → 模型确实做错，接受为困难样本
     "wrong_reject_below": 0.20,
     "wrong_accept_at": 0.45,
+    // A 级还必须达到的传统结构错误下限。
+    "severe_wrong_accept_at": 0.70,
 
     // p_solvable 阈值：此 triplet 是否在理论上可被模型解决。
     //   低于 solvable_reject_below → 无法解（遮挡/超出运动范围），丢弃
@@ -213,9 +251,7 @@
   // output: 结果输出配置
   // ─────────────────────────────────────────────────────
   "output": {
-    // 困难帧原始片段的输出目录名（相对于 run_dir）。
-    // 每个合并后的片段会在此目录下独占一个叶子目录，
-    // 训练器应将每个叶子目录视为独立视频。
+    // 训练帧输出目录名（相对于 data.root）。目录内固定只有 A/ 与 B/。
     "hard_case_dir": "extremely_hard_case",
 
     // 诊断可视化拼图（对比图）的输出目录名（相对于 run_dir）。
@@ -223,34 +259,26 @@
     "visualization_dir": "extremely_hard_case_visualization",
 
     // JSONL 清单文件名（位于 run_dir 根目录）。
-    // 每行一条记录，包含片段路径、帧编号范围、p_wrong/p_solvable 等元数据。
+    // 每行一条记录，包含 A/B/Review/Reject、三帧映射、传统与 CGVQM 证据。
     "manifest_name": "hard_case_manifest.jsonl",
 
-    // 文件落盘方式：
-    //   "hardlink_then_copy" — 优先使用硬链接（零拷贝，同文件系统时最快），
-    //                          跨文件系统则回退为完整复制
-    //   "copy"               — 始终完整复制
-    //   "symlink"            — 创建符号链接（需注意相对路径和清理问题）
-    "link_mode": "hardlink_then_copy",
+    // 训练数据固定使用原文件字节复制，并在复制后校验 SHA-256。
+    "link_mode": "copy",
 
-    // 输出目录布局：
-    //   "segment_relative" — 每个片段的帧按相对路径保留目录结构，
-    //                        适合训练器按视频组织数据
-    //   "flat"             — 所有帧平铺在一个目录，适合小规模快速检查
-    "layout": "segment_relative",
+    // A/B 平铺布局。A/B 内不创建视频、segment 或数字编号子目录；
+    // 文件 basename 原样保留，同级同名异源会明确失败。
+    "layout": "graded_flat",
 
-    // 原始困难帧物化策略：
-    //   "finalize"  — 保持旧行为，全部推理完成后统一复制并原子发布
-    //   "per_video" — 每个视频完成后写入运行专属暂存区；首版要求
-    //                 layout="segment_relative" 且不能配置 teacher
-    "materialize_strategy": "finalize",
+    // 每个视频完成 CGVQM 分级后立即复制到运行专属暂存区；
+    // finalize 只验证并复用，正式目录仍统一原子切换。
+    "materialize_strategy": "per_video",
 
     // 是否为 review 级别的样本（p_wrong 处于中间区间）也生成诊断图。
     // false 可显著减少诊断阶段的 I/O 和存储占用。
     "save_review": false,
 
-    // 诊断拼图的输出宽度（像素）。拼图高度自动按比例计算。
-    // 较小的值（160～320）适合快速人工浏览；较大值（640+）便于细节审查。
-    "visualization_width": 320
+    // 2 行 × 5 列诊断图的单格宽度和 JPEG 质量。训练帧不受此设置影响。
+    "visualization_width": 480,
+    "visualization_quality": 92
   }
 }

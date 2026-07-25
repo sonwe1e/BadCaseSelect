@@ -45,18 +45,18 @@ from torch import nn
 class TemplateModel(nn.Module):
     """Replace this docstring with a one-line description of your model."""
 
-    def __init__(
-        self,
-        *,
-        # TODO: add your model-specific constructor parameters here.
-        #       Keep them keyword-only (after the bare *) and give each
-        #       a type annotation and a sensible default where possible.
-        #
-        # Example:
-        #   base_channels: int = 32,
-        #   use_attention: bool = True,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
+        # TODO: add model-specific constructor parameters. When parameters
+        # are present, place a bare * before them to keep them keyword-only.
+        #
+        # Example signature:
+        #   def __init__(
+        #       self,
+        #       *,
+        #       base_channels: int = 32,
+        #       use_attention: bool = True,
+        #   ) -> None:
         # TODO: build the network layers.
         raise NotImplementedError("fill in __init__ before using this model")
 

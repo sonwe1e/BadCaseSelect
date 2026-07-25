@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VFI Hard Miner：坏帧筛选方法与证据链</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1018;
+      --panel: #121a26;
+      --panel-2: #182334;
+      --text: #edf3fb;
+      --muted: #a9b8ca;
+      --line: #2d3d52;
+      --blue: #66a8ff;
+      --cyan: #65d8d1;
+      --amber: #f4c264;
+      --red: #ff7d86;
+      --green: #75d99a;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      overflow-x: hidden;
+      background:
+        radial-gradient(circle at 8% -10%, #203b61 0, transparent 32rem),
+        radial-gradient(circle at 92% 10%, #173e3d 0, transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font: 16px/1.72 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+    main { width: min(1180px, calc(100% - 36px)); margin: 0 auto 80px; }
+    header { padding: 72px 0 36px; }
+    h1 { max-width: 900px; margin: 0 0 18px; font-size: clamp(34px, 5vw, 62px); line-height: 1.08; }
+    h2 { margin: 0 0 18px; font-size: 28px; }
+    h3 { margin: 28px 0 10px; font-size: 20px; }
+    p { margin: 10px 0; }
+    a { color: var(--cyan); }
+    code, .formula {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    .lead { max-width: 920px; color: #cbd8e7; font-size: 19px; }
+    .tag {
+      display: inline-block; margin-bottom: 16px; padding: 5px 10px;
+      border: 1px solid #4773a5; border-radius: 999px; color: #a8d1ff;
+      background: #13253a;
+    }
+    nav {
+      position: sticky; top: 0; z-index: 4; display: flex; gap: 8px; overflow-x: auto;
+      max-width: 100%;
+      padding: 12px 0; background: color-mix(in srgb, var(--bg) 88%, transparent);
+      backdrop-filter: blur(12px);
+    }
+    nav a {
+      flex: 0 0 auto; padding: 7px 11px; border: 1px solid var(--line);
+      border-radius: 8px; color: var(--muted); text-decoration: none; background: #101823;
+    }
+    section {
+      min-width: 0;
+      margin-top: 28px; padding: 30px; border: 1px solid var(--line);
+      border-radius: 16px; background: linear-gradient(145deg, #121a26ee, #0f1722ee);
+      box-shadow: 0 18px 60px #0005;
+    }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .card { padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2); }
+    .card h3 { margin-top: 0; }
+    .formula {
+      margin: 14px 0; padding: 16px; overflow-x: auto; white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border-left: 4px solid var(--blue); border-radius: 8px; background: #090e15;
+      color: #cde4ff;
+    }
+    .note { padding: 16px 18px; border-left: 4px solid var(--amber); background: #2d2415; }
+    .good { border-left-color: var(--green); background: #10271b; }
+    .danger { border-left-color: var(--red); background: #31171b; }
+    table { display: block; width: 100%; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 14px 0; }
+    th, td { padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: #b9d7ff; background: #162235; }
+    ul, ol { padding-left: 22px; }
+    li + li { margin-top: 7px; }
+    .flow { display: flex; max-width: 100%; align-items: stretch; gap: 9px; overflow-x: auto; padding: 8px 0 4px; }
+    .flow .step {
+      min-width: 160px; padding: 15px; border: 1px solid #36516e;
+      border-radius: 10px; background: #152235;
+    }
+    .flow .arrow { align-self: center; color: var(--blue); font-size: 24px; }
+    .grade { font-weight: 800; font-size: 24px; }
+    .a { color: var(--red); } .b { color: var(--amber); }
+    .review { color: var(--blue); } .reject { color: var(--muted); }
+    .viz-grid {
+      display: grid; grid-template-columns: repeat(5, minmax(130px, 1fr));
+      max-width: 100%; gap: 7px; overflow-x: auto;
+    }
+    .viz-grid div {
+      min-width: 130px; aspect-ratio: 16/9; display: grid; place-items: center;
+      padding: 8px; text-align: center; border: 1px solid #3a526e;
+      background: linear-gradient(135deg, #223652, #182330); color: #d9e9fa;
+    }
+    .small { color: var(--muted); font-size: 14px; }
+    @media (max-width: 800px) {
+      .grid, .grid-4 { grid-template-columns: 1fr; }
+      section { padding: 22px 18px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="tag">实现对应版本：2026-07-25</span>
+    <h1>如何判断一帧是“坏帧”，以及为什么值得加入训练集</h1>
+    <p class="lead">
+      本页描述 VFI Hard Miner 当前代码实际执行的判定链。系统不会只看一张误差图，也不会只凭一个深度模型总分收数据；
+      它先用传统局部结构误差高召回定位，再用冻结 R3D-18 的 CGVQM-2 做时空感知复核，最后通过有效性、可学习性、
+      错误真实性和严重度四层门控，把确定的训练样本分到 A 或 B。
+    </p>
+  </header>
+
+  <nav aria-label="章节导航">
+    <a href="#overview">总流程</a><a href="#traditional">传统误差</a><a href="#quality">质量门</a>
+    <a href="#cgvqm">CGVQM</a><a href="#reasons">劣化原因</a><a href="#grades">A/B 分级</a>
+    <a href="#output">输出规则</a><a href="#visual">2×5 可视化</a><a href="#tuning">A3 调参</a>
+  </nav>
+
+  <section id="overview">
+    <h2>1. 结论先行：一个样本进入 A/B 必须同时满足什么</h2>
+    <div class="formula">validity = accept
+AND in_scope = accept
+AND p_solvable ≥ solvable_accept_at
+AND mining_p_wrong ≥ wrong_accept_at
+AND 存在具有空间面积的局部候选区域
+AND CGVQM error ≥ b_error_at
+AND（CGVQM 热区与传统区域重合 OR 时序证据足够强）</div>
+    <p>
+      任一条件不满足，都不会把三帧复制到训练目录。边界样本和传统/深度证据冲突样本进入 Review，只留在
+      manifest；输入损坏、超出模型能力或明确不困难的样本进入 Reject。
+    </p>
+    <div class="flow" role="img" aria-label="筛选流程">
+      <div class="step"><strong>① 主模型推理</strong><br>按大 batch 生成 flow、mask 与 prediction</div>
+      <div class="arrow">→</div>
+      <div class="step"><strong>② 传统高召回</strong><br>原分辨率结构误差与局部区域</div>
+      <div class="arrow">→</div>
+      <div class="step"><strong>③ 四层质量门</strong><br>有效、可学、真实、足够严重</div>
+      <div class="arrow">→</div>
+      <div class="step"><strong>④ CGVQM-2</strong><br>16 帧 R3D 感知及时序复核</div>
+      <div class="arrow">→</div>
+      <div class="step"><strong>⑤ A/B 复制</strong><br>原文件字节复制与 SHA-256 校验</div>
+    </div>
+  </section>
+
+  <section id="traditional">
+    <h2>2. 传统局部错误：先回答“prediction 和 GT 到底哪里不同”</h2>
+    <p>记当前模型重建的中间帧为 <code>P</code>，真实中间帧为 <code>GT</code>。所有计算在原始分辨率、RGB [0,1] 上进行。</p>
+    <div class="grid">
+      <div class="card">
+        <h3>像素与亮度</h3>
+        <div class="formula">RGB(x)  = mean_c |P(x,c) - GT(x,c)|
+Luma(x) = |Y(P(x)) - Y(GT(x))|</div>
+        <p>RGB 捕获颜色和亮度差；Luma 单独保留人眼更敏感的明暗结构变化。</p>
+      </div>
+      <div class="card">
+        <h3>缺失边缘与新增边缘</h3>
+        <div class="formula">missing(x) = max(Sobel(GT) - Sobel(P), 0)
+extra(x)   = max(Sobel(P) - Sobel(GT), 0)</div>
+        <p>missing 表示 GT 中存在但预测丢失的轮廓；extra 表示预测凭空产生的轮廓。</p>
+      </div>
+    </div>
+    <div class="formula">edge_error(x) = max(missing(x), extra(x))
+structure(x)  = max(RGB(x), Luma(x), 1.25 × edge_error(x))</div>
+    <h3>不是取全图均值，而是寻找有空间支撑的局部异常</h3>
+    <p>
+      全图均值会把一根断掉的武器、人物手指或 UI 旁的局部撕裂稀释掉。因此系统并行使用两条候选路径：
+      在 structure 图上取 <code>max(edge_threshold, candidate_quantile)</code> 后提取连通区域，同时使用多尺度滑动窗口
+      找到“面积较大但单点不尖锐”的异常。面积小于 <code>min_region_pixels</code>、缺少 RGB 支撑或被更强区域完全覆盖的提案会被丢弃。
+    </p>
+    <div class="formula">local_score = max(
+  region_mean,
+  0.90 × top_10%_mean,
+  0.95 × top_1%_mean,
+  0.85 × peak
+)</div>
+    <p>
+      <code>p_wrong</code> 保存最强的原始局部错误；<code>mining_p_wrong = p_wrong × priority_weight</code> 才用于挖掘。
+      贴边、前后帧近似静止且 GT 边缘密度高的文字/图标区域会降低 <code>priority_weight</code>，避免简单 UI 抖动占满训练集；
+      非 UI 区域仍保留最低名额。
+    </p>
+  </section>
+
+  <section id="quality">
+    <h2>3. 四层高质量门控</h2>
+    <div class="grid-4">
+      <div class="card"><h3>输入有效性</h3><p>三帧必须可解码、尺寸一致、数值有限，编号严格符合 stride。重复帧、镜头切换、跳帧和菜单转场会被拒绝或送审。</p></div>
+      <div class="card"><h3>模型范围</h3><p>由双向光流统计大面积出界、遮挡、前景极端运动、流场不连续和不可解释运动。明确超范围的数据不会拿来训练。</p></div>
+      <div class="card"><h3>可学习性</h3><p><code>p_solvable</code> 来自 teacher 恢复能力和 best-of-warp 分支改善。GT 始终定义对错；teacher 只证明“是否有可能修好”。</p></div>
+      <div class="card"><h3>错误真实性</h3><p>必须同时存在传统局部区域和 CGVQM 感知证据；两者空间位置冲突且无时序证据时只进入 Review。</p></div>
+    </div>
+    <div class="note good">
+      <strong>为什么这能减少“问题不大”的帧：</strong>
+      单像素噪声过不了最小区域门；普通抗锯齿差异通常过不了 CGVQM error；静态 UI 会被 priority_weight 降权；
+      传统高分但 CGVQM 低分、或 CGVQM 热区不在传统候选位置的样本都不会进入 A/B。
+    </div>
+  </section>
+
+  <section id="cgvqm">
+    <h2>4. CGVQM-2：用深度时空特征确认“人是否真的能看到劣化”</h2>
+    <p>
+      CGVQM-2 使用冻结的 Kinetics-400 R3D-18。它不参与全量扫描，只复核已经通过传统阈值的候选中心。
+      对每个中心，在同一视频内取默认 16 个连续 triplet prediction 与对应 GT；视频首尾不足时复制边界位置，
+      永不跨视频。重叠窗口的 prediction 依赖会合并，相同上下文只重建一次。
+    </p>
+    <h3>候选 crop</h3>
+    <p>
+      系统取主候选 box，向外扩展约 50% 且保证最小边长，再缩放到默认 224×224。这样保留错误周围上下文，
+      同时把 Conv3D 成本限制在候选区域，不必对整张 4K 图运行 R3D。
+    </p>
+    <h3>R3D 特征距离</h3>
+    <p>输入使用官方均值/标准差。CGVQM-2 读取三层：标准化输入、R3D stem 和 layer1；后两层先沿通道做 L2 归一化。</p>
+    <div class="formula">d_l = Σ_c |w_l,c| × mean_t,h,w (F_l(P) - F_l(GT))²
+error = α × Σ_l d_l
+emap  = α × Σ_l upsample(Σ_c |w_l,c| × (F_l(P)-F_l(GT))²)</div>
+    <p>
+      这里使用 error 方向：数值越高，劣化越明显；官方 quality 等于 <code>100 - error</code>。
+      校准权重来自固定的 <code>cgvqm-2.pickle</code>，R3D 主干和校准文件都由离线 manifest 的大小和 SHA-256 管理，
+      运行时禁止联网下载。
+    </p>
+    <h3>从时空 error map 提取的证据</h3>
+    <table>
+      <thead><tr><th>字段</th><th>当前计算</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><code>center_error</code></td><td>中心 map 的 mean、top 1% mean、0.85×peak 取最大</td><td>避免小型严重结构被均值稀释</td></tr>
+        <tr><td><code>temporal_persistence</code></td><td>16 个切片中，帧均值达到 B 阈值的比例</td><td>确认错误不是单点噪声</td></tr>
+        <tr><td><code>temporal_change</code></td><td>相邻帧均值差的最大值</td><td>识别突然出现/消失的 flicker</td></tr>
+        <tr><td><code>spatial_overlap</code></td><td>中心 map top 10% 热点落入传统候选 mask 的比例</td><td>检查两种方法是否在同一位置看到问题</td></tr>
+        <tr><td><code>temporal map</code></td><td>逐像素 <code>max |emap[t+1]-emap[t]|</code></td><td>可视化时间敏感度</td></tr>
+        <tr><td><code>fused map</code></td><td><code>max(center map, temporal map)</code></td><td>同时展示静态和时序异常</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="reasons">
+    <h2>5. “为什么是坏帧”：每一种模型劣化原因如何判定</h2>
+    <p>
+      原因不是从文件名或总分猜出来的。系统先在每个候选区域计算结构、分支和运动证据，再按固定条件贴标签；
+      manifest 的 <code>regions[].metrics</code> 保留支撑数字，<code>reason_confidence</code> 由该区域错误强度乘 UI 优先权得到。
+    </p>
+    <table>
+      <thead><tr><th>原因</th><th>当前证据规则</th><th>防误报约束</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>missing_part</strong><br>部件缺失</td>
+          <td><code>missing_edge_error ≥ 0.14</code>，且 <code>missing ≥ 1.25×extra + 0.01</code>。</td>
+          <td>要求 GT 强轮廓明显消失，而不是预测和 GT 同时存在等量轻微边缘位移。</td>
+        </tr>
+        <tr>
+          <td><strong>broken_structure</strong><br>结构断裂</td>
+          <td>missing 达阈值，并且预测边缘端点更多、连通块更多，或候选为长宽比至少 1.75 的细长断裂结构。</td>
+          <td>必须先有明确缺失边缘，普通纹理颜色误差不会触发。</td>
+        </tr>
+        <tr>
+          <td><strong>ghosting</strong><br>重影/双轮廓</td>
+          <td>missing 和 extra 都达到 0.14，且二者强度比在 0.35～2.85。</td>
+          <td>要求“旧轮廓缺失 + 新轮廓出现”同时成立，单侧模糊不算重影。</td>
+        </tr>
+        <tr>
+          <td><strong>edge_tearing</strong><br>边缘撕裂</td>
+          <td>边缘误差达到 0.14，并且错误边缘与 flow 梯度或 mask 梯度的强突变区重合比例至少 0.25。</td>
+          <td>旧版“任何边缘误差都算撕裂”已移除；没有模型运动/融合证据时不贴该标签。</td>
+        </tr>
+        <tr>
+          <td><strong>blur</strong><br>细节模糊</td>
+          <td>missing 达阈值，且 GT 局部边缘强度比 prediction 至少高 <code>branch_improvement=0.08</code>。</td>
+          <td>要求 GT 的高频细节确实更强，不把纯亮度偏差写成 blur。</td>
+        </tr>
+        <tr>
+          <td><strong>endpoint_copy</strong><br>端点帧复制</td>
+          <td>prediction 到 img1 的局部距离远小于 prediction 到 GT；默认至少改善当前错误的 65%。</td>
+          <td>当前错误还必须达到最小错误阈值，正常静止画面不会仅因相似而触发。</td>
+        </tr>
+        <tr>
+          <td><strong>blend_mask_error</strong><br>融合权重错误</td>
+          <td>warp0/warp1 中至少一条分支比最终 warp blend 好 0.08 以上。</td>
+          <td>说明运动分支已经能恢复 GT，错误主要由 mask 融合放大；不是凭最终图猜 mask。</td>
+        </tr>
+        <tr>
+          <td><strong>flicker</strong><br>时序闪烁</td>
+          <td>CGVQM 相邻帧 error 均值的最大变化达到 <code>flicker_change_at</code>（默认 10）。</td>
+          <td>必须来自连续预测窗口，不再根据单个三帧样本独立推断闪烁。</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="note">
+      原因标签用于解释与 A 级结构证据，不会绕过质量门。即使出现 <code>missing_part</code>，只要输入无效、
+      <code>p_solvable</code> 不足、CGVQM 低或空间位置冲突，仍不会进入训练目录。
+    </div>
+  </section>
+
+  <section id="grades">
+    <h2>6. A、B、Review、Reject 的最终分级</h2>
+    <div class="grid">
+      <div class="card"><div class="grade a">A</div><p>大幅结构/时序劣化。必须满足 CGVQM error ≥ A 阈值、传统错误 ≥ severe 阈值，并具有强结构原因或强时序证据。</p></div>
+      <div class="card"><div class="grade b">B</div><p>确定存在但程度较轻。必须超过 B 的传统和 CGVQM 阈值，并通过空间重合或时序确认；不是“剩下的都放 B”。</p></div>
+      <div class="card"><div class="grade review">Review</div><p>阈值灰区、传统/CGVQM 总分冲突、两者位置冲突或缺少深度证据。只写 manifest，等待人工抽检。</p></div>
+      <div class="card"><div class="grade reject">Reject</div><p>无效、超范围、不可学习、没有局部支撑或错误不足。不会复制训练帧。</p></div>
+    </div>
+    <div class="formula">A =
+  common_quality_gate
+  AND cgvqm_error ≥ a_error_at
+  AND mining_p_wrong ≥ severe_wrong_accept_at
+  AND (strong_structure OR strong_temporal_evidence)
+
+B =
+  common_quality_gate
+  AND cgvqm_error ≥ b_error_at
+  AND (spatial_overlap ≥ spatial_overlap_at OR strong_temporal_evidence)
+  AND NOT A</div>
+  </section>
+
+  <section id="output">
+    <h2>7. 训练数据如何复制：按坏帧中心独立分级，不再生成三元组子目录</h2>
+    <div class="formula">第 2 帧预测为 A：原始帧 1、2、3 → extremely_hard_case/A/
+第 4 帧预测为 B：原始帧 3、4、5 → extremely_hard_case/B/</div>
+    <p>
+      因此原始第 3 帧同时出现在 A 与 B 是正确行为：它分别服务两个不同等级的训练中心。同级内部重叠取并集，
+      只复制一次。A/B 内没有视频、segment、01/02 或自动编号子目录，basename 原样保留。
+    </p>
+    <div class="grid">
+      <div class="card"><h3>字节保真</h3><p>训练帧使用 <code>copy2</code> 复制到同目录临时文件，再原子改名；完成后比较大小和 SHA-256。训练图片不会转成 JPEG。</p></div>
+      <div class="card"><h3>冲突保护</h3><p>同一等级中，不同源文件若映射到相同 basename，任务明确失败；不会覆盖、自动改名或悄悄混合两个视频。</p></div>
+      <div class="card"><h3>按视频增量</h3><p>一个视频 CGVQM 完成后立即写入 <code>.vfi_hard_miner_staging/&lt;execution_id&gt;/hard_case/A|B</code>。</p></div>
+      <div class="card"><h3>原子发布</h3><p>全部精判、诊断、manifest 和校验成功后才切换正式目录；失败保留上一版，重跑只补缺失步骤。</p></div>
+    </div>
+  </section>
+
+  <section id="visual">
+    <h2>8. 诊断图：固定两行五列</h2>
+    <div class="viz-grid" aria-label="两行五列诊断图布局">
+      <div>img0</div><div>GT</div><div>prediction</div><div>img1</div><div>传统 structure error</div>
+      <div>flow_t0</div><div>flow_t1</div><div>CGVQM center error</div><div>CGVQM temporal sensitivity</div><div>CGVQM fused confidence</div>
+    </div>
+    <p>
+      默认每格宽 480 像素，候选框以黄色覆盖在原图、预测、传统误差和光流视图上。第三行局部 crop 已删除。
+      诊断拼图以 JPEG quality 92、4:4:4 色度采样保存，减少硬盘占用；manifest 记录格式、质量和实际宽高。
+      诊断 JPEG 仅用于人工分析，训练器只能读取 A/B 中的原始复制帧。
+    </p>
+  </section>
+
+  <section id="run">
+    <h2>9. 一键执行与恢复</h2>
+    <div class="formula">vfi-hard-miner run --config configs/my_game.json</div>
+    <p>
+      一条命令内部依次执行 index → main → 可选 teacher → CGVQM → finalize。main 和 CGVQM 都有独立 SQLite 状态、
+      任务租约、attempt 结果与 30 秒日志心跳。大 batch 只用于 NPU 主推理；全分辨率重建与 CPU 评分依据
+      <code>postproc_buffer_mb</code> 自动微批次化，进度分别显示 inferred、scored 和 pending。
+    </p>
+    <p class="small">
+      分阶段命令仍保留用于故障恢复：<code>index</code>、<code>mine</code>、<code>teacher</code>、
+      <code>cgvqm</code>、<code>finalize</code>。日常运行只推荐 <code>run</code>。
+    </p>
+  </section>
+
+  <section id="tuning">
+    <h2>10. A3 首轮抽检与阈值调节</h2>
+    <ol>
+      <li>保持 <code>model.batch_size=64</code>，观察 main 的 inferred/scored/pending，确认没有持续换页。</li>
+      <li>先看 Review 中的 CGVQM error、spatial_overlap、temporal_persistence 分布，不要直接降低所有阈值。</li>
+      <li>A 中若仍有轻微帧，优先提高 <code>severe_wrong_accept_at</code> 或 <code>a_error_at</code>；不要降低 B 来“补数量”。</li>
+      <li>B 中若有抗锯齿/UI 误报，优先提高 <code>spatial_overlap_at</code>、<code>b_error_at</code>，并检查 priority_weight。</li>
+      <li>漏掉真实闪烁时，人工确认连续窗口后再调整 <code>flicker_change_at</code> 或 <code>temporal_persistence_at</code>。</li>
+      <li>每次阈值或模型变化都会改变 run hash；使用新的 <code>runtime.run_dir</code>，不能混用旧结果。</li>
+    </ol>
+    <div class="note danger">
+      不应把“输出数量多”当成质量目标。A/B 是直接供训练读取的数据；Review 才是扩召回和人工校准的缓冲区。
+      首轮 A3 验收应分别随机抽查 A、B、Review，并以误入 A/B 的简单帧比例作为主要质量指标。
+    </div>
+  </section>
+
+  <section id="manifest">
+    <h2>11. 可审计结果字段</h2>
+    <p>每个样本保留以下关键字段，足以追溯为什么复制或为什么未复制：</p>
+    <table>
+      <thead><tr><th>字段</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td><code>grade</code> / <code>selected</code></td><td>A、B、Review、Reject；只有 A/B 的 selected 为 true。</td></tr>
+        <tr><td><code>quality_gate</code></td><td>有效性、范围、传统错误、可学习性、CGVQM 确认、空间重合和时序证据。</td></tr>
+        <tr><td><code>severity_score</code></td><td>传统错误与归一化 CGVQM error 的保守融合，仅用于排序，不绕过门控。</td></tr>
+        <tr><td><code>reasons</code> / <code>reason_confidence</code></td><td>具体劣化原因及局部证据强度。</td></tr>
+        <tr><td><code>regions[].metrics</code></td><td>missing/extra edge、连通块、端点、warp 分支、UI 权重和 tearing overlap。</td></tr>
+        <tr><td><code>cgvqm</code></td><td>error、中心/时序统计、空间重合、后端、窗口、crop 与热图 artifact。</td></tr>
+        <tr><td><code>run_metadata</code></td><td>配置、execution、主模型和 CGVQM 权重指纹及运行环境。</td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+</body>
+</html>

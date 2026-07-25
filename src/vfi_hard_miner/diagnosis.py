@@ -49,6 +49,7 @@ class DiagnosisConfig:
     branch_improvement: float = 0.08
     endpoint_copy_ratio: float = 0.65
     flicker_threshold: float = 0.18
+    tearing_overlap_threshold: float = 0.25
 
     @classmethod
     def from_value(cls, value: Any | None) -> "DiagnosisConfig":
@@ -89,6 +90,12 @@ class DiagnosisConfig:
             ),
             flicker_threshold=float(
                 read("flicker_threshold", defaults.flicker_threshold)
+            ),
+            tearing_overlap_threshold=float(
+                read(
+                    "tearing_overlap_threshold",
+                    defaults.tearing_overlap_threshold,
+                )
             ),
         )
 
@@ -294,6 +301,34 @@ def _crop(values: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
     return values[y0:y1, x0:x1]
 
 
+def _gradient_support_map(
+    value: Any | None,
+    *,
+    shape: tuple[int, int],
+) -> np.ndarray | None:
+    if value is None:
+        return None
+    array = np.asarray(_to_numpy(value), dtype=np.float32)
+    if array.ndim == 3 and array.shape[:2] != shape and array.shape[0] in (1, 2):
+        array = np.moveaxis(array, 0, -1)
+    if array.ndim == 2:
+        array = array[..., None]
+    if array.ndim != 3 or array.shape[:2] != shape:
+        raise ValueError(
+            f"flow/mask evidence must match image shape {shape}, got {array.shape}"
+        )
+    dx = np.zeros_like(array)
+    dy = np.zeros_like(array)
+    dx[:, 1:] = array[:, 1:] - array[:, :-1]
+    dy[1:, :] = array[1:, :] - array[:-1, :]
+    magnitude = np.sqrt(np.square(dx).sum(axis=2) + np.square(dy).sum(axis=2))
+    positive = magnitude[magnitude > 0]
+    if not positive.size:
+        return np.zeros(shape, dtype=np.float32)
+    scale = max(float(np.quantile(positive, 0.95)), 1e-8)
+    return np.asarray(np.clip(magnitude / scale, 0.0, 1.0), dtype=np.float32)
+
+
 _NEIGHBOR_KERNEL_3X3 = np.ones((3, 3), dtype=np.int32)
 _NEIGHBOR_KERNEL_3X3[1, 1] = 0
 _STRUCTURE_8_CONNECTED = np.ones((3, 3), dtype=np.uint8)
@@ -352,6 +387,8 @@ def _diagnose_region(
     warp_blend: Any | None,
     img1: Any | None,
     temporal_error: float | None,
+    flow_discontinuity_map: np.ndarray | None,
+    mask_gradient_map: np.ndarray | None,
     priority_metrics: Mapping[str, float] | None,
     cfg: DiagnosisConfig,
 ) -> RegionDiagnosis:
@@ -417,7 +454,20 @@ def _diagnose_region(
         ratio = missing / max(extra, 1e-6)
         if 0.35 <= ratio <= 2.85:
             labels.append("ghosting")
-    if edge_error >= cfg.edge_reason_threshold:
+    edge_support = np.maximum(missing_map, extra_map) >= cfg.edge_reason_threshold
+    tearing_support = np.zeros_like(edge_support, dtype=bool)
+    if flow_discontinuity_map is not None:
+        tearing_support |= _crop(flow_discontinuity_map, box) >= 0.60
+    if mask_gradient_map is not None:
+        tearing_support |= _crop(mask_gradient_map, box) >= 0.60
+    tearing_overlap = float(
+        np.logical_and(edge_support, tearing_support).sum()
+        / max(1, int(edge_support.sum()))
+    )
+    if (
+        edge_error >= cfg.edge_reason_threshold
+        and tearing_overlap >= cfg.tearing_overlap_threshold
+    ):
         labels.append("edge_tearing")
     if temporal_error is not None and float(temporal_error) >= cfg.flicker_threshold:
         labels.append("flicker")
@@ -462,6 +512,7 @@ def _diagnose_region(
         "endpoint_copy_distance": (
             float(endpoint_copy_distance) if endpoint_copy_distance is not None else -1.0
         ),
+        "tearing_overlap": tearing_overlap,
         "p_solvable": solvability.p_solvable,
     }
     if priority_metrics:
@@ -506,6 +557,10 @@ def diagnose_sample(
     warp_blend: Any | None = None,
     img0: Any | None = None,
     img1: Any | None = None,
+    flow_t0: Any | None = None,
+    flow_t1: Any | None = None,
+    mask0: Any | None = None,
+    mask1: Any | None = None,
     regions: Sequence[RegionBox | Sequence[int]] | None = None,
     temporal_error: float | None = None,
     scoring_config: Any | None = None,
@@ -525,6 +580,26 @@ def diagnose_sample(
         img1=img1 if img0 is not None and img1 is not None else None,
     )
     height, width = scoring.maps.structure.shape
+    flow_maps = [
+        support
+        for support in (
+            _gradient_support_map(flow_t0, shape=(height, width)),
+            _gradient_support_map(flow_t1, shape=(height, width)),
+        )
+        if support is not None
+    ]
+    mask_maps = [
+        support
+        for support in (
+            _gradient_support_map(mask0, shape=(height, width)),
+            _gradient_support_map(mask1, shape=(height, width)),
+        )
+        if support is not None
+    ]
+    flow_discontinuity_map = (
+        np.maximum.reduce(flow_maps) if flow_maps else None
+    )
+    mask_gradient_map = np.maximum.reduce(mask_maps) if mask_maps else None
     source_regions: Sequence[RegionBox | Sequence[int]]
     source_regions = scoring.regions if regions is None else regions
     boxes = tuple(_normalize_box(region, (height, width)) for region in source_regions)
@@ -544,6 +619,8 @@ def diagnose_sample(
             warp_blend=warp_blend,
             img1=img1,
             temporal_error=temporal_error,
+            flow_discontinuity_map=flow_discontinuity_map,
+            mask_gradient_map=mask_gradient_map,
             priority_metrics=region_priority,
             cfg=cfg,
         )

@@ -65,10 +65,74 @@ def colorize_flow(flow: np.ndarray) -> np.ndarray:
     return result
 
 
-def _fit_panel(array: np.ndarray, width: int) -> Image.Image:
+def _fit_panel(array: np.ndarray, width: int, height: int) -> Image.Image:
     image = Image.fromarray(_rgb_uint8(array))
-    height = max(1, round(image.height * width / image.width))
     return image.resize((width, height), Image.Resampling.BILINEAR)
+
+
+def _normalized_heatmaps(*maps: np.ndarray) -> tuple[np.ndarray, ...]:
+    values = [np.asarray(item, dtype=np.float32) for item in maps]
+    finite_parts = [
+        item[np.isfinite(item)].reshape(-1) for item in values if item.size
+    ]
+    if not finite_parts:
+        raise ValueError("CGVQM heatmaps do not contain finite values")
+    finite = np.concatenate(finite_parts)
+    if not finite.size:
+        raise ValueError("CGVQM heatmaps do not contain finite values")
+    scale = max(float(np.quantile(np.maximum(finite, 0.0), 0.995)), 1e-8)
+    return tuple(np.clip(np.nan_to_num(item, nan=0.0) / scale, 0.0, 1.0) for item in values)
+
+
+def _region_boxes(regions: Iterable[Any]) -> tuple[tuple[int, int, int, int], ...]:
+    boxes: list[tuple[int, int, int, int]] = []
+    for region in regions:
+        getter = (
+            (lambda key: region[key])
+            if isinstance(region, dict)
+            else (lambda key: getattr(region, key))
+        )
+        try:
+            boxes.append(
+                tuple(int(getter(key)) for key in ("x0", "y0", "x1", "y1"))
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return tuple(boxes)
+
+
+def _labeled_panel(
+    array: np.ndarray,
+    *,
+    label: str,
+    width: int,
+    image_height: int,
+    boxes: Iterable[tuple[int, int, int, int]] = (),
+    source_shape: tuple[int, int] | None = None,
+) -> Image.Image:
+    label_height = 28
+    image = _fit_panel(array, width, image_height)
+    if source_shape is not None:
+        source_height, source_width = source_shape
+        draw = ImageDraw.Draw(image)
+        scale_x = width / max(1, source_width)
+        scale_y = image_height / max(1, source_height)
+        for x0, y0, x1, y1 in boxes:
+            draw.rectangle(
+                (
+                    round(x0 * scale_x),
+                    round(y0 * scale_y),
+                    round(x1 * scale_x),
+                    round(y1 * scale_y),
+                ),
+                outline=(255, 224, 64),
+                width=max(1, width // 240),
+            )
+    panel = Image.new("RGB", (width, label_height + image_height), (14, 18, 24))
+    panel.paste(image, (0, label_height))
+    draw = ImageDraw.Draw(panel)
+    draw.text((8, 7), label, fill=(244, 247, 252))
+    return panel
 
 
 def make_diagnostic_grid(
@@ -82,67 +146,84 @@ def make_diagnostic_grid(
     pred_only_edge: np.ndarray | None = None,
     flow_t0: np.ndarray | None = None,
     flow_t1: np.ndarray | None = None,
+    cgvqm_center: np.ndarray | None = None,
+    cgvqm_temporal: np.ndarray | None = None,
+    cgvqm_fused: np.ndarray | None = None,
     mask0: np.ndarray | None = None,
     mask1: np.ndarray | None = None,
     regions: Iterable[Any] = (),
     labels: Iterable[str] = (),
     panel_width: int = 320,
 ) -> np.ndarray:
-    """Build a two-row global diagnostic plus top local GT/pred crops."""
-    top_arrays = [img0, gt, prediction, img1]
-    edge = np.zeros_like(np.asarray(error_map), dtype=np.float32)
-    if gt_only_edge is not None:
-        edge += np.asarray(gt_only_edge, dtype=np.float32)
-    if pred_only_edge is not None:
-        edge -= np.asarray(pred_only_edge, dtype=np.float32)
-    edge_rgb = np.stack((np.clip(edge, 0, 1), np.zeros_like(edge), np.clip(-edge, 0, 1)), axis=-1)
-    diagnostic_arrays: list[np.ndarray] = [colorize_error(error_map), edge_rgb]
-    if flow_t0 is not None:
-        diagnostic_arrays.append(colorize_flow(flow_t0))
-    elif mask0 is not None:
-        diagnostic_arrays.append(np.asarray(mask0))
-    else:
-        diagnostic_arrays.append(np.zeros_like(img0))
-    if flow_t1 is not None:
-        diagnostic_arrays.append(colorize_flow(flow_t1))
-    elif mask1 is not None:
-        diagnostic_arrays.append(np.asarray(mask1))
-    else:
-        diagnostic_arrays.append(np.zeros_like(img0))
-    rows: list[Image.Image] = []
-    for arrays in (top_arrays, diagnostic_arrays):
-        panels = [_fit_panel(array, panel_width) for array in arrays]
-        row_height = max(panel.height for panel in panels)
-        row = Image.new("RGB", (panel_width * 4, row_height), "black")
-        for index, panel in enumerate(panels):
-            row.paste(panel, (index * panel_width, 0))
-        rows.append(row)
-    local_panels: list[Image.Image] = []
-    for region in list(regions)[:4]:
-        getter = (lambda key: region[key]) if isinstance(region, dict) else (lambda key: getattr(region, key))
-        x0, y0, x1, y1 = (int(getter(key)) for key in ("x0", "y0", "x1", "y1"))
-        for array in (gt, prediction):
-            crop = np.asarray(array)[y0:y1, x0:x1]
-            if crop.size:
-                local_panels.append(_fit_panel(crop, panel_width // 2))
-    if local_panels:
-        local_height = max(panel.height for panel in local_panels)
-        local_row = Image.new("RGB", (panel_width * 4, local_height), "black")
-        x = 0
-        for panel in local_panels:
-            if x + panel.width > local_row.width:
-                break
-            local_row.paste(panel, (x, 0))
-            x += panel.width
-        rows.append(local_row)
-    header_height = 28
-    canvas = Image.new("RGB", (panel_width * 4, header_height + sum(row.height for row in rows)), "black")
-    draw = ImageDraw.Draw(canvas)
-    title = " | ".join(["img0", "GT", "prediction", "img1"])
-    reason_text = ", ".join(labels)
-    draw.text((8, 6), f"{title}    reasons: {reason_text}", fill="white")
-    y = header_height
-    for row in rows:
-        canvas.paste(row, (0, y))
-        y += row.height
+    """Build the fixed two-row by five-column diagnostic contract."""
+
+    base = np.asarray(img0)
+    if base.ndim != 3:
+        raise ValueError("img0 must be HxWxC")
+    source_shape = (int(base.shape[0]), int(base.shape[1]))
+    image_height = max(1, round(source_shape[0] * panel_width / source_shape[1]))
+    boxes = _region_boxes(regions)
+    if flow_t0 is None:
+        flow_t0 = np.zeros((*source_shape, 2), dtype=np.float32)
+    if flow_t1 is None:
+        flow_t1 = np.zeros((*source_shape, 2), dtype=np.float32)
+    missing_cgvqm = (
+        cgvqm_center is None or cgvqm_temporal is None or cgvqm_fused is None
+    )
+    if missing_cgvqm:
+        zeros = np.zeros(source_shape, dtype=np.float32)
+        cgvqm_center, cgvqm_temporal, cgvqm_fused = zeros, zeros, zeros
+    normalized_cgvqm = _normalized_heatmaps(
+        np.asarray(cgvqm_center),
+        np.asarray(cgvqm_temporal),
+        np.asarray(cgvqm_fused),
+    )
+    reason_text = ", ".join(str(item) for item in labels)
+    structure_label = "structure error"
+    if reason_text:
+        structure_label += f" · {reason_text[:48]}"
+    rows = (
+        (
+            (img0, "img0", True),
+            (gt, "GT", True),
+            (prediction, "prediction", True),
+            (img1, "img1", True),
+            (colorize_error(error_map), structure_label, True),
+        ),
+        (
+            (colorize_flow(flow_t0), "flow_t0", True),
+            (colorize_flow(flow_t1), "flow_t1", True),
+            (colorize_error(normalized_cgvqm[0]), "CGVQM center error", False),
+            (
+                colorize_error(normalized_cgvqm[1]),
+                "CGVQM temporal sensitivity",
+                False,
+            ),
+            (
+                colorize_error(normalized_cgvqm[2]),
+                "CGVQM fused confidence",
+                False,
+            ),
+        ),
+    )
+    panel_height = image_height + 28
+    canvas = Image.new(
+        "RGB",
+        (panel_width * 5, panel_height * 2),
+        (0, 0, 0),
+    )
+    for row_index, row_items in enumerate(rows):
+        for column_index, (array, label, show_boxes) in enumerate(row_items):
+            panel = _labeled_panel(
+                np.asarray(array),
+                label=label,
+                width=panel_width,
+                image_height=image_height,
+                boxes=boxes if show_boxes else (),
+                source_shape=source_shape if show_boxes else None,
+            )
+            canvas.paste(
+                panel,
+                (column_index * panel_width, row_index * panel_height),
+            )
     return np.asarray(canvas)

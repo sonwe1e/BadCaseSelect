@@ -31,3 +31,18 @@ def test_uint8_cache_form_round_trips_bit_identical_to_read_rgb01(tmp_path):
     assert cached.flags["C_CONTIGUOUS"]
     np.testing.assert_array_equal(cached, array)
     np.testing.assert_array_equal(rgb_uint8_to_float32(cached), read_rgb01(path))
+
+
+def test_jpeg_writer_honors_high_quality_444_output(tmp_path):
+    from PIL import Image, JpegImagePlugin
+
+    array = np.zeros((24, 32, 3), dtype=np.uint8)
+    array[:, :16] = (255, 64, 16)
+    path = tmp_path / "diagnostic.jpg"
+
+    write_image_atomic(path, array, quality=92, subsampling=0)
+
+    with Image.open(path) as restored:
+        assert restored.format == "JPEG"
+        assert restored.size == (32, 24)
+        assert JpegImagePlugin.get_sampling(restored) == 0

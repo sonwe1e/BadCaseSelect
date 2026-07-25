@@ -125,6 +125,31 @@ def _safe_destination(root: Path, relative: str) -> Path:
     return destination
 
 
+def _load_cgvqm_maps(record: Mapping[str, Any]) -> tuple[np.ndarray, ...] | None:
+    evidence = record.get("cgvqm")
+    if evidence is None:
+        return None
+    if not isinstance(evidence, Mapping):
+        raise ValueError(f"invalid CGVQM evidence for {record.get('sample_id')}")
+    artifact = Path(str(evidence.get("artifact_path", ""))).expanduser().resolve()
+    if not artifact.is_file():
+        raise FileNotFoundError(
+            f"CGVQM diagnostic artifact is missing for "
+            f"{record.get('sample_id')}: {artifact}"
+        )
+    with np.load(artifact, allow_pickle=False) as payload:
+        required = ("center", "temporal", "fused")
+        missing = [name for name in required if name not in payload]
+        if missing:
+            raise ValueError(
+                f"CGVQM artifact {artifact} is missing arrays: {missing}"
+            )
+        maps = tuple(np.asarray(payload[name], dtype=np.float32) for name in required)
+    if any(value.ndim != 2 or not np.isfinite(value).all() for value in maps):
+        raise ValueError(f"CGVQM artifact contains invalid heatmaps: {artifact}")
+    return maps
+
+
 def _finish_batch_diagnostics(
     items: Sequence[tuple[Mapping[str, Any], np.ndarray, np.ndarray, np.ndarray]],
     reconstructed: ReconstructionResult,
@@ -136,6 +161,14 @@ def _finish_batch_diagnostics(
     for index, (record, img0, gt, img1) in enumerate(items):
         prediction = _hwc(reconstructed.prediction[index])
         scoring = score_local_errors(prediction, gt, config.thresholds)
+        cgvqm_maps = _load_cgvqm_maps(record)
+        if config.output.layout == "graded_flat" and cgvqm_maps is None:
+            raise RuntimeError(
+                f"graded diagnostic lacks CGVQM maps for {record.get('sample_id')}"
+            )
+        if cgvqm_maps is None:
+            empty = np.zeros(scoring.maps.structure.shape, dtype=np.float32)
+            cgvqm_maps = (empty, empty, empty)
         grid = make_diagnostic_grid(
             img0,
             gt,
@@ -146,6 +179,9 @@ def _finish_batch_diagnostics(
             pred_only_edge=scoring.maps.pred_only_edges,
             flow_t0=_hwc(reconstructed.flow_t0[index]),
             flow_t1=_hwc(reconstructed.flow_t1[index]),
+            cgvqm_center=cgvqm_maps[0],
+            cgvqm_temporal=cgvqm_maps[1],
+            cgvqm_fused=cgvqm_maps[2],
             mask0=_hwc(reconstructed.mask0[index]),
             mask1=_hwc(reconstructed.mask1[index]),
             regions=_region_boxes(record),
@@ -154,12 +190,25 @@ def _finish_batch_diagnostics(
         )
         relative = str(record["diagnostic_relative"])
         destination = _safe_destination(artifact_root, relative)
-        write_image_atomic(destination, grid)
+        is_jpeg = destination.suffix.lower() in {".jpg", ".jpeg"}
+        write_image_atomic(
+            destination,
+            grid,
+            quality=config.output.visualization_quality if is_jpeg else None,
+            subsampling=0 if is_jpeg else None,
+        )
         results.append(
             {
                 "sample_id": str(record["sample_id"]),
                 "artifact_path": str(destination),
                 "visualization_relative": Path(relative).as_posix(),
+                "format": "JPEG" if is_jpeg else "PNG",
+                "quality": (
+                    config.output.visualization_quality if is_jpeg else None
+                ),
+                "subsampling": "4:4:4" if is_jpeg else None,
+                "width": int(grid.shape[1]),
+                "height": int(grid.shape[0]),
             }
         )
     return results

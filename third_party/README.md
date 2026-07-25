@@ -10,12 +10,13 @@ model weights, and their license texts. Runtime code must never download assets.
 - `licenses/`: corresponding license texts.
 - `manifest.json`: source, version, license, path, size, and SHA-256 for every distributable external asset.
 
-The prepared manifest contains the pinned source archives, licenses, optional
-research weights, a pure project wheel, and manylinux2014 aarch64 NumPy/Pillow
-wheels for CPython 3.10, 3.11, and 3.12.  FLIP, CGVQM, and DINOv2 are not
-imported by the current mining baseline.  Add the real current/teacher VFI
-checkpoints only after the target CANN/Python/torch_npu tuple is known, and
-never copy x86_64 wheels into `linux-aarch64`.
+The prepared manifest contains the pinned source archives, licenses, CGVQM-2
+calibration, the torchvision Kinetics R3D-18 backbone, a pure project wheel,
+and manylinux2014 aarch64 NumPy/Pillow wheels for CPython 3.10, 3.11, and 3.12.
+CGVQM-2 is used at runtime for candidate-only deep temporal refinement; FLIP
+and DINOv2 remain research assets. Add the real current/teacher VFI checkpoints
+only after the target CANN/Python/torch_npu tuple is known, and never copy
+x86_64 wheels into `linux-aarch64`.
 
 Offline archives use the manifest as a closed allow-list for `third_party/`
 and `ckpts/`.  The local extracted `src/` trees are inspection workspaces and

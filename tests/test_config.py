@@ -205,3 +205,29 @@ def test_per_video_materialization_requires_segment_relative_without_teacher(tmp
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="does not support teacher"):
         load_config(path)
+
+
+def test_graded_flat_requires_cgvqm_and_byte_copy(tmp_path):
+    payload = _payload(tmp_path)
+    payload["output"] = {
+        "layout": "graded_flat",
+        "link_mode": "hardlink_then_copy",
+    }
+    path = tmp_path / "graded.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="requires output.link_mode='copy'"):
+        load_config(path)
+
+    payload["output"]["link_mode"] = "copy"
+    with pytest.raises(ValueError, match="requires cgvqm.enabled=true"):
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        load_config(path)
+
+    payload["cgvqm"] = {
+        "enabled": True,
+        "spatial_overlap_at": 0.4,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    config = load_config(path)
+    assert config.output.layout == "graded_flat"
+    assert config.cgvqm.spatial_overlap_at == 0.4

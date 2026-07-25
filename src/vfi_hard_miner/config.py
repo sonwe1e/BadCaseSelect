@@ -23,6 +23,7 @@ class DataConfig:
     excluded_dirs: tuple[str, ...] = (
         "extremely_hard_case",
         "extremely_hard_case_visualization",
+        ".vfi_hard_miner_staging",
         ".git",
     )
 
@@ -69,6 +70,46 @@ class ModelConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CGVQMConfig:
+    enabled: bool = False
+    backbone_checkpoint: str = (
+        "third_party/weights/cgvqm/r3d_18-b3b3357e.pth"
+    )
+    calibration_checkpoint: str = "third_party/weights/cgvqm/cgvqm-2.pickle"
+    backend: Literal["auto", "cpu", "cuda", "npu"] = "auto"
+    allow_cpu_fallback: bool = True
+    clip_frames: int = 16
+    crop_size: int = 224
+    batch_size: int = 1
+    candidates_per_task: int = 32
+    b_error_at: float = 25.0
+    a_error_at: float = 50.0
+    temporal_persistence_at: float = 0.35
+    spatial_overlap_at: float = 0.35
+    flicker_change_at: float = 10.0
+
+    def validate(self) -> None:
+        if not self.backbone_checkpoint or not self.calibration_checkpoint:
+            raise ValueError("cgvqm checkpoint paths must not be empty")
+        if self.clip_frames < 3:
+            raise ValueError("cgvqm.clip_frames must be >= 3")
+        if self.crop_size < 32:
+            raise ValueError("cgvqm.crop_size must be >= 32")
+        if self.batch_size < 1 or self.candidates_per_task < 1:
+            raise ValueError("cgvqm batch/task values must be positive")
+        if not 0.0 <= self.b_error_at <= self.a_error_at <= 100.0:
+            raise ValueError(
+                "cgvqm thresholds must satisfy 0 <= b_error_at <= a_error_at <= 100"
+            )
+        if not 0.0 <= self.temporal_persistence_at <= 1.0:
+            raise ValueError("cgvqm.temporal_persistence_at must be in [0,1]")
+        if not 0.0 <= self.spatial_overlap_at <= 1.0:
+            raise ValueError("cgvqm.spatial_overlap_at must be in [0,1]")
+        if not 0.0 <= self.flicker_change_at <= 100.0:
+            raise ValueError("cgvqm.flicker_change_at must be in [0,100]")
+
+
+@dataclass(frozen=True, slots=True)
 class ThresholdConfig:
     reject_scene_cut: float = 0.62
     reject_duplicate: float = 0.002
@@ -90,6 +131,7 @@ class ThresholdConfig:
     unexplained_motion_reject_at: float = 0.70
     wrong_reject_below: float = 0.20
     wrong_accept_at: float = 0.45
+    severe_wrong_accept_at: float = 0.70
     solvable_reject_below: float = 0.30
     solvable_accept_at: float = 0.55
     edge_threshold: float = 0.12
@@ -128,6 +170,7 @@ class ThresholdConfig:
             "unexplained_motion_reject_at",
             "wrong_reject_below",
             "wrong_accept_at",
+            "severe_wrong_accept_at",
             "solvable_reject_below",
             "solvable_accept_at",
             "edge_threshold",
@@ -203,6 +246,10 @@ class ThresholdConfig:
                 )
         if self.wrong_accept_at < self.wrong_reject_below:
             raise ValueError("wrong accept threshold must be >= reject threshold")
+        if self.severe_wrong_accept_at < self.wrong_accept_at:
+            raise ValueError(
+                "severe wrong threshold must be >= wrong accept threshold"
+            )
         if self.solvable_accept_at < self.solvable_reject_below:
             raise ValueError("solvable accept threshold must be >= reject threshold")
         if self.min_region_pixels < 1 or self.max_regions < 1:
@@ -258,12 +305,13 @@ class OutputConfig:
     visualization_dir: str = "extremely_hard_case_visualization"
     manifest_name: str = "hard_case_manifest.jsonl"
     link_mode: Literal["hardlink_then_copy", "copy"] = "hardlink_then_copy"
-    layout: Literal["segment_relative", "preserve_relative", "flat"] = (
-        "segment_relative"
-    )
+    layout: Literal[
+        "graded_flat", "segment_relative", "preserve_relative", "flat"
+    ] = "segment_relative"
     materialize_strategy: Literal["finalize", "per_video"] = "finalize"
     save_review: bool = False
-    visualization_width: int = 320
+    visualization_width: int = 480
+    visualization_quality: int = 92
 
     def validate(self) -> None:
         for value in (self.hard_case_dir, self.visualization_dir, self.manifest_name):
@@ -271,6 +319,10 @@ class OutputConfig:
                 raise ValueError("output paths must be non-empty relative paths")
         if self.visualization_width < 64:
             raise ValueError("output.visualization_width must be >= 64")
+        if not 1 <= self.visualization_quality <= 100:
+            raise ValueError("output.visualization_quality must be in [1,100]")
+        if self.layout == "graded_flat" and self.link_mode != "copy":
+            raise ValueError("output.layout='graded_flat' requires output.link_mode='copy'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +330,7 @@ class AppConfig:
     data: DataConfig
     model: ModelConfig
     teacher: ModelConfig | None = None
+    cgvqm: CGVQMConfig = field(default_factory=CGVQMConfig)
     thresholds: ThresholdConfig = field(default_factory=ThresholdConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -287,16 +340,22 @@ class AppConfig:
         self.model.validate()
         if self.teacher is not None:
             self.teacher.validate()
+        self.cgvqm.validate()
         self.thresholds.validate()
         self.runtime.validate()
         self.output.validate()
+        if self.output.layout == "graded_flat" and not self.cgvqm.enabled:
+            raise ValueError(
+                "output.layout='graded_flat' requires cgvqm.enabled=true so only "
+                "deep-model-confirmed samples enter A/B"
+            )
         if self.output.materialize_strategy == "per_video":
-            if self.output.layout != "segment_relative":
+            if self.output.layout not in ("segment_relative", "graded_flat"):
                 raise ValueError(
                     "output.materialize_strategy='per_video' requires "
-                    "output.layout='segment_relative'"
+                    "output.layout='segment_relative' or 'graded_flat'"
                 )
-            if self.teacher is not None:
+            if self.output.layout == "segment_relative" and self.teacher is not None:
                 raise ValueError(
                     "output.materialize_strategy='per_video' does not support teacher"
                 )

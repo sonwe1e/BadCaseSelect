@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from PIL import Image
 
+import vfi_hard_miner.cli as cli_module
+from vfi_hard_miner.config import AppConfig, CGVQMConfig, DataConfig, ModelConfig, OutputConfig
 from vfi_hard_miner.cli import main
 
 
@@ -57,3 +60,24 @@ def test_cli_resource_verification_checks_bundle_prerequisites(tmp_path, capsys)
 
     assert main(["verify-bundle", "--project-root", str(root), "--resources-only"]) == 2
     assert "requirements-build.lock" in capsys.readouterr().err
+
+
+def test_run_executes_cgvqm_between_main_and_finalize(tmp_path, monkeypatch):
+    config = AppConfig(
+        data=DataConfig(root=str(tmp_path)),
+        model=ModelConfig(factory="mock"),
+        cgvqm=CGVQMConfig(enabled=True),
+        output=OutputConfig(layout="graded_flat", link_mode="copy"),
+    )
+    calls = []
+    monkeypatch.setattr(cli_module, "load_config", lambda path: config)
+    monkeypatch.setattr(cli_module, "build_run_index", lambda cfg: calls.append("index"))
+    monkeypatch.setattr(cli_module, "run_main_stage", lambda path: calls.append("main"))
+    monkeypatch.setattr(cli_module, "run_cgvqm_stage", lambda path: calls.append("cgvqm"))
+    monkeypatch.setattr(cli_module, "finalize_run", lambda path: calls.append("finalize"))
+
+    cli_module._dispatch(
+        SimpleNamespace(command="run", config=tmp_path / "config.json")
+    )
+
+    assert calls == ["index", "main", "cgvqm", "finalize"]

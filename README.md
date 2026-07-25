@@ -1,6 +1,6 @@
 # VFI Hard Miner
 
-面向游戏插帧模型的离线困难样本挖掘工具。它扫描一个游戏中的连续帧，用当前模型重建中间帧，筛选“数据有效、局部错误明显、模型理论上可解”的样本，并把相邻或重叠的困难 triplet 合并为连续原始帧片段。
+面向游戏插帧模型的离线困难样本挖掘工具。它扫描连续帧，用当前模型重建中间帧，通过传统局部结构误差和 CGVQM-2 深度时空复核筛选高质量训练样本，并把每个困难中心对应的三张原始帧平铺复制到 A/B 目录。
 
 ## 当前基线
 
@@ -9,11 +9,15 @@
 - flow 上采样及像素尺度修正、backward warp 和两级 mask 融合默认在加速设备上以 FP32 完成（`runtime.reconstruction: "auto"`，启动时探测 `grid_sample` 能力）；设 `"cpu"` 回退 CPU FP32 参考实现（校准基线，与旧版本逐操作一致）。加速设备路径与 CPU 参考仅有 fp32 级舍入差异。
 - GT 决定“是否做错”；原生分辨率 RGB/亮度差、Sobel 边缘差、局部连通区域、多尺度窗口和小面积高峰共同生成 `p_wrong`。
 - `p_wrong` 保留原始 GT 误差；贴边、端点近似静态且文字/图标式高边缘密度的区域会得到较低 `priority_weight`，另算 `mining_p_wrong` 参与入选，中央人物/武器结构和非 UI 候选仍保留名额。
+- 传统评分先做高召回定位；冻结 R3D-18 的 CGVQM-2 只处理候选的连续 16 帧窗口，输出中心感知误差、时间敏感度、持续性和空间重合证据。传统与 CGVQM 冲突的样本只进入 Review。
 - 可选 teacher 和 best-of-warp 分支只估计 `p_solvable`，teacher 做错不会把源 triplet 判为无效。
 - 主挖掘和最终诊断均可使用 CPU、CUDA 或多个独立 `torch_npu` worker；NPU 模式不使用 DDP/HCCL。
-- 最终输出包含连续原始帧、诊断拼图、完整 JSONL manifest、分段记录和可恢复 SQLite 状态。默认每个合并 segment 独占一个叶目录并保留原文件名；`finalize` 会按配置的命名规则和 stride 重扫落盘结果。训练器必须把每个叶目录视为一个独立视频，不能跨叶目录拼 triplet。
+- A 表示明显的大幅运动/结构劣化，B 表示确定但较轻的劣化；阈值灰区只写 Review。A/B 内不建立视频、segment 或数字编号子目录，文件 basename 原样保留。
+- 训练帧始终按原文件字节复制并校验 SHA-256；诊断图单独使用 2×5、每格 480 px、quality 92 的 JPEG，不会进入训练数据。
 
-FLIP、CGVQM 和 DINOv2 的源码/权重目前只是离线储备，方便后续对照实验或人工复核研究。当前基线运行时不会导入它们，它们也不参与 `p_wrong`、`p_solvable` 或 `accept/review/reject` 判定；缺少这些模型不会触发另一套静默评分逻辑。
+完整的算法、质量门、八类劣化原因、A/B 判定公式和输出示例见自包含文档 [`method.html`](method.html)。
+
+FLIP 和 DINOv2 仍是离线研究储备；CGVQM-2 已正式接入候选精判。缺少 R3D 主干或 CGVQM 校准权重会明确失败，不会静默退化为仅像素评分。
 
 ## 运行前提
 
@@ -33,7 +37,8 @@ cp configs/example.json configs/my_game.json
 - `model.factory` 指向实际适配器的 `module:function`。
 - `model.checkpoint` 指向已经存在的当前模型权重。
 - `runtime.run_dir` 使用本次实验独立目录。
-- NPU 生产配置使用 `backend: "npu"`、设备 `0..7`、`workers: 8` 和 `precision: "float32"`。吞吐调优项：`runtime.postproc_workers`（CPU 评分线程数，0 为自动）、`runtime.postproc_buffer_mb`（每 worker 在途重建结果的内存预算，默认 1024 MB）、`runtime.decode_cache_mb`（uint8 帧缓存上限）、`runtime.reconstruction`（重建设备，默认 `"auto"`）和 `model.batch_size`。模型 batch 与重建/CPU 后处理微批次相互独立，大 batch 不会再把多个完整的全分辨率结果无限堆入 Future 队列。
+- NPU 生产配置使用 `backend: "npu"`、设备 `0..7`、`workers: 8`、`precision: "float32"` 和 `model.batch_size: 64`。吞吐调优项：`runtime.postproc_workers`（CPU 评分线程数，0 为自动）、`runtime.postproc_buffer_mb`（每 worker 在途重建结果的内存预算，默认 1024 MB）、`runtime.decode_cache_mb`（uint8 帧缓存上限）和 `runtime.reconstruction`。模型 batch 与重建/CPU 后处理微批次相互独立。
+- `cgvqm.backbone_checkpoint` 和 `cgvqm.calibration_checkpoint` 指向离线包中已登记的 R3D-18 与 CGVQM-2 权重；A3 Conv3D 不可用时，只有 `allow_cpu_fallback=true` 才会明确记录并回退 CPU。
 
 工具不会猜测 checkpoint key、网络输出顺序或 `mask0` 方向；接入契约见 `docs/model_adapter.md`。  
 配置字段的详细说明见 `configs/example.jsonc`（JSONC 格式，VS Code 可渲染内联注释，运行时不能直接加载）：
@@ -117,24 +122,18 @@ python scripts/probe_ascend.py --require-devices 8 --strict \
   > runs/game_name/runtime_probe.json
 ```
 
-随后执行：
+随后只需执行：
 
 ```bash
-vfi-hard-miner index --config configs/my_game.json
-vfi-hard-miner mine --config configs/my_game.json
-# 仅当配置了 teacher 时执行：
-vfi-hard-miner teacher --config configs/my_game.json
-vfi-hard-miner finalize --config configs/my_game.json
+vfi-hard-miner run --config configs/my_game.json
 ```
 
-也可以用 `vfi-hard-miner run --config configs/my_game.json` 串行执行 index、main、可选 teacher 和 finalize。没有实际模型时可使用项目 mock 适配器和合成数据做 smoke test，但它只能验证流水线，不能代表困难样本质量。
+`run` 内部依次完成 index、main、可选 teacher、CGVQM 分级和 finalize。`index`、`mine`、`teacher`、`cgvqm`、`finalize` 命令仍保留用于故障恢复，但不再要求日常手动编排。没有实际模型时可使用项目 mock 适配器和合成数据做 smoke test，但它只能验证流水线，不能代表困难样本质量。
 
-需要在长时间运行中提前查看已完成视频的原始困难帧时，可设置
-`output.materialize_strategy: "per_video"`。该模式要求
-`output.layout: "segment_relative"` 且首版不支持 teacher；`mine` 会在一个视频的
-全部 chunk 完成后，将其原子物化到
-`data.root/.vfi_hard_miner_staging/<execution_id>/hard_case`。中间目录只供人工查看，
-`finalize` 会复用这些帧并在诊断与 manifest 完成后统一切换正式输出目录。
+示例配置使用 `output.layout: "graded_flat"`、`link_mode: "copy"` 和
+`materialize_strategy: "per_video"`。一个视频的 CGVQM 任务完成后，A/B 原始帧立即写入
+`data.root/.vfi_hard_miner_staging/<execution_id>/hard_case/A|B`。中间目录只供人工查看；
+`finalize` 会验证并复用这些帧，不执行第二次完整复制，最后统一原子切换正式目录。
 
 ## Execution snapshot
 
@@ -142,6 +141,7 @@ vfi-hard-miner finalize --config configs/my_game.json
 
 - 配置哈希和索引内容摘要；索引记录包含帧路径、编号、文件大小和 `mtime_ns`。
 - 当前模型及可选 teacher checkpoint 的绝对路径、字节数和 SHA-256。
+- 启用 CGVQM 时，R3D 主干与 CGVQM-2 校准权重的绝对路径、字节数和 SHA-256。
 - 可定位时的模型工厂模块源文件 SHA-256。
 - `vfi_hard_miner` Python 源码树摘要。
 - 由上述内容生成的 `execution_id`。
@@ -150,12 +150,12 @@ vfi-hard-miner finalize --config configs/my_game.json
 
 ## 8 卡最终诊断
 
-困难片段合并后，`finalize` 会自动启动诊断阶段，无需单独的 CLI 命令：
+CGVQM 分级完成后，`finalize` 会自动启动诊断阶段，无需单独的 CLI 命令：
 
-- 仅为入选困难中心生成诊断图；`output.save_review=true` 时也包括 review 样本。
+- 仅为 A/B 困难中心生成诊断图；`output.save_review=true` 时也包括具有完整 CGVQM 证据的 Review 样本。
 - 任务会动态切成足够多的小块，最多启动 `runtime.workers` 个独立设备进程；8 卡配置下最多一张卡一个 worker，任务不足时自动减少 worker 数。
 - 每个 worker 只绑定自己的 NPU，并只加载一次当前模型；图片解码、NPU 推理+重建（默认在卡上，见 `runtime.reconstruction`）和 CPU 评分/拼图通过预取流水线重叠，多个 CPU 后处理线程（`runtime.postproc_workers`）并发消费重建结果。
-- 诊断任务使用独立 SQLite 状态、后台 lease heartbeat、attempt-scoped part 和 artifact 目录。过期、失败或产物缺失的任务可在重跑时恢复，过期 attempt 不会覆盖 winning attempt。
+- CGVQM 和诊断任务各自使用独立 SQLite 状态、后台 lease heartbeat、attempt-scoped part 和 artifact 目录。过期、失败或产物缺失的任务可在重跑时恢复，过期 attempt 不会覆盖 winning attempt。
 
 最终诊断仍要求经过校准的 FP32 基线；Windows/CUDA 结果只能用于通用功能与数值检查，不能代替 Ascend 910B 上的算子和吞吐验证。
 

@@ -72,6 +72,17 @@ def link_or_copy(source: str | Path, destination: str | Path, *, mode: LinkMode)
             raise ValueError(f"unknown link mode: {mode}")
         if method == "copy":
             shutil.copy2(source_path, temporary)
+            with temporary.open("r+b") as copied:
+                os.fsync(copied.fileno())
+        if destination_path.exists():
+            if destination_path.is_file() and _files_identical(
+                source_path, destination_path
+            ):
+                temporary.unlink(missing_ok=True)
+                return "existing"
+            raise OutputCollisionError(
+                f"destination appeared with different content: {destination_path}"
+            )
         os.replace(temporary, destination_path)
     finally:
         if temporary.exists():

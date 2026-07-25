@@ -15,6 +15,11 @@ from typing import Any, Mapping, Sequence
 
 from .config import AppConfig, load_config
 from .diagnostics import run_diagnostic_stage
+from .graded_materialization import (
+    GradedMaterializer,
+    plan_graded_mappings,
+)
+from .grading import TRAINING_GRADES
 from .indexing import build_index
 from .manifest import read_jsonl, write_jsonl_part
 from .materialization import IncrementalMaterializer
@@ -49,12 +54,22 @@ class FinalizeSummary:
     frames: int
     visualizations: int
     link_counts: dict[str, int]
+    grades: dict[str, int]
+    grade_frames: dict[str, int]
+    non_training_reasons: dict[str, int]
     manifest_path: Path
     segment_path: Path
 
 
 def _result_path(config: AppConfig) -> Path:
     run_dir = run_directory(config)
+    if config.output.layout == "graded_flat":
+        path = run_dir / "graded_results.jsonl"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"graded results are missing; run the CGVQM stage first: {path}"
+            )
+        return path
     if config.teacher is not None:
         path = run_dir / "teacher_results.jsonl"
         if not path.is_file():
@@ -588,6 +603,8 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
     _assert_stage_complete(config, "main")
     if config.teacher is not None:
         _assert_stage_complete(config, "teacher")
+    if config.output.layout == "graded_flat":
+        _assert_stage_complete(config, "cgvqm")
     records = list(read_jsonl(_result_path(config)))
     expected_hash = config.run_hash()
     expected_execution = execution_id(config)
@@ -632,8 +649,46 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
             record.get("regions", []), list
         ):
             raise RuntimeError(f"result reasons/regions schema is invalid for {sample_id}")
+    graded_layout = config.output.layout == "graded_flat"
+    if graded_layout:
+        allowed_grades = {"A", "B", "Review", "Reject"}
+        for record in records:
+            sample_id = str(record["sample_id"])
+            grade = str(record.get("grade", ""))
+            if grade not in allowed_grades:
+                raise RuntimeError(
+                    f"graded result has unknown grade {grade!r} for {sample_id}"
+                )
+            if grade in TRAINING_GRADES:
+                evidence = record.get("cgvqm")
+                if not isinstance(evidence, Mapping):
+                    raise RuntimeError(
+                        f"training grade {grade} lacks CGVQM evidence for {sample_id}"
+                    )
+                artifact = Path(str(evidence.get("artifact_path", "")))
+                if not artifact.is_file():
+                    raise RuntimeError(
+                        f"CGVQM artifact is missing for {sample_id}: {artifact}"
+                    )
+
     incremental_materializer: IncrementalMaterializer | None = None
-    if config.output.materialize_strategy == "per_video":
+    graded_materializer: GradedMaterializer | None = None
+    segment_mappings: list[tuple[Path, Path]] = []
+    segment_output_directories: dict[str, str] = {}
+    graded_mappings: list[tuple[Path, Path]] = []
+    if graded_layout:
+        segments: tuple[FrameInterval, ...] = ()
+        if config.output.materialize_strategy == "per_video":
+            graded_materializer = GradedMaterializer(
+                config,
+                execution_id=expected_execution,
+                run_dir=run_directory(config),
+            )
+            graded_materializer.materialize_all(records)
+            graded_mappings = graded_materializer.final_plan(records)
+        else:
+            graded_mappings, _ = plan_graded_mappings(records)
+    elif config.output.materialize_strategy == "per_video":
         incremental_materializer = IncrementalMaterializer(
             config,
             execution_id=expected_execution,
@@ -652,8 +707,6 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
             min_length=3,
         )
         segments = _retain_segments_with_hard_centers(segments, records)
-        segment_mappings = []
-        segment_output_directories = {}
     data_root = Path(config.data.root).expanduser().resolve()
     hard_root, visualization_root = _checked_output_roots(config, data_root)
     manifest_path = (data_root / config.output.manifest_name).resolve()
@@ -664,7 +717,9 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
     if manifest_path == data_root or hard_root in manifest_path.parents or visualization_root in manifest_path.parents:
         raise ValueError("manifest must be outside the generated frame and visualization trees")
     frame_lookup = _frame_lookup(index_records)
-    if (
+    if graded_layout:
+        sources = list(dict.fromkeys(source for source, _ in graded_mappings))
+    elif (
         incremental_materializer is None
         and segments
         and config.output.layout == "segment_relative"
@@ -688,28 +743,54 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
     selected: list[dict[str, Any]] = []
     diagnostic_inputs: list[dict[str, Any]] = []
     for record in records:
-        matching = _matching_segment_ids(record, segments_by_video)
         updated = dict(record)
-        is_hard_center = str(record.get("status", "")) in HARD_STATUSES
-        updated["covered_by_segment"] = bool(matching)
-        updated["contributed_to_segment"] = str(record["sample_id"]) in contributed_by_sample
-        updated["selected"] = bool(matching) and is_hard_center
-        updated["segment_ids"] = matching
-        updated["segment_output_directories"] = [
-            segment_output_directories[segment_id]
-            for segment_id in matching
-            if segment_id in segment_output_directories
-        ]
-        updated["contributed_segment_ids"] = contributed_by_sample.get(
-            str(record["sample_id"]), []
-        )
+        if graded_layout:
+            matching: list[str] = []
+            updated["covered_by_segment"] = False
+            updated["contributed_to_segment"] = False
+            updated["selected"] = str(record.get("grade", "")) in TRAINING_GRADES
+            updated["segment_ids"] = []
+            updated["segment_output_directories"] = []
+            updated["contributed_segment_ids"] = []
+        else:
+            matching = _matching_segment_ids(record, segments_by_video)
+            is_hard_center = str(record.get("status", "")) in HARD_STATUSES
+            updated["covered_by_segment"] = bool(matching)
+            updated["contributed_to_segment"] = (
+                str(record["sample_id"]) in contributed_by_sample
+            )
+            updated["selected"] = bool(matching) and is_hard_center
+            updated["segment_ids"] = matching
+            updated["segment_output_directories"] = [
+                segment_output_directories[segment_id]
+                for segment_id in matching
+                if segment_id in segment_output_directories
+            ]
+            updated["contributed_segment_ids"] = contributed_by_sample.get(
+                str(record["sample_id"]), []
+            )
         updated["visualization"] = None
+        review_has_diagnostic_evidence = (
+            isinstance(record.get("cgvqm"), Mapping)
+            if graded_layout
+            else True
+        )
         should_visualize = bool(updated["selected"]) or (
-            config.output.save_review and record.get("status") == "review"
+            config.output.save_review
+            and review_has_diagnostic_evidence
+            and (
+                record.get("grade") == "Review"
+                if graded_layout
+                else record.get("status") == "review"
+            )
         )
         if should_visualize:
             relative_visualization = _safe_video_relative(str(record["video_id"]))
-            relative_visualization /= f"{record['sample_id']}.png"
+            relative_visualization /= (
+                f"{record['sample_id']}.jpg"
+                if graded_layout
+                else f"{record['sample_id']}.png"
+            )
             updated["diagnostic_relative"] = relative_visualization.as_posix()
             diagnostic_inputs.append(updated)
         selected.append(updated)
@@ -722,14 +803,15 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
     if len(diagnostic_by_sample) != len(diagnostic_inputs):
         raise RuntimeError("diagnostic stage did not return one result per requested sample")
 
-    if incremental_materializer is None:
+    durable_materializer = graded_materializer or incremental_materializer
+    if durable_materializer is None:
         staging_root = Path(
             tempfile.mkdtemp(prefix=f".vfi-finalize-{config.run_hash()}-", dir=data_root)
         )
         hard_staging = staging_root / "hard_case"
     else:
-        staging_root = incremental_materializer.generation_root
-        hard_staging = incremental_materializer.hard_staging
+        staging_root = durable_materializer.generation_root
+        hard_staging = durable_materializer.hard_staging
     visualization_staging = staging_root / "visualization"
     hard_staging.mkdir(parents=True, exist_ok=True)
     if visualization_staging.exists():
@@ -738,7 +820,18 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
     published = False
     try:
         segment_triplet_counts: dict[str, int] = {}
-        if config.output.layout == "segment_relative":
+        if graded_layout:
+            (hard_staging / "A").mkdir(parents=True, exist_ok=True)
+            (hard_staging / "B").mkdir(parents=True, exist_ok=True)
+            if graded_materializer is None:
+                link_counts = materialize_mapped_frames(
+                    graded_mappings,
+                    output_root=hard_staging,
+                    mode="copy",
+                )
+            else:
+                link_counts = graded_materializer.summary().copy_counts
+        elif config.output.layout == "segment_relative":
             if incremental_materializer is None:
                 link_counts = materialize_mapped_frames(
                     segment_mappings,
@@ -800,24 +893,63 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
                 if config.teacher is None
                 else _checkpoint_fingerprint(config.teacher.checkpoint)
             ),
+            "cgvqm": (
+                {
+                    "enabled": True,
+                    "backend": config.cgvqm.backend,
+                    "backbone": _checkpoint_fingerprint(
+                        config.cgvqm.backbone_checkpoint
+                    ),
+                    "calibration": _checkpoint_fingerprint(
+                        config.cgvqm.calibration_checkpoint
+                    ),
+                    "clip_frames": config.cgvqm.clip_frames,
+                    "crop_size": config.cgvqm.crop_size,
+                    "b_error_at": config.cgvqm.b_error_at,
+                    "a_error_at": config.cgvqm.a_error_at,
+                    "temporal_persistence_at": (
+                        config.cgvqm.temporal_persistence_at
+                    ),
+                    "spatial_overlap_at": config.cgvqm.spatial_overlap_at,
+                    "flicker_change_at": config.cgvqm.flicker_change_at,
+                }
+                if config.cgvqm.enabled
+                else {"enabled": False}
+            ),
             "runtime": _runtime_metadata(config),
         }
         for record in selected:
             record["run_metadata"] = metadata
 
-        segment_payload = [
-            {
-                **asdict(segment),
-                "segment_id": _segment_id(config.run_hash(), segment),
-                "output_directory": segment_output_directories.get(
-                    _segment_id(config.run_hash(), segment)
-                ),
-                "trainable_triplets": segment_triplet_counts.get(
-                    _segment_id(config.run_hash(), segment)
-                ),
-            }
-            for segment in segments
-        ]
+        if graded_layout:
+            segment_payload = [
+                {
+                    "sample_id": str(record["sample_id"]),
+                    "video_id": str(record["video_id"]),
+                    "frame_indices": list(record["frame_indices"]),
+                    "grade": str(record["grade"]),
+                    "training_frames": [
+                        f"{record['grade']}/{Path(str(record[role]['path'])).name}"
+                        for role in ("img0", "gt", "img1")
+                    ],
+                }
+                for record in selected
+                if str(record.get("grade", "")) in TRAINING_GRADES
+            ]
+        else:
+            segment_payload = [
+                {
+                    **asdict(segment),
+                    "segment_id": _segment_id(config.run_hash(), segment),
+                    "output_directory": segment_output_directories.get(
+                        _segment_id(config.run_hash(), segment)
+                    ),
+                    "trainable_triplets": segment_triplet_counts.get(
+                        _segment_id(config.run_hash(), segment)
+                    ),
+                }
+                for segment in segments
+            ]
         segment_path = run_directory(config) / "segments.json"
         segment_path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, segment_staging_name = tempfile.mkstemp(
@@ -856,24 +988,45 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
         # never repeats inference or materialization.  A successful publication
         # renames both staged children away and leaves only the owned parent.
         if staging_root.exists() and (
-            incremental_materializer is None or published
+            durable_materializer is None or published
         ):
             shutil.rmtree(staging_root)
-        elif incremental_materializer is not None:
+        elif durable_materializer is not None:
             if visualization_staging.exists():
                 shutil.rmtree(visualization_staging)
             (staging_root / "manifest.jsonl").unlink(missing_ok=True)
         if "segment_staging" in locals():
             segment_staging.unlink(missing_ok=True)
 
+    grade_counts = {
+        grade: sum(str(record.get("grade", "")) == grade for record in selected)
+        for grade in ("A", "B", "Review", "Reject")
+    }
+    grade_frames = {
+        grade: sum(relative.parts[0] == grade for _, relative in graded_mappings)
+        for grade in ("A", "B")
+    }
+    non_training_reasons: dict[str, int] = {}
+    for record in selected:
+        if str(record.get("grade", "")) not in {"Review", "Reject"}:
+            continue
+        reasons = list(record.get("grade_reasons", ()))
+        quality_gate = record.get("quality_gate")
+        if isinstance(quality_gate, Mapping):
+            reasons.extend(quality_gate.get("blocking_reasons", ()))
+        for reason in dict.fromkeys(str(item) for item in reasons):
+            non_training_reasons[reason] = non_training_reasons.get(reason, 0) + 1
     return FinalizeSummary(
         run_hash=config.run_hash(),
         source_records=len(records),
         accepted_records=sum(bool(record["selected"]) for record in selected),
         segments=len(segments),
-        frames=len(sources),
+        frames=len(graded_mappings) if graded_layout else len(sources),
         visualizations=visualization_count,
         link_counts=link_counts,
+        grades=grade_counts,
+        grade_frames=grade_frames,
+        non_training_reasons=dict(sorted(non_training_reasons.items())),
         manifest_path=manifest_path,
         segment_path=segment_path,
     )

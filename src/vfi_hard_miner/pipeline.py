@@ -154,6 +154,16 @@ def _execution_snapshot_payload(
         "teacher_checkpoint": (
             None if config.teacher is None else _checkpoint_snapshot(config.teacher.checkpoint)
         ),
+        "cgvqm_backbone_checkpoint": (
+            _checkpoint_snapshot(config.cgvqm.backbone_checkpoint)
+            if config.cgvqm.enabled
+            else None
+        ),
+        "cgvqm_calibration_checkpoint": (
+            _checkpoint_snapshot(config.cgvqm.calibration_checkpoint)
+            if config.cgvqm.enabled
+            else None
+        ),
         "current_factory_source": _factory_source_snapshot(config.model.factory),
         "teacher_factory_source": (
             None if config.teacher is None else _factory_source_snapshot(config.teacher.factory)
@@ -515,6 +525,7 @@ def run_main_stage(config_path: str | Path) -> MainStageSummary:
             index_records=index_records,
         )
         if config.output.materialize_strategy == "per_video"
+        and config.output.layout == "segment_relative"
         else None
     )
     if config.runtime.backend == "cpu":
