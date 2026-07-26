@@ -1899,11 +1899,18 @@ def _postproc_microbatch_size(
     scratch_channels: int = _MAIN_SCRATCH_CHANNELS,
     tiered: bool = False,
     mode: str = "full",
+    override: int = 0,
 ) -> int:
-    """Choose a slice whose complete Future reservation fits its fair share."""
+    """Choose a slice whose complete Future reservation fits its fair share.
+
+    When ``override > 0`` the auto-derived value is bypassed; the admission
+    gate in ``_process_payload_records`` still limits total in-flight bytes.
+    """
 
     if not items:
         raise ValueError("cannot size an empty postprocess batch")
+    if override > 0:
+        return min(len(items), override)
     per_future_budget = max(1, int(buffer_bytes) // max(1, int(postproc_workers)))
     single = _postproc_reservation(
         items,
@@ -2190,6 +2197,7 @@ def _process_payload_records(
                     buffer_bytes=postproc_buffer_bytes,
                     postproc_workers=postproc_workers,
                     mode=pack_mode,
+                    override=config.runtime.postproc_microbatch_size,
                 )
                 for start in range(0, len(items), microbatch_size):
                     end = min(len(items), start + microbatch_size)

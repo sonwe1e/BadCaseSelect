@@ -673,3 +673,60 @@ def test_concurrent_claim_loops_complete_tasks_exactly_once(tmp_path, monkeypatc
         "pending": 0,
         "running": 0,
     }
+
+
+def _index_record(sample_id, frame_indices):
+    """Bare index-triplet record — no regions key."""
+    return {"sample_id": sample_id, "frame_indices": tuple(frame_indices)}
+
+
+def test_union_crop_uses_source_regions_via_region_lookup():
+    """region_lookup supplies the real source records; context is index records."""
+    # Candidate box is in the top-left corner.
+    candidate = _index_record("c", (5, 6))
+    candidate_with_box = _record_with_box("c", (5, 6), (0, 0, 10, 10))
+
+    # Context neighbour has a box far from the candidate.
+    neighbour = _index_record("n0", (4, 5))
+    neighbour_with_box = _record_with_box("n0", (4, 5), (50, 50, 100, 100))
+
+    # All records in by_video_index are bare index records (no regions).
+    all_index = [neighbour, candidate]
+
+    # region_lookup maps sample_id → enriched source record.
+    lookup = {
+        "c": candidate_with_box,
+        "n0": neighbour_with_box,
+    }
+
+    clips = stage_module._build_candidate_clips(
+        all_index,
+        [candidate_with_box],   # candidate must have regions for _primary_box
+        clip_frames=3,
+        crop_size=32,
+        region_lookup=lookup,
+    )
+    # Union of (0,0,10,10) and (50,50,100,100) → (0,0,100,100)
+    crop = clips[0].crop_box
+    assert crop[0] <= 0
+    assert crop[1] <= 0
+    assert crop[2] >= 100
+    assert crop[3] >= 100
+
+
+def test_union_crop_falls_back_when_region_lookup_is_none():
+    candidate = _record_with_box("c", (5, 6), (20, 20, 40, 40))
+    neighbours = [
+        _index_record("n0", (4, 5)),
+        candidate,
+        _index_record("n1", (6, 7)),
+    ]
+    clips = stage_module._build_candidate_clips(
+        neighbours,
+        [candidate],
+        clip_frames=3,
+        crop_size=32,
+        region_lookup=None,
+    )
+    # No lookup, no context boxes → crop collapses to candidate box.
+    assert clips[0].crop_box == (20, 20, 40, 40)

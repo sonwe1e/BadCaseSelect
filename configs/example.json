@@ -63,6 +63,7 @@
     "cpu_threads_per_worker": 8,
     "postproc_workers": 4,
     "postproc_buffer_mb": 2048,
+    "postproc_microbatch_size": 8,
     "warmup_batches": 2,
     "lease_seconds": 1800,
     "precision": "float32",

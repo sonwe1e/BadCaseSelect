@@ -236,6 +236,13 @@
     // 单样本超预算时独占并记录 oversize=1。
     "postproc_buffer_mb": 2048,
 
+    // 每微批次最多处理的样本数（0 = 自动按预算推导）。
+    // 自动推导将 postproc_buffer_mb/workers 预算除以单样本 retained+transient
+    // 成本，1080p A3 配置下（4 workers × 512 MiB/Future）结果为 1，
+    // 导致 64 次单样本 grid_sample。显式设置为 8 可让每次 F.grid_sample
+    // 以 batch=8 运行，提升 NPU 向量化利用率；内存安全性由准入门控保证。
+    "postproc_microbatch_size": 8,
+
     // 每个 worker 在正式推理前运行的预热批数。
     // 预热使 NPU JIT / 算子缓存充分预热，避免前几批延迟偏高影响统计。
     "warmup_batches": 2,

@@ -278,6 +278,7 @@ class RuntimeConfig:
     cpu_threads_per_worker: int = 1
     postproc_workers: int = 0
     postproc_buffer_mb: int = 1024
+    postproc_microbatch_size: int = 0
     warmup_batches: int = 1
     lease_seconds: int = 1800
     precision: Literal["float32", "float16", "bfloat16"] = "float32"
@@ -298,6 +299,8 @@ class RuntimeConfig:
             raise ValueError("runtime.postproc_workers must be >= 0")
         if self.postproc_buffer_mb < 1:
             raise ValueError("runtime.postproc_buffer_mb must be >= 1")
+        if self.postproc_microbatch_size < 0:
+            raise ValueError("runtime.postproc_microbatch_size must be >= 0")
         if self.warmup_batches < 0:
             raise ValueError("runtime.warmup_batches must be >= 0")
         if self.lease_seconds < 30:

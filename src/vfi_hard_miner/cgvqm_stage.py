@@ -322,6 +322,7 @@ def _build_candidate_clips(
     *,
     clip_frames: int,
     crop_size: int,
+    region_lookup: dict[str, Any] | None = None,
 ) -> list[_CandidateClip]:
     ordered = sorted(
         video_records,
@@ -341,9 +342,19 @@ def _build_candidate_clips(
         # union of every context frame's primary box (falling back to the
         # candidate's own box when no context frame exposes one).  The region
         # mask below still marks only ``candidate_box``.
+        # ``region_lookup`` maps sample_id → enriched source record (which
+        # carries ``regions``); index-triplet records in ``context`` have no
+        # ``regions`` key, so we resolve through the lookup when available.
+        def _region_source(item: Mapping[str, Any]) -> Mapping[str, Any]:
+            if region_lookup is not None:
+                sid = item.get("sample_id")
+                if sid is not None and str(sid) in region_lookup:
+                    return region_lookup[str(sid)]
+            return item
+
         window_boxes = [
             box
-            for box in (_try_primary_box(item) for item in context)
+            for box in (_try_primary_box(_region_source(item)) for item in context)
             if box is not None
         ]
         crop_box = _union_box(window_boxes) if window_boxes else candidate_box
@@ -1366,11 +1377,17 @@ def _run_cgvqm_claim_loop(
                         candidate_chunk = candidates[
                             start : start + config.cgvqm.candidates_per_task
                         ]
+                        region_lookup = {
+                            str(r["sample_id"]): r
+                            for r in by_video_source.get(video_id, ())
+                            if r.get("sample_id") is not None
+                        }
                         clips = _build_candidate_clips(
                             by_video_index[video_id],
                             candidate_chunk,
                             clip_frames=config.cgvqm.clip_frames,
                             crop_size=config.cgvqm.crop_size,
+                            region_lookup=region_lookup,
                         )
                         message = (
                             f"[cgvqm] video {video_id}: still refining "

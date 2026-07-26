@@ -1658,3 +1658,47 @@ def test_decode_workers_parallel_preserves_event_order(tmp_path):
         ("pixels", (50, 20)),
     ]
     assert parallel == serial
+
+
+def test_postproc_microbatch_size_override():
+    image = np.zeros((64, 64, 3), dtype=np.float32)
+    items = [({"sample_id": str(i)}, image, image, image) for i in range(64)]
+
+    result = worker_module._postproc_microbatch_size(
+        items,
+        buffer_bytes=512 * 1024 * 1024,
+        postproc_workers=4,
+        override=8,
+    )
+    assert result == 8
+
+
+def test_postproc_microbatch_size_override_caps_at_len():
+    image = np.zeros((64, 64, 3), dtype=np.float32)
+    items = [({"sample_id": str(i)}, image, image, image) for i in range(10)]
+
+    result = worker_module._postproc_microbatch_size(
+        items,
+        buffer_bytes=512 * 1024 * 1024,
+        postproc_workers=4,
+        override=100,
+    )
+    assert result == 10
+
+
+def test_postproc_microbatch_size_override_zero_uses_auto():
+    image = np.zeros((64, 64, 3), dtype=np.float32)
+    items = [({"sample_id": str(i)}, image, image, image) for i in range(64)]
+
+    auto = worker_module._postproc_microbatch_size(
+        items,
+        buffer_bytes=512 * 1024 * 1024,
+        postproc_workers=4,
+    )
+    with_zero = worker_module._postproc_microbatch_size(
+        items,
+        buffer_bytes=512 * 1024 * 1024,
+        postproc_workers=4,
+        override=0,
+    )
+    assert with_zero == auto
