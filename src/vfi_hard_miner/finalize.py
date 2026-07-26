@@ -579,6 +579,24 @@ def _publish_generation(
         lock_path.unlink(missing_ok=True)
 
 
+def _cgvqm_resolved_backend(config: AppConfig) -> str:
+    """Real aggregated CGVQM backend from the stage summary, else the config.
+
+    The stage summary records what the workers actually ran (npu/cpu/mixed,
+    including silent CPU fallbacks); the config value alone can lie.
+    """
+
+    summary_path = run_directory(config) / "cgvqm_stage_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return str(config.cgvqm.backend)
+    backend = summary.get("backend") if isinstance(summary, dict) else None
+    if isinstance(backend, str) and backend:
+        return backend
+    return str(config.cgvqm.backend)
+
+
 def _runtime_metadata(config: AppConfig) -> dict[str, Any]:
     metadata = collect_runtime_info(include_npu=False)
     # The standalone probe is intentionally run outside the coordinator so it
@@ -897,6 +915,7 @@ def finalize_run(config_path: str | Path) -> FinalizeSummary:
                 {
                     "enabled": True,
                     "backend": config.cgvqm.backend,
+                    "backend_resolved": _cgvqm_resolved_backend(config),
                     "backbone": _checkpoint_fingerprint(
                         config.cgvqm.backbone_checkpoint
                     ),

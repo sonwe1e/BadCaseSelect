@@ -354,6 +354,7 @@ def process_diagnostic_payload(
     pending_futures: list[PendingPostprocess] = []
     pending_reserved_bytes = 0
     pending_retained_bytes = 0
+    pending_device_retained_bytes = 0
     oversize_logged = False
     timings = CpuTimingTotals()
     scored_count = 0
@@ -394,7 +395,8 @@ def process_diagnostic_payload(
             next_timing_report += _TIMING_REPORT_SAMPLES
 
     def drain_one() -> None:
-        nonlocal pending_reserved_bytes, pending_retained_bytes, scored_count
+        nonlocal pending_reserved_bytes, pending_retained_bytes
+        nonlocal pending_device_retained_bytes, scored_count
         current = pending_futures.pop(0)
         reservation = current.reservation
         wait_started = time.perf_counter()
@@ -410,6 +412,9 @@ def process_diagnostic_payload(
                         pending_batches=len(pending_futures) + 1,
                         pending_bytes=pending_reserved_bytes,
                         pending_retained_bytes=pending_retained_bytes,
+                        pending_device_retained_bytes=(
+                            pending_device_retained_bytes
+                        ),
                         memory=memory_estimate(),
                     )
         timings.add_future_wait(
@@ -419,6 +424,7 @@ def process_diagnostic_payload(
         output.extend(completed)
         pending_reserved_bytes -= reservation.reserved_bytes
         pending_retained_bytes -= reservation.retained_bytes
+        pending_device_retained_bytes -= reservation.device_retained_bytes
         scored_count += reservation.sample_count
         if heartbeat is not None:
             heartbeat()
@@ -428,6 +434,7 @@ def process_diagnostic_payload(
                 pending_batches=len(pending_futures),
                 pending_bytes=pending_reserved_bytes,
                 pending_retained_bytes=pending_retained_bytes,
+                pending_device_retained_bytes=pending_device_retained_bytes,
                 memory=memory_estimate(),
             )
         maybe_report_timings()
@@ -471,6 +478,9 @@ def process_diagnostic_payload(
                     pending_batches=len(pending_futures),
                     pending_bytes=pending_reserved_bytes,
                     pending_retained_bytes=pending_retained_bytes,
+                    pending_device_retained_bytes=(
+                        pending_device_retained_bytes
+                    ),
                     memory=memory_estimate(),
                 )
             network_bytes = inference_batch.output_bytes
@@ -489,7 +499,9 @@ def process_diagnostic_payload(
                 while pending_futures and (
                     len(pending_futures) >= postproc_workers
                     or reservation.oversize
-                    or pending_reserved_bytes + reservation.pipeline_bytes
+                    or pending_reserved_bytes
+                    + pending_device_retained_bytes
+                    + reservation.pipeline_bytes
                     > postproc_buffer_bytes
                 ):
                     drain_one()
@@ -501,6 +513,9 @@ def process_diagnostic_payload(
                         pending_batches=len(pending_futures),
                         pending_bytes=pending_reserved_bytes,
                         pending_retained_bytes=pending_retained_bytes,
+                        pending_device_retained_bytes=(
+                            pending_device_retained_bytes
+                        ),
                         memory=memory_estimate(),
                     )
                 reconstruction_started = time.perf_counter()
@@ -533,6 +548,9 @@ def process_diagnostic_payload(
                 )
                 pending_reserved_bytes += reservation.reserved_bytes
                 pending_retained_bytes += reservation.retained_bytes
+                pending_device_retained_bytes += (
+                    reservation.device_retained_bytes
+                )
                 if reservation.oversize and not oversize_logged:
                     print(
                         f"{progress_prefix}  pending reservation "

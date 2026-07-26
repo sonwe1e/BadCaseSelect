@@ -386,3 +386,65 @@ def test_tier2_materialize_is_cached_and_thread_safe() -> None:
     assert len(outcomes) == 8
     assert all(fields is outcomes[0] for fields in outcomes)
     assert set(outcomes[0]) == {"mask0", "mask1", "warp0", "warp1", "warp_blend"}
+
+
+def test_pack_prediction_to_cpu_matches_full_pack_prediction() -> None:
+    from vfi_hard_miner.reconstruction import (  # noqa: E402
+        pack_prediction_to_cpu,
+    )
+
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    full = pack_reconstruction_to_cpu(result)
+    prediction_only = pack_prediction_to_cpu(result)
+
+    assert torch.equal(prediction_only.prediction, full.prediction)
+    for name in (
+        "flow_t0",
+        "flow_t1",
+        "mask0",
+        "mask1",
+        "warp0",
+        "warp1",
+        "warp_blend",
+    ):
+        assert prediction_only.__dict__[name] is None
+
+
+def test_tier2_materialize_releases_packed_tensor() -> None:
+    from vfi_hard_miner.reconstruction import (  # noqa: E402
+        TIER2_CHANNELS,
+        Tier2Residue,
+    )
+
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    full = pack_reconstruction_to_cpu(result)
+    # Mirror the device path's packed residue with a CPU tensor: the
+    # release-after-transfer lifecycle is independent of the real device.
+    packed = torch.cat(
+        [full.mask0, full.mask1, full.warp0, full.warp1, full.warp_blend],
+        dim=1,
+    )
+    assert packed.shape[1] == TIER2_CHANNELS
+    residue = Tier2Residue(packed=packed)
+    assert residue.device_bytes == packed.numel() * packed.element_size()
+
+    tier2 = residue.materialize()
+
+    assert residue._packed is None
+    assert residue.device_bytes == 0
+    # Cached slices still match the legacy full pack and re-materialize is a
+    # no-op returning the same cache.
+    assert tier2 is residue.materialize()
+    assert torch.equal(tier2["mask0"], full.mask0)
+    assert torch.equal(tier2["mask1"], full.mask1)
+    assert torch.equal(tier2["warp0"], full.warp0)
+    assert torch.equal(tier2["warp1"], full.warp1)
+    assert torch.equal(tier2["warp_blend"], full.warp_blend)

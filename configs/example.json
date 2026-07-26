@@ -25,6 +25,7 @@
     "calibration_checkpoint": "third_party/weights/cgvqm/cgvqm-2.pickle",
     "backend": "auto",
     "allow_cpu_fallback": true,
+    "cpu_fallback_workers": 2,
     "clip_frames": 16,
     "crop_size": 224,
     "batch_size": 4,

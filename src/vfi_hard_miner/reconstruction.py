@@ -509,7 +509,9 @@ class Tier2Residue:
     def device_bytes(self) -> int:
         if self._packed is not None:
             return int(self._packed.numel()) * int(self._packed.element_size())
-        assert self._fields is not None
+        if self._fields is None:
+            # Device path after materialize: the packed tensor was released.
+            return 0
         return sum(
             int(tensor.numel()) * int(tensor.element_size())
             for tensor in self._fields.values()
@@ -524,6 +526,10 @@ class Tier2Residue:
                     packed = self._packed.detach().to(
                         device="cpu", dtype=torch.float32
                     )
+                    # The device copy now lives on CPU; drop the device
+                    # tensor so candidate microbatches stop occupying NPU
+                    # memory for the rest of their diagnosis window.
+                    self._packed = None
                     fields: dict[str, torch.Tensor] = {}
                     offset = 0
                     for name, channels in _TIER2_FIELDS:
@@ -581,6 +587,32 @@ def pack_tier1_to_cpu(
         prediction=tier1_fields["prediction"],
     )
     return partial, residue
+
+
+def pack_prediction_to_cpu(result: ReconstructionResult) -> ReconstructionResult:
+    """Transfer only the prediction (3ch) to CPU; every other field is None.
+
+    Teacher scoring consumes the prediction alone, so the flows, warps and
+    masks never need to be concatenated on device nor cross the device
+    boundary, and no ``Tier2Residue`` is created.
+    """
+
+    if result.prediction.device.type != "cpu":
+        prediction = result.prediction.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+    else:
+        prediction = result.prediction
+    return ReconstructionResult(
+        flow_t0=None,
+        flow_t1=None,
+        mask0=None,
+        mask1=None,
+        warp0=None,
+        warp1=None,
+        warp_blend=None,
+        prediction=prediction,
+    )
 
 
 def merge_tier2(

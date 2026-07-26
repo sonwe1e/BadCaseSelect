@@ -96,10 +96,14 @@
     "backbone_checkpoint": "third_party/weights/cgvqm/r3d_18-b3b3357e.pth",
     "calibration_checkpoint": "third_party/weights/cgvqm/cgvqm-2.pickle",
 
-    // auto 跟随主模型后端。A3 Conv3D 探针失败时，只有 allow_cpu_fallback
-    // 为 true 才会明确记录原因并回退 CPU。
+    // auto 跟随主模型后端。启动时先跑一个 probe 子进程探测每个 NPU 的
+    // Conv3D 支持；探针失败时，只有 allow_cpu_fallback 为 true 才会明确
+    // 记录原因并回退 CPU（否则 fail-loud 中止）。
     "backend": "auto",
     "allow_cpu_fallback": true,
+    // 回退 CPU 时改用固定数量的 CPU worker（不再 per-device 起 NPU 数量的
+    // 进程），避免 CPU Conv3D 把 8 路并发压垮。仅在触发回退时生效。
+    "cpu_fallback_workers": 2,
 
     // 每个候选使用同一视频内连续 16 个 prediction/GT 中间帧。
     // 首尾使用确定性边界 padding，不跨视频。
@@ -111,7 +115,8 @@
     "candidates_per_task": 32,
     // 跨候选 chunk 复用的上下文缓存（MB/worker）：相邻候选窗口共享大量
     // context 帧，命中即跳过解码与推理；淘汰只会触发重推，评分逐位不变。
-    // 0 表示禁用。视频之间自动清空。
+    // prediction 以 uint8 缓存（与裁剪路径同一量化公式），单条占用约为
+    // float32 的 1/4，同样预算下可多缓存约 4 倍条目。0 表示禁用；视频间自动清空。
     "context_cache_mb": 256,
 
     // CGVQM 使用 error 方向：越高表示感知劣化越明显。

@@ -60,6 +60,7 @@ class CGVQMStageSummary:
     error_summary: dict[str, float]
     manifest_path: Path
     materialization: GradedMaterializationSummary | None = None
+    worker_backends: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(slots=True)
@@ -68,6 +69,7 @@ class _CandidateClip:
     context: tuple[Mapping[str, Any], ...]
     center_slot: int
     box: tuple[int, int, int, int]
+    crop_box: tuple[int, int, int, int]
     distorted: np.ndarray
     reference: np.ndarray
     filled: np.ndarray
@@ -229,6 +231,36 @@ def _primary_box(record: Mapping[str, Any]) -> tuple[int, int, int, int]:
     return tuple(int(value) for value in box)
 
 
+def _try_primary_box(
+    record: Mapping[str, Any],
+) -> tuple[int, int, int, int] | None:
+    """Lenient ``_primary_box``: return None instead of raising.
+
+    Context frames in a clip window may be plain samples with no regions;
+    they still contribute to the crop extent only if they expose a primary
+    box, so a missing/invalid box is silently skipped rather than fatal.
+    """
+
+    try:
+        return _primary_box(record)
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def _union_box(
+    boxes: Sequence[tuple[int, int, int, int]],
+) -> tuple[int, int, int, int]:
+    """Smallest box covering every input box (min corner / max corner)."""
+
+    if not boxes:
+        raise ValueError("_union_box requires at least one box")
+    x0 = min(box[0] for box in boxes)
+    y0 = min(box[1] for box in boxes)
+    x1 = max(box[2] for box in boxes)
+    y1 = max(box[3] for box in boxes)
+    return int(x0), int(y0), int(x1), int(y1)
+
+
 def _window_indices(length: int, center: int, frames: int) -> tuple[int, ...]:
     if length < 1:
         raise ValueError("video must contain at least one indexed sample")
@@ -263,11 +295,22 @@ def _crop_resize_uint8(
     image: np.ndarray,
     box: tuple[int, int, int, int],
     size: int,
+    *,
+    extent_box: tuple[int, int, int, int] | None = None,
 ) -> np.ndarray:
+    """Crop to a padded square around ``extent_box`` (default ``box``).
+
+    When ``extent_box`` is given (the 16-frame union), the crop follows the
+    region's motion across the window while ``box`` still identifies the
+    candidate's own region for the mask; passing ``box`` alone preserves the
+    single-box behaviour.
+    """
+
     array = np.asarray(image)
     if array.dtype != np.uint8:
         array = np.clip(np.rint(array * 255.0), 0, 255).astype(np.uint8)
-    x0, y0, x1, y1 = _expanded_box(box, array.shape)
+    extent = box if extent_box is None else extent_box
+    x0, y0, x1, y1 = _expanded_box(extent, array.shape)
     crop = Image.fromarray(array[y0:y1, x0:x1])
     resized = crop.resize((size, size), Image.Resampling.BILINEAR)
     return np.asarray(resized, dtype=np.uint8)
@@ -293,12 +336,24 @@ def _build_candidate_clips(
         indices = _window_indices(len(ordered), positions[sample_id], clip_frames)
         context = tuple(ordered[index] for index in indices)
         center_slot = clip_frames // 2
+        candidate_box = _primary_box(record)
+        # Crop extent follows the region across the whole 16-frame window: the
+        # union of every context frame's primary box (falling back to the
+        # candidate's own box when no context frame exposes one).  The region
+        # mask below still marks only ``candidate_box``.
+        window_boxes = [
+            box
+            for box in (_try_primary_box(item) for item in context)
+            if box is not None
+        ]
+        crop_box = _union_box(window_boxes) if window_boxes else candidate_box
         clips.append(
             _CandidateClip(
                 record=record,
                 context=context,
                 center_slot=center_slot,
-                box=_primary_box(record),
+                box=candidate_box,
+                crop_box=crop_box,
                 distorted=np.empty(
                     (clip_frames, crop_size, crop_size, 3), dtype=np.uint8
                 ),
@@ -317,8 +372,18 @@ def _region_mask_in_crop(
     *,
     image_shape: tuple[int, int, int],
     crop_size: int,
+    crop_extent_box: tuple[int, int, int, int] | None = None,
 ) -> np.ndarray:
-    crop_x0, crop_y0, crop_x1, crop_y1 = _expanded_box(box, image_shape)
+    """Mark the candidate's own ``box`` inside the (possibly larger) crop.
+
+    ``crop_extent_box`` is the 16-frame union that defines the crop rectangle;
+    the mask maps the candidate region into that same expanded crop so scoring
+    still weights only the candidate's region even though the crop shows the
+    full motion span.  Defaults to ``box`` (single-box behaviour).
+    """
+
+    extent = box if crop_extent_box is None else crop_extent_box
+    crop_x0, crop_y0, crop_x1, crop_y1 = _expanded_box(extent, image_shape)
     box_x0, box_y0, box_x1, box_y1 = box
     crop_width = max(1, crop_x1 - crop_x0)
     crop_height = max(1, crop_y1 - crop_y0)
@@ -387,14 +452,89 @@ def _scorer_backend_label(config: AppConfig) -> str:
     )
 
 
+def _worker_backend_report_path(
+    config: AppConfig, device_index: int | None
+) -> Path:
+    name = (
+        "worker_cpu.json"
+        if device_index is None
+        else f"worker_{int(device_index)}.json"
+    )
+    return run_directory(config) / "cgvqm_workers" / name
+
+
+def _write_worker_backend_report(
+    config: AppConfig,
+    device_index: int | None,
+    info: Mapping[str, str | None],
+) -> dict[str, Any]:
+    """Persist this worker's real backend so the parent can aggregate it."""
+
+    report = {
+        "device": None if device_index is None else int(device_index),
+        "model_backend": info.get("desired"),
+        "scorer_backend": info.get("backend"),
+        "fallback_reason": info.get("fallback_reason"),
+    }
+    path = _worker_backend_report_path(config, device_index)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    return report
+
+
+def _read_worker_backend_reports(config: AppConfig) -> list[dict[str, Any]]:
+    directory = run_directory(config) / "cgvqm_workers"
+    reports: list[dict[str, Any]] = []
+    for path in sorted(directory.glob("worker_*.json")):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                report = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(report, dict) and report.get("scorer_backend"):
+            reports.append(report)
+    return reports
+
+
+def _aggregate_worker_backends(
+    reports: Sequence[Mapping[str, Any]], config: AppConfig
+) -> str:
+    """Collapse per-worker real backends: uniform -> that backend, else mixed.
+
+    Missing reports (e.g. a worker that died before writing one) fall back
+    to the config-derived label with a warning rather than a wrong label.
+    """
+
+    if not reports:
+        print(
+            "[cgvqm] warning: no worker backend reports found;"
+            " recording config-derived backend label",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _scorer_backend_label(config)
+    # Device-index suffixes (npu:0, npu:1, ...) still mean one backend kind.
+    backends = {
+        str(report["scorer_backend"]).split(":", 1)[0] for report in reports
+    }
+    if len(backends) == 1:
+        return next(iter(backends))
+    return "mixed"
+
+
 class _ContextCache:
     """Per-video LRU cache of context-frame predictions and GT frames.
 
-    Adjacent candidate chunks share most context samples; caching both the
-    reconstructed prediction (float32 HWC) and the decoded GT frame lets the
-    next chunk fill clip slots without decoding or inferring them again.
-    Eviction only costs a re-inference, so scores stay identical no matter
-    when entries are dropped.
+    Adjacent candidate chunks share most context samples; caching the
+    reconstructed prediction (uint8 HWC, pre-quantized with the same formula
+    the crop path applies) and the decoded GT frame lets the next chunk fill
+    clip slots without decoding or inferring them again.  Storing the
+    prediction as uint8 rather than float32 cuts its footprint to ~1/4, so a
+    fixed ``context_cache_mb`` budget retains far more entries.  Eviction only
+    costs a re-inference, so scores stay identical no matter when entries are
+    dropped.
     """
 
     def __init__(self, budget_bytes: int) -> None:
@@ -465,7 +605,46 @@ def _load_scorer(
     model_device: torch.device,
     *,
     device_index: int | None = None,
-) -> tuple[CGVQM2Scorer, str]:
+    force_cpu: bool = False,
+    fallback_reason: str | None = None,
+) -> tuple[CGVQM2Scorer, dict[str, str | None]]:
+    """Load and probe the scorer, returning the backend that actually runs.
+
+    The info dict carries ``backend`` (what the probe accepted), ``desired``
+    (the configured target) and ``fallback_reason`` (why CPU was chosen, if
+    it was), so the parent can record the real runtime backend instead of a
+    config-derived label.
+
+    When ``force_cpu`` is set the parent pool has already run the shared probe
+    and decided to run the scorer on CPU; this loads CPU directly without
+    re-attempting (and failing on) the unsupported accelerator backend.
+    """
+
+    if force_cpu:
+        # The pool already ran the shared probe and chose CPU; build the
+        # desired label as a string (no live accelerator torch.device, which
+        # would require torch_npu just to name the fallback we are avoiding).
+        backend = _scorer_backend_label(config)
+        index = (
+            int(config.runtime.devices[0])
+            if device_index is None
+            else int(device_index)
+        )
+        desired_label = "cpu" if backend == "cpu" else f"{backend}:{index}"
+        scorer = CGVQM2Scorer(
+            config.cgvqm.backbone_checkpoint,
+            config.cgvqm.calibration_checkpoint,
+            device="cpu",
+        )
+        scorer.probe(
+            clip_frames=min(config.cgvqm.clip_frames, 4),
+            crop_size=min(config.cgvqm.crop_size, 64),
+        )
+        return scorer, {
+            "backend": "cpu",
+            "desired": desired_label,
+            "fallback_reason": fallback_reason or "pool selected CPU scorer",
+        }
     desired = _scorer_device(config, model_device, device_index=device_index)
     try:
         scorer = CGVQM2Scorer(
@@ -477,12 +656,17 @@ def _load_scorer(
             clip_frames=min(config.cgvqm.clip_frames, 4),
             crop_size=min(config.cgvqm.crop_size, 64),
         )
-        return scorer, str(desired)
+        return scorer, {
+            "backend": str(desired),
+            "desired": str(desired),
+            "fallback_reason": None,
+        }
     except Exception as exc:
         if desired.type == "cpu" or not config.cgvqm.allow_cpu_fallback:
             raise
+        fallback_reason = f"{type(exc).__name__}: {exc}"
         print(
-            f"[cgvqm] backend {desired} unavailable ({type(exc).__name__}: {exc}); "
+            f"[cgvqm] backend {desired} unavailable ({fallback_reason}); "
             "using explicit CPU fallback",
             file=sys.stderr,
             flush=True,
@@ -496,7 +680,105 @@ def _load_scorer(
             clip_frames=min(config.cgvqm.clip_frames, 4),
             crop_size=min(config.cgvqm.crop_size, 64),
         )
-        return scorer, "cpu"
+        return scorer, {
+            "backend": "cpu",
+            "desired": str(desired),
+            "fallback_reason": fallback_reason,
+        }
+
+
+def _cgvqm_probe_entry(config_path: str, result_path: str) -> None:
+    """Spawn target: probe CGVQM Conv3D support on every configured device.
+
+    Runs in a clean child so the parent stays torch-free.  For each device it
+    loads the R3D-18 backbone and runs a tiny Conv3D probe; the first failure's
+    exception is recorded so the parent can decide (and log) the CPU fallback.
+    Writes ``{supported, reason, devices: [{device, supported, reason}]}``.
+    """
+
+    config = load_config(config_path)
+    per_device: list[dict[str, Any]] = []
+    overall_supported = True
+    first_reason: str | None = None
+    for device_index in config.runtime.devices:
+        device_index = int(device_index)
+        try:
+            model_device = _model_device(config, device_index=device_index)
+            desired = _scorer_device(
+                config, model_device, device_index=device_index
+            )
+            scorer = CGVQM2Scorer(
+                config.cgvqm.backbone_checkpoint,
+                config.cgvqm.calibration_checkpoint,
+                device=desired,
+            )
+            scorer.probe(
+                clip_frames=min(config.cgvqm.clip_frames, 4),
+                crop_size=min(config.cgvqm.crop_size, 64),
+            )
+            per_device.append(
+                {"device": device_index, "supported": True, "reason": None}
+            )
+            del scorer
+        except Exception as exc:  # noqa: BLE001 - recorded, not swallowed
+            reason = f"{type(exc).__name__}: {exc}"
+            overall_supported = False
+            first_reason = first_reason or reason
+            per_device.append(
+                {
+                    "device": device_index,
+                    "supported": False,
+                    "reason": reason,
+                }
+            )
+    result = {
+        "supported": overall_supported,
+        "reason": first_reason,
+        "devices": per_device,
+    }
+    path = Path(result_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(result, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _probe_cgvqm_backend(config: AppConfig, config_path: Path) -> dict[str, Any]:
+    """Run the Conv3D probe in a clean subprocess and return its verdict.
+
+    A probe failure (crash / no output) is treated as unsupported so the pool
+    errs toward the explicit, capped CPU fallback rather than spawning one
+    accelerator worker per device that would each fail the same way.
+    """
+
+    result_path = run_directory(config) / "cgvqm_probe.json"
+    spawn = get_spawn_context()
+    process = spawn.Process(
+        target=_cgvqm_probe_entry,
+        args=(str(config_path), str(result_path)),
+        name="vfi-cgvqm-probe",
+    )
+    process.start()
+    process.join()
+    if process.exitcode != 0 or not result_path.exists():
+        reason = f"probe process exited with code {process.exitcode}"
+        print(
+            f"[cgvqm] Conv3D probe failed ({reason}); treating accelerator "
+            "backend as unsupported",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {"supported": False, "reason": reason, "devices": []}
+    try:
+        with open(result_path, encoding="utf-8") as handle:
+            verdict = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "supported": False,
+            "reason": f"unreadable probe result: {exc}",
+            "devices": [],
+        }
+    return verdict
 
 
 def _top_area_mean(values: np.ndarray, fraction: float = 0.01) -> float:
@@ -658,12 +940,19 @@ def _fill_clip_slots(
                 clip.box,
                 image_shape=gt.shape,
                 crop_size=config.cgvqm.crop_size,
+                crop_extent_box=clip.crop_box,
             )
         clip.distorted[slot] = _crop_resize_uint8(
-            prediction, clip.box, config.cgvqm.crop_size
+            prediction,
+            clip.box,
+            config.cgvqm.crop_size,
+            extent_box=clip.crop_box,
         )
         clip.reference[slot] = _crop_resize_uint8(
-            gt, clip.box, config.cgvqm.crop_size
+            gt,
+            clip.box,
+            config.cgvqm.crop_size,
+            extent_box=clip.crop_box,
         )
         clip.filled[slot] = True
 
@@ -747,7 +1036,14 @@ def _fill_and_score_clips(
             for local, (record, _img0, gt, _img1) in enumerate(
                 prepared.items
             ):
-                prediction = _hwc(predictions[local])
+                # Quantize the prediction to uint8 up front with the exact
+                # formula _crop_resize_uint8 uses at full resolution, so both
+                # the cached and freshly reconstructed paths feed identical
+                # uint8 pixels downstream (bit-exact) while the context cache
+                # holds ~1/4 the bytes of the float32 prediction.
+                prediction = np.clip(
+                    np.rint(_hwc(predictions[local]) * 255.0), 0, 255
+                ).astype(np.uint8)
                 sample_id = str(record["sample_id"])
                 if context_cache is not None:
                     context_cache.put(
@@ -968,18 +1264,32 @@ def _run_cgvqm_stage_local(config_path: str | Path) -> CGVQMStageSummary:
     context = _prepare_cgvqm_context(config)
     if not config.cgvqm.enabled:
         return _write_disabled_cgvqm_output(context)
-    backend_label = _run_cgvqm_claim_loop(context)
-    return _finalize_cgvqm_stage(context, backend_label=backend_label)
+    scorer_info = _run_cgvqm_claim_loop(context)
+    report = _write_worker_backend_report(config, None, scorer_info)
+    summary = _finalize_cgvqm_stage(
+        context,
+        backend_label=_aggregate_worker_backends([report], config),
+        worker_backends=(report,),
+    )
+    _write_summary(
+        run_directory(config) / "cgvqm_stage_summary.json", summary
+    )
+    return summary
 
 
 def _run_cgvqm_claim_loop(
-    context: _CgvqmRunContext, *, device_index: int | None = None
-) -> str:
+    context: _CgvqmRunContext,
+    *,
+    device_index: int | None = None,
+    force_cpu_scorer: bool = False,
+    scorer_fallback_reason: str | None = None,
+) -> dict[str, str | None]:
     """Claim per-video tasks until the queue is empty.
 
     One call owns one accelerator device; several processes may run it
     concurrently against the shared SQLite state (the owner string is
-    device- and pid-suffixed).  Returns the scorer backend label.
+    device- and pid-suffixed).  Returns the actual scorer backend info
+    from ``_load_scorer`` (backend / desired / fallback_reason).
     """
 
     config = context.config
@@ -998,8 +1308,12 @@ def _run_cgvqm_claim_loop(
     adapter = ModelAdapter.from_config(
         config.model, device=model_device, validate_values=False
     )
-    scorer, scorer_backend = _load_scorer(
-        config, model_device, device_index=device_index
+    scorer, scorer_info = _load_scorer(
+        config,
+        model_device,
+        device_index=device_index,
+        force_cpu=force_cpu_scorer,
+        fallback_reason=scorer_fallback_reason,
     )
     parts_dir = run_directory(config) / "cgvqm_parts"
     artifacts_dir = run_directory(config) / "cgvqm_artifacts"
@@ -1144,11 +1458,14 @@ def _run_cgvqm_claim_loop(
                 and video_id not in materializer.completed_video_ids()
             ):
                 materializer.materialize_video(video_id, graded_video)
-    return scorer_backend
+    return scorer_info
 
 
 def _finalize_cgvqm_stage(
-    context: _CgvqmRunContext, *, backend_label: str | None
+    context: _CgvqmRunContext,
+    *,
+    backend_label: str | None,
+    worker_backends: tuple[dict[str, Any], ...] = (),
 ) -> CGVQMStageSummary:
     """Grade every completed video from the shared state (torch-free)."""
 
@@ -1233,6 +1550,7 @@ def _finalize_cgvqm_stage(
         error_summary,
         output_path,
         None if materializer is None else materializer.summary(),
+        worker_backends,
     )
 
 
@@ -1263,19 +1581,94 @@ def _write_summary(path: Path, summary: CGVQMStageSummary) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _cgvqm_stage_work_entry(config_path: str, device_index: int) -> None:
+def _cgvqm_stage_work_entry(
+    config_path: str,
+    device_index: int,
+    force_cpu_scorer: bool = False,
+    scorer_fallback_reason: str | None = None,
+) -> None:
     """Spawn target: run the claim loop for exactly one accelerator device.
 
     Finalization (grading, materialization, summary) is the parent's job:
     it needs no torch context and reads the shared SQLite state after all
     workers have joined.
+
+    ``force_cpu_scorer`` is set by the parent when the shared Conv3D probe
+    found the accelerator unsupported: the VFI model still runs on the NPU
+    (Conv2D is fine), only the CGVQM R3D-18 scorer drops to CPU, and the pool
+    is capped at ``cgvqm.cpu_fallback_workers`` so CPU scoring is not
+    oversubscribed.
     """
 
     config = load_config(config_path)
     context = _prepare_cgvqm_context(config)
     if not config.cgvqm.enabled:
         return
-    _run_cgvqm_claim_loop(context, device_index=device_index)
+    scorer_info = _run_cgvqm_claim_loop(
+        context,
+        device_index=device_index,
+        force_cpu_scorer=force_cpu_scorer,
+        scorer_fallback_reason=scorer_fallback_reason,
+    )
+    _write_worker_backend_report(config, device_index, scorer_info)
+
+
+def _resolve_cgvqm_worker_pool(
+    config: AppConfig, config_path: Path
+) -> list[dict[str, Any]]:
+    """Decide the worker pool up front from a single shared Conv3D probe.
+
+    Returns a list of worker specs ``{device, force_cpu_scorer, reason}``.
+
+    * Scorer desired on the accelerator and the probe passes -> one worker per
+      device, scorer on the accelerator (unchanged behaviour).
+    * Scorer desired on CPU (config), or the probe finds Conv3D unsupported ->
+      a pool capped at ``cgvqm.cpu_fallback_workers`` (never more than the
+      device count) so CPU scoring is not oversubscribed by one worker per
+      NPU.  Fail-loud instead if the probe fails and ``allow_cpu_fallback`` is
+      off.
+    """
+
+    devices = [int(index) for index in config.runtime.devices]
+    scorer_desired = _scorer_backend_label(config)
+    force_cpu = False
+    reason: str | None = None
+    if scorer_desired == "cpu":
+        force_cpu = True
+        reason = "cgvqm.backend resolves to cpu"
+    else:
+        verdict = _probe_cgvqm_backend(config, config_path)
+        if not bool(verdict.get("supported", False)):
+            reason = str(verdict.get("reason") or "Conv3D probe unsupported")
+            if not config.cgvqm.allow_cpu_fallback:
+                raise RuntimeError(
+                    "CGVQM Conv3D unsupported on "
+                    f"{scorer_desired} and allow_cpu_fallback is off: {reason}"
+                )
+            force_cpu = True
+            print(
+                f"[cgvqm] Conv3D unsupported on {scorer_desired} ({reason}); "
+                f"falling back to {config.cgvqm.cpu_fallback_workers} CPU "
+                "scorer worker(s)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if not force_cpu:
+        return [
+            {"device": device, "force_cpu_scorer": False, "reason": None}
+            for device in devices
+        ]
+    worker_count = min(int(config.cgvqm.cpu_fallback_workers), len(devices))
+    worker_count = max(1, worker_count)
+    return [
+        {
+            "device": devices[i],
+            "force_cpu_scorer": True,
+            "reason": reason,
+        }
+        for i in range(worker_count)
+    ]
 
 
 def run_cgvqm_stage(config_path: str | Path) -> CGVQMStageSummary:
@@ -1285,6 +1678,11 @@ def run_cgvqm_stage(config_path: str | Path) -> CGVQMStageSummary:
     (each loads the model and R3D-18 once and claims videos from the shared
     SQLite state); the parent then finalizes from the shared state without
     initializing torch itself.  CPU runs stay in-process.
+
+    A single shared Conv3D probe (``_resolve_cgvqm_worker_pool``) decides the
+    pool before spawning: if the accelerator cannot run R3D-18, the scorer
+    drops to a CPU pool capped at ``cgvqm.cpu_fallback_workers`` rather than
+    one CPU worker per NPU.
     """
 
     path = Path(config_path).resolve()
@@ -1295,13 +1693,19 @@ def run_cgvqm_stage(config_path: str | Path) -> CGVQMStageSummary:
     # Prepared before spawning so initially_done reflects the stage start.
     stage_context = _prepare_cgvqm_context(config)
 
+    worker_specs = _resolve_cgvqm_worker_pool(config, path)
     spawn = get_spawn_context()
     processes: list[tuple[int, Any]] = []
-    for device_index in config.runtime.devices:
-        device_index = int(device_index)
+    for spec in worker_specs:
+        device_index = int(spec["device"])
         process = spawn.Process(
             target=_cgvqm_stage_work_entry,
-            args=(str(path), device_index),
+            args=(
+                str(path),
+                device_index,
+                bool(spec["force_cpu_scorer"]),
+                spec["reason"],
+            ),
             name=f"vfi-cgvqm-refine-{device_index}",
         )
         processes.append((device_index, process))
@@ -1327,8 +1731,11 @@ def run_cgvqm_stage(config_path: str | Path) -> CGVQMStageSummary:
     if failed:
         raise RuntimeError(f"CGVQM refinement workers failed on devices {failed}")
 
+    reports = _read_worker_backend_reports(config)
     summary = _finalize_cgvqm_stage(
-        stage_context, backend_label=_scorer_backend_label(config)
+        stage_context,
+        backend_label=_aggregate_worker_backends(reports, config),
+        worker_backends=tuple(reports),
     )
     _write_summary(
         run_directory(config) / "cgvqm_stage_summary.json", summary

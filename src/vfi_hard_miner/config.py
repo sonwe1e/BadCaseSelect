@@ -78,6 +78,7 @@ class CGVQMConfig:
     calibration_checkpoint: str = "third_party/weights/cgvqm/cgvqm-2.pickle"
     backend: Literal["auto", "cpu", "cuda", "npu"] = "auto"
     allow_cpu_fallback: bool = True
+    cpu_fallback_workers: int = 2
     clip_frames: int = 16
     crop_size: int = 224
     batch_size: int = 1
@@ -98,6 +99,8 @@ class CGVQMConfig:
             raise ValueError("cgvqm.crop_size must be >= 32")
         if self.batch_size < 1 or self.candidates_per_task < 1:
             raise ValueError("cgvqm batch/task values must be positive")
+        if self.cpu_fallback_workers < 1:
+            raise ValueError("cgvqm.cpu_fallback_workers must be >= 1")
         if self.context_cache_mb < 0:
             raise ValueError("cgvqm.context_cache_mb must be >= 0 (0 disables)")
         if not 0.0 <= self.b_error_at <= self.a_error_at <= 100.0:
