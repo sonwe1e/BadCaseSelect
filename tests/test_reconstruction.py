@@ -165,14 +165,14 @@ def test_reconstruction_rejects_unknown_mask_role() -> None:
 from vfi_hard_miner.reconstruction import pack_reconstruction_to_cpu  # noqa: E402
 
 
-def _random_reconstruction_inputs():
+def _random_reconstruction_inputs(batch: int = 2):
     torch.manual_seed(7)
-    img0 = torch.rand((2, 3, 5, 7))
-    img1 = torch.rand((2, 3, 5, 7))
-    flow0 = (torch.rand((2, 2, 2, 3)) - 0.5) * 2.0
-    flow1 = (torch.rand((2, 2, 2, 3)) - 0.5) * 2.0
-    mask0 = torch.rand((2, 1, 2, 3))
-    mask1 = torch.rand((2, 1, 2, 3))
+    img0 = torch.rand((batch, 3, 5, 7))
+    img1 = torch.rand((batch, 3, 5, 7))
+    flow0 = (torch.rand((batch, 2, 2, 3)) - 0.5) * 2.0
+    flow1 = (torch.rand((batch, 2, 2, 3)) - 0.5) * 2.0
+    mask0 = torch.rand((batch, 1, 2, 3))
+    mask1 = torch.rand((batch, 1, 2, 3))
     return img0, img1, flow0, flow1, mask0, mask1
 
 
@@ -448,3 +448,100 @@ def test_tier2_materialize_releases_packed_tensor() -> None:
     assert torch.equal(tier2["warp0"], full.warp0)
     assert torch.equal(tier2["warp1"], full.warp1)
     assert torch.equal(tier2["warp_blend"], full.warp_blend)
+
+
+def test_materialize_with_indices_transfers_only_candidate_rows() -> None:
+    from vfi_hard_miner.reconstruction import TIER2_CHANNELS, Tier2Residue
+
+    B = 4
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(batch=B),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    full = pack_reconstruction_to_cpu(result)
+    packed = torch.cat(
+        [full.mask0, full.mask1, full.warp0, full.warp1, full.warp_blend], dim=1
+    )
+    assert packed.shape == (B, TIER2_CHANNELS, 5, 7)
+
+    indices = [1, 3]
+    residue = Tier2Residue(packed=packed.clone())
+    tier2 = residue.materialize(indices)
+
+    # Packed tensor released after D2H.
+    assert residue._packed is None
+    # Returned dict has only the requested rows.
+    assert tier2["mask0"].shape[0] == 2
+    assert torch.equal(tier2["mask0"], full.mask0[indices])
+    assert torch.equal(tier2["mask1"], full.mask1[indices])
+    assert torch.equal(tier2["warp0"], full.warp0[indices])
+    assert torch.equal(tier2["warp1"], full.warp1[indices])
+    assert torch.equal(tier2["warp_blend"], full.warp_blend[indices])
+    # Second call returns cached result.
+    assert tier2 is residue.materialize(indices)
+
+
+def test_materialize_full_unchanged() -> None:
+    """materialize() with no indices still transfers the full batch."""
+    from vfi_hard_miner.reconstruction import TIER2_CHANNELS, Tier2Residue
+
+    B = 3
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(batch=B),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    full = pack_reconstruction_to_cpu(result)
+    packed = torch.cat(
+        [full.mask0, full.mask1, full.warp0, full.warp1, full.warp_blend], dim=1
+    )
+    residue = Tier2Residue(packed=packed.clone())
+    tier2 = residue.materialize()
+
+    assert tier2["mask0"].shape[0] == B
+    assert torch.equal(tier2["warp_blend"], full.warp_blend)
+
+
+def test_slice_reconstruction_cpu_selects_rows() -> None:
+    from vfi_hard_miner.reconstruction import slice_reconstruction_cpu
+
+    B = 5
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(batch=B),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    full = pack_reconstruction_to_cpu(result)
+    indices = [0, 2, 4]
+    sliced = slice_reconstruction_cpu(full, indices)
+
+    assert sliced.flow_t0.shape[0] == 3
+    assert torch.equal(sliced.flow_t0, full.flow_t0[indices])
+    assert torch.equal(sliced.flow_t1, full.flow_t1[indices])
+    assert torch.equal(sliced.prediction, full.prediction[indices])
+    assert torch.equal(sliced.warp0, full.warp0[indices])
+    assert torch.equal(sliced.mask1, full.mask1[indices])
+
+
+def test_slice_reconstruction_cpu_passes_none_fields() -> None:
+    from vfi_hard_miner.reconstruction import (
+        pack_tier1_to_cpu,
+        slice_reconstruction_cpu,
+    )
+
+    B = 3
+    result = reconstruct_midpoint(
+        *_random_reconstruction_inputs(batch=B),
+        network_size=(2, 3),
+        mask0_role="warp0_weight",
+    )
+    partial, _residue = pack_tier1_to_cpu(result)
+    # Tier-1 partial has None for warp/mask fields.
+    assert partial.warp0 is None
+
+    sliced = slice_reconstruction_cpu(partial, [0, 2])
+    assert sliced.warp0 is None
+    assert sliced.mask0 is None
+    assert sliced.flow_t0.shape[0] == 2
+    assert torch.equal(sliced.prediction, partial.prediction[[0, 2]])

@@ -128,7 +128,10 @@
     // 否则属于两种证据冲突，只进入 Review。
     "spatial_overlap_at": 0.35,
     // 相邻 CGVQM 帧均值变化超过该 error 值时，记录 flicker 时序证据。
-    "flicker_change_at": 10.0
+    "flicker_change_at": 10.0,
+    // union crop 仅纳入与候选框 IoU 或 containment ≥ 阈值的上下文框；
+    // 过滤掉同 region 内不相关的运动区域，避免 crop 被非候选区域撑大。
+    "union_crop_iou_threshold": 0.10
   },
 
   // ─────────────────────────────────────────────────────

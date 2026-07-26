@@ -517,18 +517,19 @@ class Tier2Residue:
             for tensor in self._fields.values()
         )
 
-    def materialize(self) -> dict[str, torch.Tensor]:
-        """Transfer (or slice) tier-2 to CPU once; later calls reuse the cache."""
+    def materialize(self, indices: list[int] | None = None) -> dict[str, torch.Tensor]:
+        """Transfer (or slice) tier-2 to CPU once; later calls reuse the cache.
+
+        When ``indices`` is given only those rows are transferred, reducing D2H
+        traffic to the candidate subset of the microbatch.
+        """
 
         with self._lock:
             if self._cached is None:
                 if self._packed is not None:
-                    packed = self._packed.detach().to(
-                        device="cpu", dtype=torch.float32
-                    )
-                    # The device copy now lives on CPU; drop the device
-                    # tensor so candidate microbatches stop occupying NPU
-                    # memory for the rest of their diagnosis window.
+                    src = self._packed if indices is None else self._packed[indices]
+                    packed = src.detach().to(device="cpu", dtype=torch.float32)
+                    # Drop the device tensor once CPU copy exists.
                     self._packed = None
                     fields: dict[str, torch.Tensor] = {}
                     offset = 0
@@ -536,10 +537,17 @@ class Tier2Residue:
                         fields[name] = packed[:, offset : offset + channels]
                         offset += channels
                 else:
-                    fields = {
-                        name: tensor.detach().to(device="cpu", dtype=torch.float32)
-                        for name, tensor in self._fields.items()
-                    }
+                    assert self._fields is not None
+                    if indices is None:
+                        fields = {
+                            name: tensor.detach().to(device="cpu", dtype=torch.float32)
+                            for name, tensor in self._fields.items()
+                        }
+                    else:
+                        fields = {
+                            name: tensor[indices].detach().to(device="cpu", dtype=torch.float32)
+                            for name, tensor in self._fields.items()
+                        }
                 self._cached = fields
             return self._cached
 
@@ -629,6 +637,30 @@ def merge_tier2(
         warp1=tier2["warp1"],
         warp_blend=tier2["warp_blend"],
         prediction=partial.prediction,
+    )
+
+
+def slice_reconstruction_cpu(
+    result: ReconstructionResult, indices: list[int]
+) -> ReconstructionResult:
+    """Return a new ReconstructionResult sliced to ``indices`` along the batch dim.
+
+    Non-None fields are index-selected; None fields remain None.  All tensors
+    must already be CPU-resident (caller's responsibility).
+    """
+
+    def _s(t: torch.Tensor | None) -> torch.Tensor | None:
+        return None if t is None else t[indices]
+
+    return ReconstructionResult(
+        flow_t0=_s(result.flow_t0),
+        flow_t1=_s(result.flow_t1),
+        mask0=_s(result.mask0),
+        mask1=_s(result.mask1),
+        warp0=_s(result.warp0),
+        warp1=_s(result.warp1),
+        warp_blend=_s(result.warp_blend),
+        prediction=_s(result.prediction),
     )
 
 

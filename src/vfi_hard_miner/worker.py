@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _replace_dc
 import os
 from queue import Full, Queue
 import socket
@@ -48,6 +48,7 @@ from .reconstruction import (
     pack_reconstruction_to_cpu,
     pack_tier1_to_cpu,
     reconstruct_midpoint,
+    slice_reconstruction_cpu,
 )
 from .scoring import build_image_basis, luminance, score_local_errors, score_region
 from .state import LeaseHeartbeat, LeaseLostError, TaskStore
@@ -1727,6 +1728,21 @@ class PendingPhase1:
     reconstructed_tier1: ReconstructionResult
 
 
+@dataclass(slots=True)
+class PendingPhase2:
+    """Phase-2 diagnosis future created after the main-thread tier-2 D2H.
+
+    The main thread does not block on this future immediately: it inserts the
+    entry at the front of ``pending`` and moves on to the next reconstruction.
+    ``drain_phase2_and_collect`` awaits it and reassembles the ordered records.
+    """
+
+    future: Future[list[tuple[int, dict[str, Any]]]]
+    record_by_index: dict[int, dict[str, Any]]
+    reservation: PendingReservation
+    candidate_count: int
+
+
 def _infer_model_batch(
     items: Sequence[DecodedItem],
     *,
@@ -1958,7 +1974,7 @@ def _process_payload_records(
     postproc_buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
     postproc_workers = _resolve_postproc_workers(config)
     output: list[dict[str, Any]] = []
-    pending: list[PendingPostprocess | PendingPhase1] = []
+    pending: list[PendingPostprocess | PendingPhase1 | PendingPhase2] = []
     pending_reserved_bytes = 0
     pending_retained_bytes = 0
     pending_device_retained_bytes = 0
@@ -2034,15 +2050,16 @@ def _process_payload_records(
         )
         return result
 
-    def drain_two_phase(
+    def drain_phase1_and_submit(
         entry: PendingPhase1, reservation: PendingReservation
-    ) -> list[dict[str, Any]]:
-        """Drain one two-phase microbatch: phase-1 results, main-thread
-        tier-2 D2H for candidates, then phase-2 diagnosis.
+    ) -> PendingPhase2 | list[dict[str, Any]]:
+        """Await phase-1 result, do tier-2 D2H, and submit phase-2 async.
 
-        Device-bytes accounting: subtracted at materialize time for
-        candidate batches (the packed tensor is released right then) and at
-        drain time for all-reject batches (the residue drops with ``entry``).
+        Returns a ``PendingPhase2`` when candidates need full diagnosis, or a
+        finished records list when every sample was fast-rejected (all-reject
+        path).  Device-bytes accounting is done here; CPU-buffer accounting
+        happens in ``drain_phase2_and_collect`` or in ``drain_one`` for the
+        all-reject case.
         """
 
         nonlocal pending_device_retained_bytes
@@ -2067,39 +2084,55 @@ def _process_payload_records(
                 raise RuntimeError(
                     "two-phase drain requires a tier-2 residue"
                 )
-            # The main thread owns every tier-2 D2H: transfers are
-            # serialized here so CPU pool threads never touch device
-            # tensors and timing against the next reconstruction is
-            # deterministic.
+            candidate_indices = [c.sample_index for c in candidates]
             d2h_started = time.perf_counter()
-            tier2_fields = residue.materialize()
+            tier2_fields = residue.materialize(candidate_indices)
             timings.add_reconstruction(
                 time.perf_counter() - d2h_started, len(candidates)
             )
             tier2_d2h_bytes += reservation.device_retained_bytes
             tier2_materialized_batches += 1
             tier2_candidate_samples += len(candidates)
-            pending_device_retained_bytes -= (
-                reservation.device_retained_bytes
+            pending_device_retained_bytes -= reservation.device_retained_bytes
+            compacted_tier1 = slice_reconstruction_cpu(
+                entry.reconstructed_tier1, candidate_indices
             )
-            merged = merge_tier2(entry.reconstructed_tier1, tier2_fields)
+            merged = merge_tier2(compacted_tier1, tier2_fields)
+            local_candidates = [
+                _replace_dc(c, sample_index=i) for i, c in enumerate(candidates)
+            ]
             phase2_future = executor.submit(
                 _finish_phase2_batch,
-                candidates,
+                local_candidates,
                 merged,
                 config=config,
                 timings=timings,
             )
-            record_by_index.update(
-                await_future(phase2_future, wait_samples=len(candidates))
+            return PendingPhase2(
+                future=phase2_future,
+                record_by_index=record_by_index,
+                reservation=reservation,
+                candidate_count=len(candidates),
             )
         else:
-            pending_device_retained_bytes -= (
-                reservation.device_retained_bytes
-            )
+            pending_device_retained_bytes -= reservation.device_retained_bytes
+            return [
+                record_by_index[index]
+                for index in range(reservation.sample_count)
+            ]
+
+    def drain_phase2_and_collect(
+        entry: PendingPhase2,
+    ) -> list[dict[str, Any]]:
+        """Await the phase-2 future and return records in original sample order."""
+
+        record_by_index = dict(entry.record_by_index)
+        record_by_index.update(
+            await_future(entry.future, wait_samples=entry.candidate_count)
+        )
         return [
             record_by_index[index]
-            for index in range(reservation.sample_count)
+            for index in range(entry.reservation.sample_count)
         ]
 
     def drain_one() -> None:
@@ -2108,7 +2141,16 @@ def _process_payload_records(
         current = pending.pop(0)
         reservation = current.reservation
         if isinstance(current, PendingPhase1):
-            completed = drain_two_phase(current, reservation)
+            result = drain_phase1_and_submit(current, reservation)
+            if isinstance(result, PendingPhase2):
+                # Phase-2 is now in flight; park it at the front so its
+                # samples drain before any later microbatch (FIFO).
+                pending.insert(0, result)
+                return
+            completed = result
+        elif isinstance(current, PendingPhase2):
+            completed = drain_phase2_and_collect(current)
+            # device_retained_bytes was already decremented in drain_phase1_and_submit.
         else:
             completed = await_future(
                 current.future, wait_samples=reservation.sample_count

@@ -316,6 +316,27 @@ def _crop_resize_uint8(
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _box_iou_containment(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> tuple[float, float]:
+    """Return (iou, containment_of_a_in_b) for two (x0,y0,x1,y1) boxes.
+
+    Containment is the fraction of box ``a`` covered by box ``b``.
+    Both values are in [0,1]; degenerate (zero-area) boxes return (0.0, 0.0).
+    """
+
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union = area_a + area_b - inter
+    iou = inter / union if union > 0 else 0.0
+    containment = inter / area_a if area_a > 0 else 0.0
+    return iou, containment
+
+
 def _build_candidate_clips(
     video_records: Sequence[Mapping[str, Any]],
     candidates: Sequence[Mapping[str, Any]],
@@ -323,6 +344,7 @@ def _build_candidate_clips(
     clip_frames: int,
     crop_size: int,
     region_lookup: dict[str, Any] | None = None,
+    overlap_threshold: float = 0.10,
 ) -> list[_CandidateClip]:
     ordered = sorted(
         video_records,
@@ -352,10 +374,18 @@ def _build_candidate_clips(
                     return region_lookup[str(sid)]
             return item
 
+        # Only include context boxes that overlap the candidate region
+        # (IoU or containment ≥ overlap_threshold).  This prevents unrelated
+        # adjacent regions from inflating the crop beyond the motion area of
+        # interest while still spanning the candidate's own motion arc.
         window_boxes = [
             box
             for box in (_try_primary_box(_region_source(item)) for item in context)
             if box is not None
+            and (
+                overlap_threshold <= 0.0
+                or max(_box_iou_containment(box, candidate_box)) >= overlap_threshold
+            )
         ]
         crop_box = _union_box(window_boxes) if window_boxes else candidate_box
         clips.append(
@@ -1388,6 +1418,7 @@ def _run_cgvqm_claim_loop(
                             clip_frames=config.cgvqm.clip_frames,
                             crop_size=config.cgvqm.crop_size,
                             region_lookup=region_lookup,
+                            overlap_threshold=config.cgvqm.union_crop_iou_threshold,
                         )
                         message = (
                             f"[cgvqm] video {video_id}: still refining "

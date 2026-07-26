@@ -465,6 +465,7 @@ def test_clip_crop_box_is_the_window_union_not_the_candidate_box():
         [video[1]],  # candidate is the middle frame
         clip_frames=3,
         crop_size=32,
+        overlap_threshold=0.0,
     )
     clip = clips[0]
     # The candidate's own box is unchanged (used for the region mask).
@@ -705,6 +706,7 @@ def test_union_crop_uses_source_regions_via_region_lookup():
         clip_frames=3,
         crop_size=32,
         region_lookup=lookup,
+        overlap_threshold=0.0,
     )
     # Union of (0,0,10,10) and (50,50,100,100) → (0,0,100,100)
     crop = clips[0].crop_box
@@ -730,3 +732,87 @@ def test_union_crop_falls_back_when_region_lookup_is_none():
     )
     # No lookup, no context boxes → crop collapses to candidate box.
     assert clips[0].crop_box == (20, 20, 40, 40)
+
+
+def test_box_iou_containment_perfect_overlap():
+    a = (0, 0, 10, 10)
+    iou, containment = stage_module._box_iou_containment(a, a)
+    assert iou == pytest.approx(1.0)
+    assert containment == pytest.approx(1.0)
+
+
+def test_box_iou_containment_no_overlap():
+    a = (0, 0, 5, 5)
+    b = (10, 10, 20, 20)
+    iou, containment = stage_module._box_iou_containment(a, b)
+    assert iou == pytest.approx(0.0)
+    assert containment == pytest.approx(0.0)
+
+
+def test_box_iou_containment_partial():
+    # a and b share a 5×5 block in the corner
+    a = (0, 0, 10, 10)  # area = 100
+    b = (5, 5, 15, 15)  # area = 100, inter = 25, union = 175
+    iou, containment = stage_module._box_iou_containment(a, b)
+    assert iou == pytest.approx(25 / 175)
+    assert containment == pytest.approx(25 / 100)
+
+
+def test_box_iou_containment_degenerate():
+    a = (5, 5, 5, 5)  # zero area
+    b = (0, 0, 10, 10)
+    iou, containment = stage_module._box_iou_containment(a, b)
+    assert iou == pytest.approx(0.0)
+    assert containment == pytest.approx(0.0)
+
+
+def test_union_crop_iou_filter_excludes_distant_context_boxes():
+    """Context boxes with no overlap to candidate box are filtered out."""
+    candidate = _record_with_box("c", (5, 6), (0, 0, 10, 10))
+    far_neighbour_src = _record_with_box("n0", (4, 5), (200, 200, 300, 300))
+    near_neighbour_src = _record_with_box("n1", (6, 7), (5, 5, 15, 15))
+
+    all_index = [
+        _index_record("n0", (4, 5)),
+        candidate,
+        _index_record("n1", (6, 7)),
+    ]
+    lookup = {
+        "c": candidate,
+        "n0": far_neighbour_src,
+        "n1": near_neighbour_src,
+    }
+
+    clips = stage_module._build_candidate_clips(
+        all_index,
+        [candidate],
+        clip_frames=3,
+        crop_size=32,
+        region_lookup=lookup,
+        overlap_threshold=0.10,
+    )
+    crop = clips[0].crop_box
+    # far_neighbour (200,200,300,300) has zero IoU with candidate (0,0,10,10)
+    # and must be excluded.  near_neighbour (5,5,15,15) overlaps and is kept.
+    assert crop[2] < 200 and crop[3] < 200
+
+
+def test_union_crop_iou_filter_zero_threshold_includes_all():
+    """overlap_threshold=0.0 disables the filter — all context boxes included."""
+    candidate = _record_with_box("c", (5, 6), (0, 0, 10, 10))
+    far_neighbour_src = _record_with_box("n0", (4, 5), (200, 200, 300, 300))
+
+    all_index = [_index_record("n0", (4, 5)), candidate]
+    lookup = {"c": candidate, "n0": far_neighbour_src}
+
+    clips = stage_module._build_candidate_clips(
+        all_index,
+        [candidate],
+        clip_frames=3,
+        crop_size=32,
+        region_lookup=lookup,
+        overlap_threshold=0.0,
+    )
+    crop = clips[0].crop_box
+    # With no filtering, far box is included in the union.
+    assert crop[2] >= 300 or crop[3] >= 300

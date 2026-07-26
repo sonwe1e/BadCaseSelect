@@ -89,6 +89,7 @@ class CGVQMConfig:
     temporal_persistence_at: float = 0.35
     spatial_overlap_at: float = 0.35
     flicker_change_at: float = 10.0
+    union_crop_iou_threshold: float = 0.10
 
     def validate(self) -> None:
         if not self.backbone_checkpoint or not self.calibration_checkpoint:
@@ -113,6 +114,8 @@ class CGVQMConfig:
             raise ValueError("cgvqm.spatial_overlap_at must be in [0,1]")
         if not 0.0 <= self.flicker_change_at <= 100.0:
             raise ValueError("cgvqm.flicker_change_at must be in [0,100]")
+        if not 0.0 <= self.union_crop_iou_threshold <= 1.0:
+            raise ValueError("cgvqm.union_crop_iou_threshold must be in [0,1]")
 
 
 @dataclass(frozen=True, slots=True)

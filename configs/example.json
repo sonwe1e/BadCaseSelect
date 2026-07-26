@@ -35,7 +35,8 @@
     "a_error_at": 50.0,
     "temporal_persistence_at": 0.35,
     "spatial_overlap_at": 0.35,
-    "flicker_change_at": 10.0
+    "flicker_change_at": 10.0,
+    "union_crop_iou_threshold": 0.10
   },
   "thresholds": {
     "wrong_reject_below": 0.20,

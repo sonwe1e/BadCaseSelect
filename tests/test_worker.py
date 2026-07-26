@@ -1329,9 +1329,9 @@ def test_fast_rejected_samples_never_materialize_tier2(tmp_path, monkeypatch):
     calls = []
     original_materialize = worker_module.Tier2Residue.materialize
 
-    def spy(self):
+    def spy(self, indices=None):
         calls.append(id(self))
-        return original_materialize(self)
+        return original_materialize(self, indices)
 
     monkeypatch.setattr(worker_module.Tier2Residue, "materialize", spy)
     results = worker_module._process_payload_records(
@@ -1455,9 +1455,9 @@ def test_two_phase_materialize_runs_on_the_main_thread(tmp_path, monkeypatch):
     calls = []
     original_materialize = worker_module.Tier2Residue.materialize
 
-    def spy(self):
+    def spy(self, indices=None):
         calls.append(threading.current_thread())
-        return original_materialize(self)
+        return original_materialize(self, indices)
 
     monkeypatch.setattr(worker_module.Tier2Residue, "materialize", spy)
     results = worker_module._process_payload_records(
