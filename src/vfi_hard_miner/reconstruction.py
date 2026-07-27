@@ -13,10 +13,14 @@ from __future__ import annotations
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
+import time
 from typing import Literal
+import warnings
 
 import torch
 import torch.nn.functional as F
+
+from .gates import compute_motion_evidence_torch
 
 
 Mask0Role = Literal["warp0_weight", "warp1_weight"]
@@ -33,14 +37,17 @@ class ReconstructionResult:
     materialized and merged back (see ``Tier2Residue`` / ``merge_tier2``).
     """
 
-    flow_t0: torch.Tensor
-    flow_t1: torch.Tensor
+    flow_t0: torch.Tensor | None
+    flow_t1: torch.Tensor | None
     mask0: torch.Tensor | None
     mask1: torch.Tensor | None
     warp0: torch.Tensor | None
     warp1: torch.Tensor | None
     warp_blend: torch.Tensor | None
     prediction: torch.Tensor
+    scope_metrics: torch.Tensor | None = None
+    flow_discontinuity_map: torch.Tensor | None = None
+    flow_metric_timings: Mapping[str, float] | None = None
 
 
 DeviceLike = torch.device | str | None
@@ -292,6 +299,7 @@ def reconstruct_midpoint(
     padding_mode: PaddingMode = "border",
     device: DeviceLike = None,
     validate: bool = True,
+    compute_motion_metrics: bool = False,
 ) -> ReconstructionResult:
     """Reconstruct the midpoint prediction under the fixed model contract.
 
@@ -378,6 +386,50 @@ def reconstruct_midpoint(
             device=target,
             validate=validate,
         )
+        motion_evidence = None
+        if compute_motion_metrics:
+            try:
+                motion_evidence = compute_motion_evidence_torch(
+                    resized_flow0,
+                    resized_flow1,
+                    synchronize_timings=True,
+                )
+            except (NotImplementedError, RuntimeError) as exc:
+                message = str(exc).lower()
+                unsupported = any(
+                    marker in message
+                    for marker in (
+                        "not implemented",
+                        "not support",
+                        "unsupported",
+                        "could not run",
+                    )
+                )
+                if target.type == "cpu" or not unsupported:
+                    raise
+                fallback_started = time.perf_counter()
+                motion_evidence = compute_motion_evidence_torch(
+                    resized_flow0.detach().to(device="cpu"),
+                    resized_flow1.detach().to(device="cpu"),
+                    synchronize_timings=False,
+                )
+                fallback_timings = dict(motion_evidence.timings_seconds)
+                fallback_timings["flow_cpu_fallback"] = (
+                    time.perf_counter() - fallback_started
+                )
+                motion_evidence = type(motion_evidence)(
+                    scope_metrics=motion_evidence.scope_metrics,
+                    flow_discontinuity_support=(
+                        motion_evidence.flow_discontinuity_support
+                    ),
+                    timings_seconds=fallback_timings,
+                )
+                warnings.warn(
+                    "reconstruction device does not support one or more flow "
+                    "scope operators; falling back to CPU flow metrics",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         resized_mask0 = resize_mask(
             raw_mask0,
             original_size,
@@ -427,6 +479,21 @@ def reconstruct_midpoint(
             warp1=warp1,
             warp_blend=warp_blend,
             prediction=prediction,
+            scope_metrics=(
+                motion_evidence.scope_metrics
+                if motion_evidence is not None
+                else None
+            ),
+            flow_discontinuity_map=(
+                motion_evidence.flow_discontinuity_support
+                if motion_evidence is not None
+                else None
+            ),
+            flow_metric_timings=(
+                motion_evidence.timings_seconds
+                if motion_evidence is not None
+                else None
+            ),
         )
 
 
@@ -442,12 +509,10 @@ _PACK_FIELD_CHANNELS: tuple[tuple[str, int], ...] = (
 )
 RECONSTRUCTION_CHANNELS = sum(channels for _, channels in _PACK_FIELD_CHANNELS)
 
-# Two-tier transfer: tier-1 (prediction + flows) is needed for every sample
-# (motion gates + base scoring), tier-2 (warps + masks) only for samples that
-# pass fast-reject and reach diagnose_sample.
+# Two-tier transfer: tier-1 keeps only prediction.  Scope scalars and the
+# thresholded one-byte discontinuity support are packed separately, so the
+# four full-resolution float32 flow channels never cross to the CPU.
 _TIER1_FIELDS: tuple[tuple[str, int], ...] = (
-    ("flow_t0", 2),
-    ("flow_t1", 2),
     ("prediction", 3),
 )
 _TIER2_FIELDS: tuple[tuple[str, int], ...] = (
@@ -477,7 +542,24 @@ def pack_reconstruction_to_cpu(result: ReconstructionResult) -> ReconstructionRe
     for name, channels in _PACK_FIELD_CHANNELS:
         fields[name] = packed[:, offset : offset + channels]
         offset += channels
-    return ReconstructionResult(**fields)
+    return ReconstructionResult(
+        **fields,
+        scope_metrics=(
+            None
+            if result.scope_metrics is None
+            else result.scope_metrics.detach().to(
+                device="cpu", dtype=torch.float32
+            )
+        ),
+        flow_discontinuity_map=(
+            None
+            if result.flow_discontinuity_map is None
+            else result.flow_discontinuity_map.detach().to(
+                device="cpu", dtype=torch.uint8
+            )
+        ),
+        flow_metric_timings=result.flow_metric_timings,
+    )
 
 
 class Tier2Residue:
@@ -555,10 +637,12 @@ class Tier2Residue:
 def pack_tier1_to_cpu(
     result: ReconstructionResult,
 ) -> tuple[ReconstructionResult, Tier2Residue]:
-    """Transfer tier-1 (prediction + flows, 7ch) to CPU; hold tier-2 back.
+    """Transfer prediction + compact scope evidence; hold tier-2 back.
 
-    Device path: tier-1 leaves in one packed copy and tier-2 is concatenated
-    into a single device-resident tensor inside the returned ``Tier2Residue``.
+    Device path: prediction (3ch), six scalars, and one uint8 support plane
+    leave the device; tier-2 is concatenated into one device-resident tensor.
+    The full-resolution flow fields remain device-local and are released when
+    this function returns.
     CPU path: no copies at all — tier-1 fields are referenced directly and the
     residue keeps the original field tensors, so ``materialize`` degrades to
     identity transfers.  Sliced values are bitwise identical to the legacy
@@ -566,33 +650,43 @@ def pack_tier1_to_cpu(
     """
 
     if result.prediction.device.type != "cpu":
-        tier1 = torch.cat(
-            [getattr(result, name) for name, _ in _TIER1_FIELDS], dim=1
+        tier1 = result.prediction.detach().to(
+            device="cpu", dtype=torch.float32
         )
-        tier1 = tier1.detach().to(device="cpu", dtype=torch.float32)
-        tier1_fields: dict[str, torch.Tensor] = {}
-        offset = 0
-        for name, channels in _TIER1_FIELDS:
-            tier1_fields[name] = tier1[:, offset : offset + channels]
-            offset += channels
+        tier1_fields = {"prediction": tier1}
         tier2 = torch.cat(
             [getattr(result, name) for name, _ in _TIER2_FIELDS], dim=1
         )
         residue = Tier2Residue(packed=tier2)
     else:
-        tier1_fields = {name: getattr(result, name) for name, _ in _TIER1_FIELDS}
+        tier1_fields = {"prediction": result.prediction}
         residue = Tier2Residue(
             fields={name: getattr(result, name) for name, _ in _TIER2_FIELDS}
         )
     partial = ReconstructionResult(
-        flow_t0=tier1_fields["flow_t0"],
-        flow_t1=tier1_fields["flow_t1"],
+        flow_t0=None,
+        flow_t1=None,
         mask0=None,
         mask1=None,
         warp0=None,
         warp1=None,
         warp_blend=None,
         prediction=tier1_fields["prediction"],
+        scope_metrics=(
+            None
+            if result.scope_metrics is None
+            else result.scope_metrics.detach().to(
+                device="cpu", dtype=torch.float32
+            )
+        ),
+        flow_discontinuity_map=(
+            None
+            if result.flow_discontinuity_map is None
+            else result.flow_discontinuity_map.detach().to(
+                device="cpu", dtype=torch.uint8
+            )
+        ),
+        flow_metric_timings=result.flow_metric_timings,
     )
     return partial, residue
 
@@ -620,6 +714,9 @@ def pack_prediction_to_cpu(result: ReconstructionResult) -> ReconstructionResult
         warp1=None,
         warp_blend=None,
         prediction=prediction,
+        scope_metrics=None,
+        flow_discontinuity_map=None,
+        flow_metric_timings=None,
     )
 
 
@@ -637,6 +734,9 @@ def merge_tier2(
         warp1=tier2["warp1"],
         warp_blend=tier2["warp_blend"],
         prediction=partial.prediction,
+        scope_metrics=partial.scope_metrics,
+        flow_discontinuity_map=partial.flow_discontinuity_map,
+        flow_metric_timings=partial.flow_metric_timings,
     )
 
 
@@ -661,6 +761,9 @@ def slice_reconstruction_cpu(
         warp1=_s(result.warp1),
         warp_blend=_s(result.warp_blend),
         prediction=_s(result.prediction),
+        scope_metrics=_s(result.scope_metrics),
+        flow_discontinuity_map=_s(result.flow_discontinuity_map),
+        flow_metric_timings=result.flow_metric_timings,
     )
 
 

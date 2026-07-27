@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait as wait_futures,
+)
 from dataclasses import dataclass, replace as _replace_dc
 import os
 from queue import Full, Queue
@@ -27,6 +32,8 @@ from .diagnosis import (
     estimate_solvability,
 )
 from .gates import (
+    MotionEvidence,
+    ScopeMetrics,
     compute_motion_evidence,
     compute_validity_metrics,
     decide_hard_case,
@@ -50,7 +57,14 @@ from .reconstruction import (
     reconstruct_midpoint,
     slice_reconstruction_cpu,
 )
-from .scoring import build_image_basis, luminance, score_local_errors, score_region
+from .scoring import (
+    ImageBasis,
+    build_image_basis,
+    complete_score_metrics,
+    luminance,
+    score_local_errors,
+    score_region,
+)
 from .state import LeaseHeartbeat, LeaseLostError, TaskStore
 
 
@@ -114,6 +128,8 @@ class CpuTimingTotals:
 
     def __post_init__(self) -> None:
         self._lock = Lock()
+        self._phase_seconds: dict[str, float] = {}
+        self._phase_samples: dict[str, int] = {}
 
     def add(
         self,
@@ -150,6 +166,24 @@ class CpuTimingTotals:
             self.future_wait_seconds += float(seconds)
             self.future_wait_samples += int(samples)
 
+    def add_phases(
+        self,
+        phases: Mapping[str, float] | None,
+        *,
+        samples: int = 1,
+    ) -> None:
+        if not phases:
+            return
+        count = max(1, int(samples))
+        with self._lock:
+            for name, seconds in phases.items():
+                self._phase_seconds[name] = self._phase_seconds.get(
+                    name, 0.0
+                ) + float(seconds)
+                self._phase_samples[name] = self._phase_samples.get(
+                    name, 0
+                ) + count
+
     def milliseconds_per_sample(self) -> dict[str, float]:
         with self._lock:
             values = {
@@ -183,6 +217,15 @@ class CpuTimingTotals:
                     self.samples,
                 ),
             }
+            values.update(
+                {
+                    name: (
+                        seconds,
+                        self._phase_samples.get(name, 0),
+                    )
+                    for name, seconds in self._phase_seconds.items()
+                }
+            )
         return {
             name: (seconds * 1000.0 / count if count > 0 else 0.0)
             for name, (seconds, count) in values.items()
@@ -190,6 +233,22 @@ class CpuTimingTotals:
 
 
 _TIMING_REPORT_SAMPLES = 16
+_DETAILED_TIMING_FIELDS = (
+    "validity_difference",
+    "validity_histogram",
+    "validity_quantile",
+    "flow_oob",
+    "flow_background_median",
+    "flow_gradient",
+    "flow_quantile",
+    "flow_cpu_fallback",
+    "error_map_generation",
+    "candidate_quantile",
+    "native_component_label",
+    "integral_windows",
+    "summary_metrics",
+    "phase2_diagnosis",
+)
 
 
 def _print_timing_summary(
@@ -212,7 +271,11 @@ def _print_timing_summary(
         f"  scoring_ms/sample={values['scoring']:.1f}"
         f"  branch_evidence_ms/sample={values['branch_evidence']:.1f}"
         f"  motion_gates_ms/sample={values['motion_gates']:.1f}"
-        f"  serialization_ms/sample={values['serialization']:.1f}",
+        f"  serialization_ms/sample={values['serialization']:.1f}"
+        + "".join(
+            f"  {name}_ms/sample={values.get(name, 0.0):.1f}"
+            for name in _DETAILED_TIMING_FIELDS
+        ),
         file=sys.stderr,
         flush=True,
     )
@@ -383,6 +446,56 @@ def _hwc(tensor: torch.Tensor) -> np.ndarray:
     return np.asarray(value, dtype=np.float32)
 
 
+def _motion_evidence_for_sample(
+    reconstructed: ReconstructionResult,
+    batch_index: int,
+) -> MotionEvidence:
+    """Use compact device-computed evidence, with a legacy CPU fallback."""
+
+    if reconstructed.scope_metrics is not None:
+        values = (
+            reconstructed.scope_metrics[batch_index]
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+            .numpy()
+        )
+        if values.shape != (6,) or not np.isfinite(values).all():
+            raise ValueError("device scope metrics must contain six finite values")
+        support: np.ndarray | None = None
+        if reconstructed.flow_discontinuity_map is not None:
+            raw_support = (
+                reconstructed.flow_discontinuity_map[batch_index]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            support = np.squeeze(raw_support).astype(np.float32, copy=False)
+            if support.ndim != 2:
+                raise ValueError(
+                    "device flow discontinuity support must be a 2-D map"
+                )
+        return MotionEvidence(
+            scope_metrics=ScopeMetrics(
+                out_of_bounds_ratio=float(values[0]),
+                flow_discontinuity_ratio=float(values[1]),
+                foreground_large_motion_ratio=float(values[2]),
+                occlusion_ratio=float(values[3]),
+                unexplained_motion_ratio=float(values[4]),
+                background_motion=float(values[5]),
+            ),
+            flow_discontinuity_map=support,
+        )
+    if reconstructed.flow_t0 is None or reconstructed.flow_t1 is None:
+        raise RuntimeError(
+            "reconstruction has neither compact scope evidence nor CPU flow"
+        )
+    return compute_motion_evidence(
+        _hwc(reconstructed.flow_t0[batch_index]),
+        _hwc(reconstructed.flow_t1[batch_index]),
+    )
+
+
 def _load_cached_uint8(cache: ImageCache, path: str, *, max_items: int) -> np.ndarray:
     """LRU frame cache in uint8 form (4x less memory than float32)."""
 
@@ -449,9 +562,9 @@ def _sample_record(
     scoring_basis_elapsed = time.perf_counter() - scoring_basis_started
 
     motion_gates_started = time.perf_counter()
-    flow_t0 = _hwc(reconstructed.flow_t0[batch_index])
-    flow_t1 = _hwc(reconstructed.flow_t1[batch_index])
-    motion_evidence = compute_motion_evidence(flow_t0, flow_t1)
+    motion_evidence = _motion_evidence_for_sample(
+        reconstructed, batch_index
+    )
     indices = tuple(int(value) for value in source["frame_indices"])
     stride = int(source["stride"])
     contiguous = indices == (indices[0], indices[0] + stride, indices[0] + 2 * stride)
@@ -623,6 +736,31 @@ class Phase1Reject:
     record: dict[str, Any]
 
 
+class _BatchImageBasisCache:
+    """Tiny rolling cache for overlapping stride-1 triplets in one Future."""
+
+    def __init__(self, max_items: int = 3) -> None:
+        self._max_items = max(1, int(max_items))
+        self._items: OrderedDict[str, ImageBasis] = OrderedDict()
+
+    def get(
+        self,
+        key: str,
+        image: np.ndarray,
+        *,
+        name: str,
+    ) -> ImageBasis:
+        existing = self._items.pop(key, None)
+        if existing is not None:
+            self._items[key] = existing
+            return existing
+        basis = build_image_basis(image, name=name)
+        self._items[key] = basis
+        while len(self._items) > self._max_items:
+            self._items.popitem(last=False)
+        return basis
+
+
 @dataclass(frozen=True, slots=True)
 class Phase1Candidate:
     """Live tier-1 intermediates for a sample that earned a full diagnosis.
@@ -637,6 +775,7 @@ class Phase1Candidate:
     img0: np.ndarray
     gt: np.ndarray
     img1: np.ndarray
+    img1_basis: ImageBasis
     prediction: np.ndarray
     scoring: Any
     motion_evidence: Any
@@ -663,19 +802,47 @@ def _score_sample_phase1(
     batch_index: int,
     thresholds: Any,
     timings: CpuTimingTotals | None = None,
+    basis_cache: _BatchImageBasisCache | None = None,
 ) -> Phase1Reject | Phase1Candidate:
     """Tier-1 scoring for one sample: pure numpy / CPU-torch work.
 
-    Runs in a postprocess pool thread on tier-1 data only (flows +
-    prediction, already on the CPU).  Rejected samples return finished
+    Runs in a postprocess pool thread on tier-1 data only (prediction +
+    compact scope evidence, already on the CPU). Rejected samples return finished
     records bitwise identical to the legacy single-phase path; candidates
     carry their intermediates into phase 2.
     """
 
+    phase_timings: dict[str, float] = {}
     scoring_basis_started = time.perf_counter()
-    gt_basis = build_image_basis(gt, name="gt")
-    img0_luminance = luminance(img0)
-    img1_luminance = luminance(img1)
+    if basis_cache is None:
+        gt_basis = build_image_basis(gt, name="gt")
+        img0_luminance = luminance(img0)
+        img1_luminance = luminance(img1)
+        img1_basis = build_image_basis(img1, name="img1")
+    else:
+        def basis_key(field: str, image: np.ndarray) -> str:
+            value = source.get(field, {})
+            if isinstance(value, Mapping) and value.get("path"):
+                return str(value["path"])
+            return f"{field}:{id(image)}"
+
+        img0_basis = basis_cache.get(
+            basis_key("img0", img0),
+            img0,
+            name="img0",
+        )
+        gt_basis = basis_cache.get(
+            basis_key("gt", gt),
+            gt,
+            name="gt",
+        )
+        img1_basis = basis_cache.get(
+            basis_key("img1", img1),
+            img1,
+            name="img1",
+        )
+        img0_luminance = img0_basis.luminance
+        img1_luminance = img1_basis.luminance
     endpoint_change = np.asarray(
         np.abs(img0 - img1).mean(axis=-1),
         dtype=np.float32,
@@ -683,9 +850,9 @@ def _score_sample_phase1(
     scoring_basis_elapsed = time.perf_counter() - scoring_basis_started
 
     motion_gates_started = time.perf_counter()
-    flow_t0 = _hwc(reconstructed.flow_t0[batch_index])
-    flow_t1 = _hwc(reconstructed.flow_t1[batch_index])
-    motion_evidence = compute_motion_evidence(flow_t0, flow_t1)
+    motion_evidence = _motion_evidence_for_sample(
+        reconstructed, batch_index
+    )
     indices = tuple(int(value) for value in source["frame_indices"])
     stride = int(source["stride"])
     contiguous = indices == (indices[0], indices[0] + stride, indices[0] + 2 * stride)
@@ -699,6 +866,7 @@ def _score_sample_phase1(
             gt_basis.luminance,
             img1_luminance,
         ),
+        timings=phase_timings,
     )
     validity = evaluate_validity(validity_metrics, thresholds)
     scope_metrics = motion_evidence.scope_metrics
@@ -715,6 +883,8 @@ def _score_sample_phase1(
         img1=img1,
         reference_basis=gt_basis,
         endpoint_change_map=endpoint_change,
+        detailed_metrics=False,
+        timings=phase_timings,
     )
     scoring_elapsed = (
         scoring_basis_elapsed + time.perf_counter() - scoring_started
@@ -729,12 +899,15 @@ def _score_sample_phase1(
         fast_reject_reason = "prediction_not_wrong"
 
     if fast_reject_reason is None:
+        if timings is not None:
+            timings.add_phases(phase_timings)
         return Phase1Candidate(
             sample_index=batch_index,
             source=source,
             img0=img0,
             gt=gt,
             img1=img1,
+            img1_basis=img1_basis,
             prediction=prediction,
             scoring=scoring,
             motion_evidence=motion_evidence,
@@ -823,6 +996,7 @@ def _score_sample_phase1(
     }
     serialization_elapsed = time.perf_counter() - serialization_started
     if timings is not None:
+        timings.add_phases(phase_timings)
         timings.add(
             scoring=scoring_elapsed,
             branch_evidence=branch_elapsed,
@@ -847,6 +1021,12 @@ def _diagnose_sample_phase2(
     """
 
     index = candidate.sample_index
+    phase_timings: dict[str, float] = {}
+    complete_score_metrics(
+        candidate.scoring,
+        thresholds,
+        timings=phase_timings,
+    )
     branch_started = time.perf_counter()
     diagnosis = diagnose_sample(
         candidate.prediction,
@@ -862,6 +1042,7 @@ def _diagnose_sample_phase2(
         regions=candidate.scoring.regions,
         scoring_config=thresholds,
         scoring_result=candidate.scoring,
+        img1_basis=candidate.img1_basis,
         config=thresholds,
     )
     p_wrong = float(diagnosis.p_wrong)
@@ -872,6 +1053,10 @@ def _diagnose_sample_phase2(
     diagnosis_metrics: dict[str, Any] = dict(diagnosis.metrics)
     primary_region_index = diagnosis.primary_region_index
     branch_elapsed = time.perf_counter() - branch_started
+    phase_timings["phase2_diagnosis"] = (
+        phase_timings.get("phase2_diagnosis", 0.0)
+        + branch_elapsed
+    )
 
     decision = decide_hard_case(
         candidate.validity,
@@ -922,6 +1107,7 @@ def _diagnose_sample_phase2(
     }
     serialization_elapsed = time.perf_counter() - serialization_started
     if timings is not None:
+        timings.add_phases(phase_timings)
         timings.add(
             scoring=candidate.scoring_elapsed,
             branch_evidence=branch_elapsed,
@@ -941,6 +1127,7 @@ def _finish_phase1_batch(
     """Pool-thread entry: tier-1 fast-reject scoring for a whole microbatch."""
 
     outcomes: list[Phase1Reject | Phase1Candidate] = []
+    basis_cache = _BatchImageBasisCache(max_items=3)
     for index, item in enumerate(items):
         outcomes.append(
             _score_sample_phase1(
@@ -952,6 +1139,7 @@ def _finish_phase1_batch(
                 batch_index=index,
                 thresholds=config.thresholds,
                 timings=timings,
+                basis_cache=basis_cache,
             )
         )
     return Phase1BatchResult(outcomes=outcomes)
@@ -1139,12 +1327,66 @@ class _ProgressLog:
         self._scored = 0
         self._start = time.monotonic()
         self._last = self._start
+        self._resolved_postproc_workers = 0
+        self._resolved_microbatch_size: int | str = "auto_pending"
+        self._postproc_buffer_mb = 0
+        self._candidate_ratio = 0.0
+        self._phase1_queue_depth = 0
+        self._phase2_queue_depth = 0
         print(
             f"{self._prefix}  inferred 0/{self._total}"
             f"  scored 0/{self._total}  starting",
             file=sys.stderr,
             flush=True,
         )
+
+    def configure(
+        self,
+        *,
+        resolved_postproc_workers: int,
+        resolved_microbatch_size: int | str,
+        postproc_buffer_mb: int,
+    ) -> None:
+        self._resolved_postproc_workers = int(resolved_postproc_workers)
+        self._resolved_microbatch_size = resolved_microbatch_size
+        self._postproc_buffer_mb = int(postproc_buffer_mb)
+        print(
+            f"{self._prefix}  pipeline_config"
+            f"  resolved_postproc_workers "
+            f"{self._resolved_postproc_workers}"
+            f"  resolved_microbatch_size "
+            f"{self._resolved_microbatch_size}"
+            f"  postproc_buffer_mb {self._postproc_buffer_mb}"
+            f"  candidate_ratio {self._candidate_ratio:.4f}"
+            f"  actual_tier2_d2h_bytes 0"
+            f"  phase1_queue_depth 0"
+            f"  phase2_queue_depth 0",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def set_pipeline_state(
+        self,
+        *,
+        candidate_ratio: float,
+        phase1_queue_depth: int,
+        phase2_queue_depth: int,
+        resolved_microbatch_size: int | None = None,
+    ) -> None:
+        self._candidate_ratio = float(np.clip(candidate_ratio, 0.0, 1.0))
+        self._phase1_queue_depth = max(0, int(phase1_queue_depth))
+        self._phase2_queue_depth = max(0, int(phase2_queue_depth))
+        if resolved_microbatch_size is not None:
+            first_resolution = self._resolved_microbatch_size == "auto_pending"
+            self._resolved_microbatch_size = int(resolved_microbatch_size)
+            if first_resolution:
+                print(
+                    f"{self._prefix}  pipeline_resolved"
+                    f"  resolved_microbatch_size "
+                    f"{self._resolved_microbatch_size}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def update_inferred(
         self,
@@ -1332,8 +1574,17 @@ class _ProgressLog:
             f"  device_retained "
             f"{pending_device_retained_bytes / (1024 * 1024):.0f} MiB"
             f"  tier2_d2h {tier2_d2h_bytes / (1024 * 1024):.0f} MiB"
+            f"  actual_tier2_d2h_bytes {tier2_d2h_bytes}"
             f"  tier2_materialized_batches {tier2_materialized_batches}"
             f"  tier2_candidate_samples {tier2_candidate_samples}"
+            f"  candidate_ratio {self._candidate_ratio:.4f}"
+            f"  resolved_postproc_workers "
+            f"{self._resolved_postproc_workers}"
+            f"  resolved_microbatch_size "
+            f"{self._resolved_microbatch_size}"
+            f"  postproc_buffer_mb {self._postproc_buffer_mb}"
+            f"  phase1_queue_depth {self._phase1_queue_depth}"
+            f"  phase2_queue_depth {self._phase2_queue_depth}"
             f"  decode_uint8 "
             f"{resolved_memory.decode_uint8_bytes / (1024 * 1024):.0f} MiB"
             f"  network {resolved_memory.network_bytes / (1024 * 1024):.0f} MiB"
@@ -1616,14 +1867,14 @@ def _reconstruct_outputs(
     ``validate=False`` disables the device-synchronizing NaN/range scans for
     the production hot path; results are bitwise identical either way.
 
-    ``tiered=True`` returns ``(partial, residue)``: tier-1 (prediction +
-    flows, 7ch) is transferred immediately and tier-2 (warps + masks, 11ch)
-    stays resident until the scoring thread materializes it for candidates
-    that pass fast-reject.
+    ``tiered=True`` returns ``(partial, residue)``: tier-1 transfers prediction,
+    six scope scalars, and one uint8 discontinuity support plane; tier-2
+    (warps + masks, 11ch) stays resident until the main thread materializes
+    selected candidates.
 
     ``prediction_only=True`` transfers only the prediction (3ch) and leaves
     every other field on the device (unpacked): the teacher path scores the
-    prediction alone, so the 7ch tier-1 transfer and the held-back tier-2
+    prediction alone, so compact scope evidence and the held-back tier-2
     residue are both pure waste there.
     """
 
@@ -1640,6 +1891,7 @@ def _reconstruct_outputs(
         padding_mode=model_config.padding_mode,
         device=device,
         validate=validate,
+        compute_motion_metrics=tiered,
     )
     if prediction_only:
         return pack_prediction_to_cpu(reconstructed)
@@ -1711,6 +1963,7 @@ class PendingReservation:
 class PendingPostprocess:
     future: Future[list[dict[str, Any]]]
     reservation: PendingReservation
+    sequence_ids: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)
@@ -1726,21 +1979,23 @@ class PendingPhase1:
     reservation: PendingReservation
     tier2_residue: Tier2Residue | None
     reconstructed_tier1: ReconstructionResult
+    sequence_ids: tuple[int, ...]
 
 
 @dataclass(slots=True)
 class PendingPhase2:
     """Phase-2 diagnosis future created after the main-thread tier-2 D2H.
 
-    The main thread does not block on this future immediately: it inserts the
-    entry at the front of ``pending`` and moves on to the next reconstruction.
-    ``drain_phase2_and_collect`` awaits it and reassembles the ordered records.
+    It lives in a separate ready-scanned queue; final records are restored
+    through the global sequence reorder buffer.
     """
 
     future: Future[list[tuple[int, dict[str, Any]]]]
     record_by_index: dict[int, dict[str, Any]]
     reservation: PendingReservation
     candidate_count: int
+    sequence_ids: tuple[int, ...]
+    candidate_indices: tuple[int, ...]
 
 
 def _infer_model_batch(
@@ -1807,12 +2062,13 @@ def _reconstruction_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
 
 
 def _reconstruction_tier1_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
-    """CPU-held tier-1 payload (prediction + flows, 7ch float32)."""
+    """CPU tier-1: prediction + uint8 support map + six float scalars."""
 
     if not items:
         raise ValueError("cannot estimate reconstruction bytes for an empty batch")
     height, width = items[0][1].shape[:2]
-    return int(height) * int(width) * TIER1_CHANNELS * 4
+    pixels = int(height) * int(width)
+    return pixels * TIER1_CHANNELS * 4 + pixels + 6 * 4
 
 
 def _reconstruction_tier2_bytes_per_sample(items: Sequence[DecodedItem]) -> int:
@@ -1845,19 +2101,21 @@ def _postproc_reservation(
     """Budget one Future's memory.
 
     ``mode="tiered"`` (or legacy ``tiered=True``) matches the two-tier
-    production pipeline: only tier-1 (7ch) is CPU-retained per sample while
+    production pipeline: prediction + compact scope evidence are CPU-retained
+    per sample while
     tier-2 (11ch) stays on the reconstruction device until candidates
     materialize it; both count against ``pipeline_bytes``.  ``mode="full"``
     keeps the legacy 18-channel all-on-CPU accounting.  ``mode="prediction"``
     matches the teacher path: only the prediction (3ch) is retained and
-    nothing stays on the device.
+    nothing stays on the device. ``mode="phase2"`` is the candidate-only CPU
+    diagnosis reservation after selected tier-2 rows have transferred.
     """
 
     if not items:
         raise ValueError("cannot reserve postprocess memory for an empty batch")
     if tiered:
         mode = "tiered"
-    if mode not in ("full", "tiered", "prediction"):
+    if mode not in ("full", "tiered", "prediction", "phase2"):
         raise ValueError(f"unknown postproc reservation mode: {mode!r}")
     count = len(items) if sample_count is None else int(sample_count)
     if count < 1 or count > len(items):
@@ -1871,6 +2129,12 @@ def _postproc_reservation(
         device_retained_bytes = (
             count * _reconstruction_tier2_bytes_per_sample(items)
         )
+    elif mode == "phase2":
+        reconstruction_retained_bytes = count * (
+            _reconstruction_tier1_bytes_per_sample(items)
+            + _reconstruction_tier2_bytes_per_sample(items)
+        )
+        device_retained_bytes = 0
     elif mode == "prediction":
         reconstruction_retained_bytes = (
             count * _prediction_bytes_per_sample(items)
@@ -1974,13 +2238,19 @@ def _process_payload_records(
     postproc_buffer_bytes = int(config.runtime.postproc_buffer_mb) * 1024 * 1024
     postproc_workers = _resolve_postproc_workers(config)
     output: list[dict[str, Any]] = []
-    pending: list[PendingPostprocess | PendingPhase1 | PendingPhase2] = []
+    legacy_pending: list[PendingPostprocess] = []
+    phase1_pending: list[PendingPhase1] = []
+    phase2_pending: list[PendingPhase2] = []
+    completed_reorder_buffer: dict[int, dict[str, Any]] = {}
+    next_sequence_to_assign = 0
+    next_sequence_to_publish = 0
     pending_reserved_bytes = 0
     pending_retained_bytes = 0
     pending_device_retained_bytes = 0
     tier2_d2h_bytes = 0
     tier2_materialized_batches = 0
     tier2_candidate_samples = 0
+    phase1_evaluated_samples = 0
     timings = CpuTimingTotals()
     oversize_logged = False
     scored_count = 0
@@ -1989,6 +2259,36 @@ def _process_payload_records(
     network_bytes = 0
     reconstruction_transient_bytes = 0
     bar = _ProgressLog(len(records), progress_prefix) if progress_prefix else None
+    if bar is not None:
+        bar.configure(
+            resolved_postproc_workers=postproc_workers,
+            resolved_microbatch_size=(
+                config.runtime.postproc_microbatch_size
+                if config.runtime.postproc_microbatch_size > 0
+                else "auto_pending"
+            ),
+            postproc_buffer_mb=config.runtime.postproc_buffer_mb,
+        )
+
+    def sync_bar_state(*, microbatch_size: int | None = None) -> None:
+        if bar is None:
+            return
+        bar.set_pipeline_state(
+            candidate_ratio=(
+                tier2_candidate_samples
+                / max(1, phase1_evaluated_samples)
+            ),
+            phase1_queue_depth=len(phase1_pending),
+            phase2_queue_depth=len(phase2_pending),
+            resolved_microbatch_size=microbatch_size,
+        )
+
+    def pending_count() -> int:
+        return (
+            len(legacy_pending)
+            + len(phase1_pending)
+            + len(phase2_pending)
+        )
 
     def memory_estimate() -> MemoryEstimate:
         return MemoryEstimate(
@@ -2020,152 +2320,43 @@ def _process_payload_records(
         while next_timing_report <= scored_count:
             next_timing_report += _TIMING_REPORT_SAMPLES
 
-    def await_future(future: Future, *, wait_samples: int) -> Any:
-        """Wait on a pool Future with heartbeat + progress on slow waits."""
+    def publish_completed(
+        sequence_ids: Sequence[int],
+        completed: Sequence[dict[str, Any]],
+        *,
+        reservation: PendingReservation,
+        release_device: bool,
+    ) -> None:
+        """Release memory now and publish records later in source order."""
 
-        wait_started = time.perf_counter()
-        while True:
-            try:
-                result = future.result(timeout=_FUTURE_WAIT_SECONDS)
-                break
-            except FutureTimeoutError:
-                if heartbeat is not None:
-                    heartbeat()
-                if bar is not None:
-                    bar.waiting(
-                        pending_batches=len(pending) + 1,
-                        pending_bytes=pending_reserved_bytes,
-                        pending_retained_bytes=pending_retained_bytes,
-                        pending_device_retained_bytes=(
-                            pending_device_retained_bytes
-                        ),
-                        tier2_d2h_bytes=tier2_d2h_bytes,
-                        tier2_materialized_batches=tier2_materialized_batches,
-                        tier2_candidate_samples=tier2_candidate_samples,
-                        memory=memory_estimate(),
-                    )
-        timings.add_future_wait(
-            time.perf_counter() - wait_started,
-            wait_samples,
-        )
-        return result
-
-    def drain_phase1_and_submit(
-        entry: PendingPhase1, reservation: PendingReservation
-    ) -> PendingPhase2 | list[dict[str, Any]]:
-        """Await phase-1 result, do tier-2 D2H, and submit phase-2 async.
-
-        Returns a ``PendingPhase2`` when candidates need full diagnosis, or a
-        finished records list when every sample was fast-rejected (all-reject
-        path).  Device-bytes accounting is done here; CPU-buffer accounting
-        happens in ``drain_phase2_and_collect`` or in ``drain_one`` for the
-        all-reject case.
-        """
-
-        nonlocal pending_device_retained_bytes
-        nonlocal tier2_d2h_bytes, tier2_materialized_batches
-        nonlocal tier2_candidate_samples
-        phase1: Phase1BatchResult = await_future(
-            entry.future, wait_samples=reservation.sample_count
-        )
-        candidates = [
-            outcome
-            for outcome in phase1.outcomes
-            if isinstance(outcome, Phase1Candidate)
-        ]
-        record_by_index: dict[int, dict[str, Any]] = {
-            outcome.sample_index: outcome.record
-            for outcome in phase1.outcomes
-            if isinstance(outcome, Phase1Reject)
-        }
-        if candidates:
-            residue = entry.tier2_residue
-            if residue is None:
-                raise RuntimeError(
-                    "two-phase drain requires a tier-2 residue"
-                )
-            candidate_indices = [c.sample_index for c in candidates]
-            d2h_started = time.perf_counter()
-            tier2_fields = residue.materialize(candidate_indices)
-            timings.add_reconstruction(
-                time.perf_counter() - d2h_started, len(candidates)
-            )
-            tier2_d2h_bytes += reservation.device_retained_bytes
-            tier2_materialized_batches += 1
-            tier2_candidate_samples += len(candidates)
-            pending_device_retained_bytes -= reservation.device_retained_bytes
-            compacted_tier1 = slice_reconstruction_cpu(
-                entry.reconstructed_tier1, candidate_indices
-            )
-            merged = merge_tier2(compacted_tier1, tier2_fields)
-            local_candidates = [
-                _replace_dc(c, sample_index=i) for i, c in enumerate(candidates)
-            ]
-            phase2_future = executor.submit(
-                _finish_phase2_batch,
-                local_candidates,
-                merged,
-                config=config,
-                timings=timings,
-            )
-            return PendingPhase2(
-                future=phase2_future,
-                record_by_index=record_by_index,
-                reservation=reservation,
-                candidate_count=len(candidates),
-            )
-        else:
-            pending_device_retained_bytes -= reservation.device_retained_bytes
-            return [
-                record_by_index[index]
-                for index in range(reservation.sample_count)
-            ]
-
-    def drain_phase2_and_collect(
-        entry: PendingPhase2,
-    ) -> list[dict[str, Any]]:
-        """Await the phase-2 future and return records in original sample order."""
-
-        record_by_index = dict(entry.record_by_index)
-        record_by_index.update(
-            await_future(entry.future, wait_samples=entry.candidate_count)
-        )
-        return [
-            record_by_index[index]
-            for index in range(entry.reservation.sample_count)
-        ]
-
-    def drain_one() -> None:
         nonlocal pending_reserved_bytes, pending_retained_bytes
         nonlocal pending_device_retained_bytes, scored_count
-        current = pending.pop(0)
-        reservation = current.reservation
-        if isinstance(current, PendingPhase1):
-            result = drain_phase1_and_submit(current, reservation)
-            if isinstance(result, PendingPhase2):
-                # Phase-2 is now in flight; park it at the front so its
-                # samples drain before any later microbatch (FIFO).
-                pending.insert(0, result)
-                return
-            completed = result
-        elif isinstance(current, PendingPhase2):
-            completed = drain_phase2_and_collect(current)
-            # device_retained_bytes was already decremented in drain_phase1_and_submit.
-        else:
-            completed = await_future(
-                current.future, wait_samples=reservation.sample_count
+        nonlocal next_sequence_to_publish
+        if len(sequence_ids) != len(completed):
+            raise RuntimeError(
+                "completed record count does not match sequence ids"
             )
-            pending_device_retained_bytes -= reservation.device_retained_bytes
-        output.extend(completed)
         pending_reserved_bytes -= reservation.reserved_bytes
         pending_retained_bytes -= reservation.retained_bytes
-        scored_count += reservation.sample_count
+        if release_device:
+            pending_device_retained_bytes -= (
+                reservation.device_retained_bytes
+            )
+        for sequence_id, record in zip(sequence_ids, completed):
+            completed_reorder_buffer[int(sequence_id)] = record
+        while next_sequence_to_publish in completed_reorder_buffer:
+            output.append(
+                completed_reorder_buffer.pop(next_sequence_to_publish)
+            )
+            next_sequence_to_publish += 1
+        scored_count += len(completed)
         if heartbeat is not None:
             heartbeat()
+        sync_bar_state()
         if bar is not None:
             bar.update_scored(
-                reservation.sample_count,
-                pending_batches=len(pending),
+                len(completed),
+                pending_batches=pending_count(),
                 pending_bytes=pending_reserved_bytes,
                 pending_retained_bytes=pending_retained_bytes,
                 pending_device_retained_bytes=pending_device_retained_bytes,
@@ -2175,6 +2366,204 @@ def _process_payload_records(
                 memory=memory_estimate(),
             )
         maybe_report_timings()
+
+    def process_phase1(entry: PendingPhase1) -> None:
+        """Convert one completed Phase-1 result into output or Phase 2."""
+
+        nonlocal pending_reserved_bytes, pending_retained_bytes
+        nonlocal pending_device_retained_bytes
+        nonlocal tier2_d2h_bytes, tier2_materialized_batches
+        nonlocal tier2_candidate_samples, phase1_evaluated_samples
+        reservation = entry.reservation
+        phase1: Phase1BatchResult = entry.future.result()
+        candidates = [
+            outcome
+            for outcome in phase1.outcomes
+            if isinstance(outcome, Phase1Candidate)
+        ]
+        phase1_evaluated_samples += reservation.sample_count
+        record_by_index: dict[int, dict[str, Any]] = {
+            outcome.sample_index: outcome.record
+            for outcome in phase1.outcomes
+            if isinstance(outcome, Phase1Reject)
+        }
+        if not candidates:
+            pending_device_retained_bytes -= (
+                reservation.device_retained_bytes
+            )
+            completed = [
+                record_by_index[index]
+                for index in range(reservation.sample_count)
+            ]
+            publish_completed(
+                entry.sequence_ids,
+                completed,
+                reservation=reservation,
+                release_device=False,
+            )
+            return
+
+        residue = entry.tier2_residue
+        if residue is None:
+            raise RuntimeError("two-phase drain requires a tier-2 residue")
+        candidate_indices = tuple(
+            candidate.sample_index for candidate in candidates
+        )
+        candidate_items: list[DecodedItem] = [
+            (
+                candidate.source,
+                candidate.img0,
+                candidate.gt,
+                candidate.img1,
+            )
+            for candidate in candidates
+        ]
+        phase2_reservation = _postproc_reservation(
+            candidate_items,
+            buffer_bytes=postproc_buffer_bytes,
+            mode="phase2",
+        )
+        d2h_started = time.perf_counter()
+        tier2_fields = residue.materialize(list(candidate_indices))
+        d2h_elapsed = time.perf_counter() - d2h_started
+        timings.add_reconstruction(d2h_elapsed, len(candidates))
+        actual_d2h = sum(
+            int(tensor.numel()) * int(tensor.element_size())
+            for tensor in tier2_fields.values()
+        )
+        tier2_d2h_bytes += actual_d2h
+        tier2_materialized_batches += 1
+        tier2_candidate_samples += len(candidates)
+
+        # Phase 1 held every sample plus full device residue.  After selected
+        # D2H, keep only candidate CPU inputs/tier-1/tier-2 and recompute the
+        # reservation before Phase 2 enters the pool.
+        pending_reserved_bytes += (
+            phase2_reservation.reserved_bytes - reservation.reserved_bytes
+        )
+        pending_retained_bytes += (
+            phase2_reservation.retained_bytes - reservation.retained_bytes
+        )
+        pending_device_retained_bytes -= reservation.device_retained_bytes
+        compacted_tier1 = slice_reconstruction_cpu(
+            entry.reconstructed_tier1,
+            list(candidate_indices),
+        )
+        merged = merge_tier2(compacted_tier1, tier2_fields)
+        local_candidates = [
+            _replace_dc(candidate, sample_index=index)
+            for index, candidate in enumerate(candidates)
+        ]
+        future = executor.submit(
+            _finish_phase2_batch,
+            local_candidates,
+            merged,
+            config=config,
+            timings=timings,
+        )
+        phase2_pending.append(
+            PendingPhase2(
+                future=future,
+                record_by_index=record_by_index,
+                reservation=phase2_reservation,
+                candidate_count=len(candidates),
+                sequence_ids=entry.sequence_ids,
+                candidate_indices=candidate_indices,
+            )
+        )
+        sync_bar_state()
+
+    def process_phase2(entry: PendingPhase2) -> None:
+        record_by_index = dict(entry.record_by_index)
+        for local_index, record in entry.future.result():
+            try:
+                original_index = entry.candidate_indices[local_index]
+            except IndexError as exc:
+                raise RuntimeError(
+                    "phase-2 result index is outside candidate mapping"
+                ) from exc
+            record_by_index[original_index] = record
+        completed = [
+            record_by_index[index]
+            for index in range(len(entry.sequence_ids))
+        ]
+        publish_completed(
+            entry.sequence_ids,
+            completed,
+            reservation=entry.reservation,
+            release_device=False,
+        )
+
+    def process_legacy(entry: PendingPostprocess) -> None:
+        completed = entry.future.result()
+        publish_completed(
+            entry.sequence_ids,
+            completed,
+            reservation=entry.reservation,
+            release_device=True,
+        )
+
+    def reap_ready() -> bool:
+        """Reap any completed Future, preferring Phase 2 then Phase 1."""
+
+        for entries, processor in (
+            (phase2_pending, process_phase2),
+            (phase1_pending, process_phase1),
+            (legacy_pending, process_legacy),
+        ):
+            for index, entry in enumerate(entries):
+                if not entry.future.done():
+                    continue
+                entries.pop(index)
+                processor(entry)
+                return True
+        return False
+
+    def drain_any(*, block: bool) -> bool:
+        """Reap ready work without FIFO head-of-line blocking."""
+
+        if reap_ready():
+            return True
+        if not block or pending_count() == 0:
+            return False
+        futures = [
+            entry.future
+            for entry in (
+                *phase2_pending,
+                *phase1_pending,
+                *legacy_pending,
+            )
+        ]
+        wait_started = time.perf_counter()
+        while True:
+            done, _ = wait_futures(
+                futures,
+                timeout=_FUTURE_WAIT_SECONDS,
+                return_when=FIRST_COMPLETED,
+            )
+            if done:
+                break
+            if heartbeat is not None:
+                heartbeat()
+            sync_bar_state()
+            if bar is not None:
+                bar.waiting(
+                    pending_batches=pending_count(),
+                    pending_bytes=pending_reserved_bytes,
+                    pending_retained_bytes=pending_retained_bytes,
+                    pending_device_retained_bytes=(
+                        pending_device_retained_bytes
+                    ),
+                    tier2_d2h_bytes=tier2_d2h_bytes,
+                    tier2_materialized_batches=tier2_materialized_batches,
+                    tier2_candidate_samples=tier2_candidate_samples,
+                    memory=memory_estimate(),
+                )
+        timings.add_future_wait(
+            time.perf_counter() - wait_started,
+            max(1, pending_count()),
+        )
+        return reap_ready()
 
     with ThreadPoolExecutor(
         max_workers=postproc_workers,
@@ -2212,10 +2601,11 @@ def _process_payload_records(
                     len(items),
                 )
                 network_bytes = inference_batch.network_bytes
+                sync_bar_state()
                 if bar is not None:
                     bar.update_inferred(
                         len(items),
-                        pending_batches=len(pending),
+                        pending_batches=pending_count(),
                         pending_bytes=pending_reserved_bytes,
                         pending_retained_bytes=pending_retained_bytes,
                         pending_device_retained_bytes=(
@@ -2241,29 +2631,43 @@ def _process_payload_records(
                     mode=pack_mode,
                     override=config.runtime.postproc_microbatch_size,
                 )
+                sync_bar_state(microbatch_size=microbatch_size)
                 for start in range(0, len(items), microbatch_size):
+                    while drain_any(block=False):
+                        pass
                     end = min(len(items), start + microbatch_size)
                     item_slice = list(items[start:end])
+                    sequence_ids = tuple(
+                        range(
+                            next_sequence_to_assign,
+                            next_sequence_to_assign + len(item_slice),
+                        )
+                    )
+                    next_sequence_to_assign += len(item_slice)
                     reservation = _postproc_reservation(
                         item_slice,
                         buffer_bytes=postproc_buffer_bytes,
                         mode=pack_mode,
                     )
-                    while pending and (
-                        len(pending) >= postproc_workers
+                    while pending_count() and (
+                        pending_count() >= postproc_workers
                         or reservation.oversize
                         or pending_reserved_bytes
                         + pending_device_retained_bytes
                         + reservation.pipeline_bytes
                         > postproc_buffer_bytes
                     ):
-                        drain_one()
+                        if not drain_any(block=True):
+                            raise RuntimeError(
+                                "pending work could not make progress"
+                            )
                     reconstruction_transient_bytes = (
                         reservation.reconstruction_transient_bytes
                     )
+                    sync_bar_state()
                     if bar is not None:
                         bar.waiting(
-                            pending_batches=len(pending),
+                            pending_batches=pending_count(),
                             pending_bytes=pending_reserved_bytes,
                             pending_retained_bytes=pending_retained_bytes,
                             pending_device_retained_bytes=(
@@ -2292,9 +2696,10 @@ def _process_payload_records(
                             prediction_only=True,
                         )
                     elif tiered_reconstruction:
-                        # Two-tier D2H: only prediction + flows (7ch) leave
-                        # the device now; warps + masks (11ch) transfer on
-                        # demand for candidates that pass fast-reject.
+                        # Tier 1 transfers prediction + six scope scalars +
+                        # one uint8 discontinuity support plane.  Full-
+                        # resolution flows stay on the device and are freed;
+                        # warps + masks transfer only for candidates.
                         reconstructed, tier2_residue = _reconstruct_outputs(
                             prepared.img0_tensor,
                             prepared.img1_tensor,
@@ -2316,6 +2721,10 @@ def _process_payload_records(
                             device=reconstruction_device,
                             validate=False,
                         )
+                    timings.add_phases(
+                        reconstructed.flow_metric_timings,
+                        samples=len(item_slice),
+                    )
                     timings.add_reconstruction(
                         time.perf_counter() - reconstruction_started,
                         len(item_slice),
@@ -2342,6 +2751,7 @@ def _process_payload_records(
                                 reservation=reservation,
                                 tier2_residue=tier2_residue,
                                 reconstructed_tier1=reconstructed,
+                                sequence_ids=sequence_ids,
                             )
                         )
                     else:
@@ -2359,10 +2769,14 @@ def _process_payload_records(
                         pending_entry = PendingPostprocess(
                             future=future,
                             reservation=reservation,
+                            sequence_ids=sequence_ids,
                         )
                     del prepared
                     reconstruction_transient_bytes = 0
-                    pending.append(pending_entry)
+                    if isinstance(pending_entry, PendingPhase1):
+                        phase1_pending.append(pending_entry)
+                    else:
+                        legacy_pending.append(pending_entry)
                     pending_reserved_bytes += reservation.reserved_bytes
                     pending_retained_bytes += reservation.retained_bytes
                     pending_device_retained_bytes += (
@@ -2382,18 +2796,30 @@ def _process_payload_records(
                 network_bytes = 0
                 decode_uint8_bytes = 0
             elif kind == "invalid":
-                while pending:
-                    drain_one()
                 record, error = value
-                output.append(invalid_record(record, error))
+                sequence_id = next_sequence_to_assign
+                next_sequence_to_assign += 1
+                completed_reorder_buffer[sequence_id] = invalid_record(
+                    record, error
+                )
+                while next_sequence_to_publish in completed_reorder_buffer:
+                    output.append(
+                        completed_reorder_buffer.pop(
+                            next_sequence_to_publish
+                        )
+                    )
+                    next_sequence_to_publish += 1
                 scored_count += 1
+                sync_bar_state()
                 if bar is not None:
                     bar.update_invalid(
                         1,
-                        pending_batches=0,
-                        pending_bytes=0,
-                        pending_retained_bytes=0,
-                        pending_device_retained_bytes=0,
+                        pending_batches=pending_count(),
+                        pending_bytes=pending_reserved_bytes,
+                        pending_retained_bytes=pending_retained_bytes,
+                        pending_device_retained_bytes=(
+                            pending_device_retained_bytes
+                        ),
                         tier2_d2h_bytes=tier2_d2h_bytes,
                         tier2_materialized_batches=tier2_materialized_batches,
                         tier2_candidate_samples=tier2_candidate_samples,
@@ -2404,8 +2830,18 @@ def _process_payload_records(
                 raise RuntimeError(f"unexpected decode event {kind!r}")
             if heartbeat is not None:
                 heartbeat()
-        while pending:
-            drain_one()
+        while pending_count():
+            if not drain_any(block=True):
+                raise RuntimeError("pending work could not make progress")
+    if completed_reorder_buffer:
+        raise RuntimeError(
+            "completed reorder buffer has an unresolved sequence gap"
+        )
+    if next_sequence_to_publish != next_sequence_to_assign:
+        raise RuntimeError(
+            "processed record count does not match task payload"
+        )
+    sync_bar_state()
     if bar is not None:
         bar.close(
             pending_batches=0,

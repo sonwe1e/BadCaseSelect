@@ -217,34 +217,33 @@
     // 每个 worker 的图片解码缓存上限（MB）。帧以 uint8 缓存（比 float32
     // 省 4 倍内存），缓存帧数 = min(本预算 / 单帧字节数, chunk_triplets + 2)。
     // stride=1 时缓存覆盖整个 chunk 即可实现每帧只解码一次；4K 帧约 24MB/帧，
-    // 1024MB 约缓存 42 帧，足以覆盖 bs8 在途窗口。内存紧张时下限为 16。
+    // 1024MB 约缓存 42 帧，足以覆盖微批次 4/8 的在途窗口。内存紧张时下限为 16。
     "decode_cache_mb": 1024,
 
     // 每个 worker 进程的 CPU 线程数（用于 PyTorch/OpenCV 内部并行）。
     // 多 worker 时建议 cpu_threads_per_worker × workers ≤ 物理核心数。
-    "cpu_threads_per_worker": 8,
+    "cpu_threads_per_worker": 1,
 
     // 每个 worker 的 CPU 后处理线程数（重建结果的评分与诊断）。
     // 0 表示自动：结合逻辑核数、worker 数与每进程线程预算计算，并将每个
     // NPU worker 的全分辨率评分 Future 限制为最多 2 个，避免内存带宽争用。
-    // 显式 4：×8 worker 共 32 个评分线程（scipy/numpy 释放 GIL 有真并行），
-    // 实际在途数量继续受 postproc_buffer_mb 限制。
-    "postproc_workers": 4,
+    // 本轮 A/B 起点显式设为 2；配合每进程 1 个内部线程，避免 8 个进程
+    // 产生嵌套线程超卖。实际在途数量继续受 postproc_buffer_mb 限制。
+    "postproc_workers": 2,
 
     // 每个 worker 的 CPU 后处理完整预留上限（MB）。两阶段回传口径：
-    // tier-1 7 通道（prediction+flow）CPU 驻留 + tier-2 11 通道（warp+mask）
+    // tier-1 为 prediction 3 通道 + 6 个 scope 标量 + uint8 discontinuity 支持图；
+    // full-resolution flow 不再传回 CPU，tier-2 仍为 11 通道 warp+mask。
     // 设备端驻留（仅候选按需回传）+ Future 持有的 9 通道 float32 输入、
     // 24 plane 评分 scratch、当前微批次 6 通道 endpoint stack transient
     // 和固定开销。准入在原分辨率 float32 转换与 reconstruction 之前完成；
     // 单样本超预算时独占并记录 oversize=1。
-    "postproc_buffer_mb": 2048,
+    "postproc_buffer_mb": 4096,
 
     // 每微批次最多处理的样本数（0 = 自动按预算推导）。
-    // 自动推导将 postproc_buffer_mb/workers 预算除以单样本 retained+transient
-    // 成本，1080p A3 配置下（4 workers × 512 MiB/Future）结果为 1，
-    // 导致 64 次单样本 grid_sample。显式设置为 8 可让每次 F.grid_sample
-    // 以 batch=8 运行，提升 NPU 向量化利用率；内存安全性由准入门控保证。
-    "postproc_microbatch_size": 8,
+    // 本轮 A/B 起点为 4：目标是在 4096 MiB 内允许两个 pipeline 并发。
+    // 应与 8 和 0(auto) 使用同一 chunk 对照，以完整端到端时间选择。
+    "postproc_microbatch_size": 4,
 
     // 每个 worker 在正式推理前运行的预热批数。
     // 预热使 NPU JIT / 算子缓存充分预热，避免前几批延迟偏高影响统计。

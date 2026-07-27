@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from vfi_hard_miner.gates import (
     FrameValidityMetrics,
     GateResult,
     ScopeMetrics,
     compute_motion_evidence,
+    compute_motion_evidence_torch,
     compute_scope_metrics,
     compute_validity_metrics,
     decide_hard_case,
@@ -57,6 +59,49 @@ def test_motion_evidence_reuses_flow_gradient_without_changing_support():
         rtol=0.0,
         atol=1e-7,
     )
+
+
+def test_device_motion_evidence_matches_cpu_scope_and_support():
+    rng = np.random.default_rng(23)
+    flow0 = rng.normal(0.0, 6.0, size=(2, 37, 53, 2)).astype(np.float32)
+    flow1 = rng.normal(0.0, 6.0, size=(2, 37, 53, 2)).astype(np.float32)
+    device = compute_motion_evidence_torch(
+        torch.from_numpy(np.moveaxis(flow0, -1, 1)),
+        torch.from_numpy(np.moveaxis(flow1, -1, 1)),
+    )
+
+    for index in range(2):
+        expected = compute_motion_evidence(flow0[index], flow1[index])
+        expected_values = np.asarray(
+            [
+                expected.scope_metrics.out_of_bounds_ratio,
+                expected.scope_metrics.flow_discontinuity_ratio,
+                expected.scope_metrics.foreground_large_motion_ratio,
+                expected.scope_metrics.occlusion_ratio,
+                expected.scope_metrics.unexplained_motion_ratio,
+                expected.scope_metrics.background_motion,
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(
+            device.scope_metrics[index].numpy(),
+            expected_values,
+            rtol=0.0,
+            atol=2e-6,
+        )
+        expected_support = (
+            np.asarray(expected.flow_discontinuity_map) >= 0.60
+        ).astype(np.uint8)
+        np.testing.assert_array_equal(
+            device.flow_discontinuity_support[index, 0].numpy(),
+            expected_support,
+        )
+    assert set(device.timings_seconds) == {
+        "flow_oob",
+        "flow_background_median",
+        "flow_gradient",
+        "flow_quantile",
+    }
 
 
 def test_clean_validity_is_accepted():

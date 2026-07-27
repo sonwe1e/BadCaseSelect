@@ -114,7 +114,16 @@ def test_reconstruction_converts_all_products_to_cpu_float32() -> None:
         network_size=(2, 3),
         mask0_role="warp0_weight",
     )
-    for value in result.__dict__.values():
+    for value in (
+        result.flow_t0,
+        result.flow_t1,
+        result.mask0,
+        result.mask1,
+        result.warp0,
+        result.warp1,
+        result.warp_blend,
+        result.prediction,
+    ):
         assert value.device.type == "cpu"
         assert value.dtype == torch.float32
 
@@ -191,7 +200,17 @@ def test_explicit_cpu_device_matches_default_reference(
     )
     reference = reconstruct_midpoint(*inputs, **kwargs)
     explicit = reconstruct_midpoint(*inputs, **kwargs, device="cpu")
-    for name, tensor in reference.__dict__.items():
+    for name in (
+        "flow_t0",
+        "flow_t1",
+        "mask0",
+        "mask1",
+        "warp0",
+        "warp1",
+        "warp_blend",
+        "prediction",
+    ):
+        tensor = reference.__dict__[name]
         torch.testing.assert_close(explicit.__dict__[name], tensor)
         assert explicit.__dict__[name].device.type == "cpu"
 
@@ -203,7 +222,17 @@ def test_pack_reconstruction_to_cpu_round_trips_all_fields() -> None:
         mask0_role="warp0_weight",
     )
     packed = pack_reconstruction_to_cpu(result)
-    for name, tensor in result.__dict__.items():
+    for name in (
+        "flow_t0",
+        "flow_t1",
+        "mask0",
+        "mask1",
+        "warp0",
+        "warp1",
+        "warp_blend",
+        "prediction",
+    ):
+        tensor = result.__dict__[name]
         field = packed.__dict__[name]
         assert field.device.type == "cpu"
         assert field.dtype == torch.float32
@@ -264,7 +293,17 @@ def test_reconstruct_validate_flag_is_bitwise_identical() -> None:
     kwargs = dict(network_size=(2, 3), mask0_role="warp0_weight")
     validated = reconstruct_midpoint(*inputs, **kwargs)
     unvalidated = reconstruct_midpoint(*inputs, validate=False, **kwargs)
-    for name, tensor in validated.__dict__.items():
+    for name in (
+        "flow_t0",
+        "flow_t1",
+        "mask0",
+        "mask1",
+        "warp0",
+        "warp1",
+        "warp_blend",
+        "prediction",
+    ):
+        tensor = validated.__dict__[name]
         assert torch.equal(unvalidated.__dict__[name], tensor), name
 
 
@@ -313,29 +352,45 @@ def test_pack_tier1_to_cpu_round_trips_to_legacy_full_pack() -> None:
         pack_tier1_to_cpu,
     )
 
-    assert TIER1_CHANNELS == 7
+    assert TIER1_CHANNELS == 3
     assert TIER2_CHANNELS == 11
 
     result = reconstruct_midpoint(
         *_random_reconstruction_inputs(),
         network_size=(2, 3),
         mask0_role="warp0_weight",
+        compute_motion_metrics=True,
     )
     full = pack_reconstruction_to_cpu(result)
     partial, residue = pack_tier1_to_cpu(result)
 
     for name in ("mask0", "mask1", "warp0", "warp1", "warp_blend"):
         assert partial.__dict__[name] is None
-    for name in ("flow_t0", "flow_t1", "prediction"):
-        assert torch.equal(partial.__dict__[name], full.__dict__[name])
+    assert partial.flow_t0 is None
+    assert partial.flow_t1 is None
+    assert torch.equal(partial.prediction, full.prediction)
+    torch.testing.assert_close(partial.scope_metrics, full.scope_metrics)
+    assert torch.equal(
+        partial.flow_discontinuity_map,
+        full.flow_discontinuity_map,
+    )
 
     tier2 = residue.materialize()
     for name in ("mask0", "mask1", "warp0", "warp1", "warp_blend"):
         assert torch.equal(tier2[name], full.__dict__[name])
 
     merged = merge_tier2(partial, tier2)
-    for name, tensor in full.__dict__.items():
-        assert torch.equal(merged.__dict__[name], tensor), name
+    for name in (
+        "mask0",
+        "mask1",
+        "warp0",
+        "warp1",
+        "warp_blend",
+        "prediction",
+        "scope_metrics",
+        "flow_discontinuity_map",
+    ):
+        assert torch.equal(merged.__dict__[name], full.__dict__[name]), name
 
 
 def test_pack_tier1_cpu_path_is_zero_copy() -> None:
@@ -350,8 +405,8 @@ def test_pack_tier1_cpu_path_is_zero_copy() -> None:
     partial, residue = pack_tier1_to_cpu(result)
 
     # Tier-1 fields are referenced directly, no concatenation copy.
-    assert partial.flow_t0 is result.flow_t0
-    assert partial.flow_t1 is result.flow_t1
+    assert partial.flow_t0 is None
+    assert partial.flow_t1 is None
     assert partial.prediction is result.prediction
     # Materialization shares storage with the original fields.
     tier2 = residue.materialize()
@@ -543,5 +598,6 @@ def test_slice_reconstruction_cpu_passes_none_fields() -> None:
     sliced = slice_reconstruction_cpu(partial, [0, 2])
     assert sliced.warp0 is None
     assert sliced.mask0 is None
-    assert sliced.flow_t0.shape[0] == 2
+    assert sliced.flow_t0 is None
+    assert sliced.flow_t1 is None
     assert torch.equal(sliced.prediction, partial.prediction[[0, 2]])

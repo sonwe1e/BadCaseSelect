@@ -537,6 +537,68 @@ def test_inference_overlaps_cpu_finish_and_preserves_batch_order(
     assert all(name.startswith(thread_prefix) for name in finish_threads)
 
 
+def test_completed_future_bypasses_slow_queue_head_and_output_reorders(
+    monkeypatch,
+):
+    config = _parallel_test_config(batch_size=1, prefetch=1)
+    config = dataclasses.replace(
+        config,
+        runtime=dataclasses.replace(
+            config.runtime,
+            postproc_workers=2,
+            postproc_buffer_mb=64,
+        ),
+    )
+    batches = [
+        [_decoded_item("first", 0.1)],
+        [_decoded_item("second", 0.2)],
+        [_decoded_item("third", 0.3)],
+    ]
+    third_started = threading.Event()
+    completion_order = []
+    completion_lock = threading.Lock()
+
+    def decoded_batches(*args, **kwargs):
+        for batch in batches:
+            yield "batch", batch
+
+    def finish(items, reconstructed, *, config):
+        sample_id = items[0][0]["sample_id"]
+        if sample_id == "first":
+            assert third_started.wait(timeout=2.0)
+        elif sample_id == "third":
+            third_started.set()
+        with completion_lock:
+            completion_order.append(sample_id)
+        return [{"sample_id": sample_id}]
+
+    monkeypatch.setattr(
+        worker_module,
+        "_prefetched_decode_batches",
+        decoded_batches,
+    )
+    result = worker_module._process_payload_records(
+        [{}, {}, {}],
+        adapter=_RecordingAdapter(),
+        config=config,
+        model_config=config.model,
+        finish_batch=finish,
+        invalid_record=worker_module._invalid_record,
+        heartbeat=None,
+        progress_prefix="",
+        reconstruction_device=None,
+        thread_name_prefix="vfi-ready-first",
+    )
+
+    assert completion_order[0] == "second"
+    assert "third" in completion_order[:2]
+    assert [record["sample_id"] for record in result] == [
+        "first",
+        "second",
+        "third",
+    ]
+
+
 @pytest.mark.parametrize(
     ("stage", "process", "finish_name", "records_key"),
     [
@@ -1092,6 +1154,28 @@ def test_large_model_batch_is_split_into_memory_bounded_postproc_slices(
     assert "decode_ms/sample" in progress
 
 
+def test_timing_summary_reports_all_fine_grained_phases(capsys):
+    timings = worker_module.CpuTimingTotals()
+    timings.add_phases(
+        {
+            name: 0.001
+            for name in worker_module._DETAILED_TIMING_FIELDS
+        },
+        samples=1,
+    )
+
+    worker_module._print_timing_summary(
+        "probe",
+        timings,
+        scored=1,
+        final=True,
+    )
+
+    output = capsys.readouterr().err
+    for name in worker_module._DETAILED_TIMING_FIELDS:
+        assert f"{name}_ms/sample=1.0" in output
+
+
 def test_slow_postprocess_wait_emits_progress_and_heartbeat(monkeypatch, capsys):
     config = _parallel_test_config(batch_size=1, prefetch=1)
     runtime = dataclasses.replace(
@@ -1170,7 +1254,11 @@ def test_postproc_reservation_tiered_splits_cpu_and_device_retention():
     tiered = worker_module._postproc_reservation(
         items, buffer_bytes=16 * 1024 * 1024, tiered=True
     )
-    assert tiered.retained_bytes == plane_bytes * (7 + 9)
+    # Prediction is float32 (3ch), support is uint8 (1 byte/pixel), and
+    # scope contributes six float32 scalars.
+    assert tiered.retained_bytes == (
+        plane_bytes * (3 + 9) + 10 * 20 + 6 * 4
+    )
     assert tiered.device_retained_bytes == plane_bytes * 11
     assert tiered.scratch_bytes == plane_bytes * 24
     assert tiered.pipeline_bytes == (
@@ -1201,6 +1289,16 @@ def test_postproc_reservation_prediction_mode_retains_only_prediction():
     assert prediction.device_retained_bytes == 0
     assert prediction.pipeline_bytes == (
         prediction.reserved_bytes + prediction.reconstruction_transient_bytes
+    )
+
+    phase2 = worker_module._postproc_reservation(
+        items,
+        buffer_bytes=16 * 1024 * 1024,
+        mode="phase2",
+    )
+    assert phase2.device_retained_bytes == 0
+    assert phase2.retained_bytes == (
+        plane_bytes * (3 + 11 + 9) + 10 * 20 + 6 * 4
     )
 
     with pytest.raises(ValueError, match="mode"):
@@ -1351,14 +1449,15 @@ def test_fast_rejected_samples_never_materialize_tier2(tmp_path, monkeypatch):
     assert len(results) == 1
     assert calls == []
     assert results[0]["metrics"]["diagnosis"]["skipped"] == 1.0
+    assert "structure_q99" in results[0]["metrics"]["scoring"]
+    assert "rgb_mean" not in results[0]["metrics"]["scoring"]
 
 
 def test_pending_device_bytes_count_toward_the_postproc_budget(tmp_path):
     # 256x256 frames make the per-future tier-2 device retention (11ch,
-    # 2.75 MiB) large enough to matter: with a 28 MiB budget, CPU-only
-    # accounting admits two in-flight futures (reserved 11 MiB + next
-    # pipeline 15.25 MiB = 26.25 MiB <= 28 MiB), but cumulative accounting
-    # including the pending device bytes does not (26.25 + 2.75 = 29 MiB).
+    # 2.75 MiB) large enough to matter: with a 27 MiB budget, CPU-only
+    # accounting admits two in-flight futures, but cumulative accounting
+    # including the pending device bytes does not.
     root = tmp_path / "game"
     for index in range(1, 5):
         frame = np.full((256, 256, 3), 16 * index, dtype=np.uint8)
@@ -1379,7 +1478,7 @@ def test_pending_device_bytes_count_toward_the_postproc_budget(tmp_path):
             state_db=str(tmp_path / "state.sqlite3"),
             run_dir=str(tmp_path / "run"),
             postproc_workers=4,
-            postproc_buffer_mb=28,
+            postproc_buffer_mb=27,
         ),
     )
     build_run_index(config)
@@ -1425,6 +1524,16 @@ def test_pending_device_bytes_count_toward_the_postproc_budget(tmp_path):
 
 def test_progress_log_reports_device_retained_and_tier2_fields(capsys):
     bar = worker_module._ProgressLog(10, "probe")
+    bar.configure(
+        resolved_postproc_workers=2,
+        resolved_microbatch_size=4,
+        postproc_buffer_mb=4096,
+    )
+    bar.set_pipeline_state(
+        candidate_ratio=0.25,
+        phase1_queue_depth=2,
+        phase2_queue_depth=1,
+    )
     bar.close(
         pending_batches=0,
         pending_bytes=2 * 1024 * 1024,
@@ -1440,8 +1549,84 @@ def test_progress_log_reports_device_retained_and_tier2_fields(capsys):
     assert "tier2_d2h 8 MiB" in err
     assert "tier2_materialized_batches 3" in err
     assert "tier2_candidate_samples 7" in err
+    assert "actual_tier2_d2h_bytes 8388608" in err
+    assert "resolved_postproc_workers 2" in err
+    assert "resolved_microbatch_size 4" in err
+    assert "postproc_buffer_mb 4096" in err
+    assert "candidate_ratio 0.2500" in err
+    assert "phase1_queue_depth 2" in err
+    assert "phase2_queue_depth 1" in err
     # resident_estimate now covers pending CPU reserved + pending device.
     assert "resident_estimate 6 MiB" in err
+
+
+def test_phase1_basis_cache_reuses_overlapping_stride1_frames(monkeypatch):
+    height = width = 16
+    frames = {
+        index: np.full(
+            (height, width, 3),
+            index / 10.0,
+            dtype=np.float32,
+        )
+        for index in range(1, 6)
+    }
+    items = []
+    for start in range(1, 4):
+        paths = (start, start + 1, start + 2)
+        source = {
+            "sample_id": f"s{start}",
+            "frame_indices": list(paths),
+            "stride": 1,
+            "img0": {"path": f"{paths[0]}.png"},
+            "gt": {"path": f"{paths[1]}.png"},
+            "img1": {"path": f"{paths[2]}.png"},
+        }
+        items.append(
+            (
+                source,
+                frames[paths[0]],
+                frames[paths[1]],
+                frames[paths[2]],
+            )
+        )
+    calls = []
+    original = worker_module.build_image_basis
+
+    def counted(image, *, name="image"):
+        calls.append(name)
+        return original(image, name=name)
+
+    monkeypatch.setattr(worker_module, "build_image_basis", counted)
+    reconstructed = ReconstructionResult(
+        flow_t0=None,
+        flow_t1=None,
+        mask0=None,
+        mask1=None,
+        warp0=None,
+        warp1=None,
+        warp_blend=None,
+        prediction=torch.stack(
+            [
+                torch.from_numpy(item[2]).permute(2, 0, 1)
+                for item in items
+            ]
+        ),
+        scope_metrics=torch.zeros((3, 6), dtype=torch.float32),
+        flow_discontinuity_map=torch.zeros(
+            (3, 1, height, width),
+            dtype=torch.uint8,
+        ),
+    )
+
+    worker_module._finish_phase1_batch(
+        items,
+        reconstructed,
+        config=_parallel_test_config(batch_size=3),
+    )
+
+    # Five unique frames across three overlapping triplets; without the
+    # rolling cache this path builds nine bases.
+    assert len(calls) == 5
 
 
 def test_two_phase_materialize_runs_on_the_main_thread(tmp_path, monkeypatch):

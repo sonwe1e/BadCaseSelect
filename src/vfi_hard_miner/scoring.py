@@ -9,7 +9,8 @@ native connected components, and multi-scale windows.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+import time
+from typing import Any, Mapping, MutableMapping, Sequence
 
 import numpy as np
 from scipy.ndimage import find_objects as _nd_find_objects
@@ -410,14 +411,6 @@ def summarize_error_map(
     if not np.isfinite(array).all():
         raise ValueError("error map contains NaN or infinite values")
     flat = array.reshape(-1)
-    quantiles = np.quantile(flat, (0.95, 0.99, 0.999))
-    metrics = {
-        "mean": float(flat.mean()),
-        "max": float(flat.max()),
-        "q95": float(quantiles[0]),
-        "q99": float(quantiles[1]),
-        "q999": float(quantiles[2]),
-    }
     fractions = tuple(float(value) for value in top_area_fractions)
     for fraction in fractions:
         if not 0.0 < fraction <= 1.0:
@@ -433,7 +426,37 @@ def summarize_error_map(
             if count < flat.size
         }
     )
-    partitioned = np.partition(flat, starts) if starts else flat
+    quantile_levels = (0.95, 0.99, 0.999)
+    quantile_positions = tuple(
+        (flat.size - 1) * level for level in quantile_levels
+    )
+    quantile_indices = {
+        int(np.floor(position))
+        for position in quantile_positions
+    } | {
+        int(np.ceil(position))
+        for position in quantile_positions
+    }
+    kth = sorted(set(starts) | quantile_indices)
+    partitioned = np.partition(flat, kth) if kth else flat
+
+    quantiles: list[float] = []
+    for position in quantile_positions:
+        lower = int(np.floor(position))
+        upper = int(np.ceil(position))
+        weight = float(position - lower)
+        lower_value = float(partitioned[lower])
+        upper_value = float(partitioned[upper])
+        quantiles.append(
+            lower_value + (upper_value - lower_value) * weight
+        )
+    metrics = {
+        "mean": float(flat.mean()),
+        "max": float(flat.max()),
+        "q95": quantiles[0],
+        "q99": quantiles[1],
+        "q999": quantiles[2],
+    }
     for fraction in fractions:
         count = counts[fraction]
         top_values = (
@@ -683,7 +706,10 @@ def _integral_image(values: np.ndarray) -> np.ndarray:
 
 
 def _window_grid(
-    values: np.ndarray, window: int
+    values: np.ndarray,
+    window: int,
+    *,
+    integral: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     height, width = values.shape
     size_y = min(max(1, int(window)), height)
@@ -698,12 +724,14 @@ def _window_grid(
         xs = np.append(xs, width - size_x)
     y1 = ys + size_y
     x1 = xs + size_x
-    integral = _integral_image(values)
+    resolved_integral = (
+        _integral_image(values) if integral is None else integral
+    )
     sums = (
-        integral[y1[:, None], x1[None, :]]
-        - integral[ys[:, None], x1[None, :]]
-        - integral[y1[:, None], xs[None, :]]
-        + integral[ys[:, None], xs[None, :]]
+        resolved_integral[y1[:, None], x1[None, :]]
+        - resolved_integral[ys[:, None], x1[None, :]]
+        - resolved_integral[y1[:, None], xs[None, :]]
+        + resolved_integral[ys[:, None], xs[None, :]]
     )
     means = np.asarray(sums / float(size_y * size_x), dtype=np.float32)
     return means, ys, xs, y1, x1
@@ -1008,6 +1036,7 @@ def _find_candidate_regions_and_raw_score(
     support_map: ArrayLike | None = None,
     gt_edge_map: ArrayLike | None = None,
     endpoint_change_map: ArrayLike | None = None,
+    timings: MutableMapping[str, float] | None = None,
 ) -> tuple[tuple[RegionBox, ...], float, dict[int, float]]:
     """Generate prioritized regions plus context-independent raw severity."""
 
@@ -1039,6 +1068,7 @@ def _find_candidate_regions_and_raw_score(
     if (gt_edges is None) != (endpoint_change is None):
         raise ValueError("GT edges and endpoint change must be provided together")
 
+    quantile_started = time.perf_counter()
     quantile_threshold = float(np.quantile(values, float(cfg.candidate_quantile)))
     adaptive = max(float(cfg.edge_threshold), quantile_threshold)
     native_mask = values >= adaptive
@@ -1061,6 +1091,12 @@ def _find_candidate_regions_and_raw_score(
         )
         native_threshold_floor = min(native_threshold_floor, interior_threshold)
         native_mask[y0:y1, x0:x1] |= interior >= interior_threshold
+    if timings is not None:
+        timings["candidate_quantile"] = timings.get(
+            "candidate_quantile", 0.0
+        ) + (time.perf_counter() - quantile_started)
+
+    native_started = time.perf_counter()
     raw_native_candidates = _native_region_candidates(
         native_mask,
         values,
@@ -1068,6 +1104,10 @@ def _find_candidate_regions_and_raw_score(
         cfg,
         candidate_threshold=native_threshold_floor,
     )
+    if timings is not None:
+        timings["native_component_label"] = timings.get(
+            "native_component_label", 0.0
+        ) + (time.perf_counter() - native_started)
     # Candidate generation is deliberately independent of endpoint/UI context.
     # UI evidence may reprioritize candidates but must never change raw GT
     # wrongness or make the candidate pool depend on whether endpoints exist.
@@ -1076,12 +1116,18 @@ def _find_candidate_regions_and_raw_score(
     window_candidates: list[RegionBox] = []
     window_maxima: dict[int, float] = {}
     seen_sizes: set[int] = set()
+    windows_started = time.perf_counter()
+    shared_integral = _integral_image(values)
     for requested_size in cfg.window_sizes:
         size = min(max(1, int(requested_size)), min(values.shape))
         if size in seen_sizes:
             continue
         seen_sizes.add(size)
-        means, ys, xs, y1s, x1s = _window_grid(values, size)
+        means, ys, xs, y1s, x1s = _window_grid(
+            values,
+            size,
+            integral=shared_integral,
+        )
         window_maxima[size] = float(means.max())
         qualified = means >= float(cfg.window_threshold)
         for component in _extract_components(qualified, means):
@@ -1105,6 +1151,10 @@ def _find_candidate_regions_and_raw_score(
                     },
                 )
             )
+    if timings is not None:
+        timings["integral_windows"] = timings.get(
+            "integral_windows", 0.0
+        ) + (time.perf_counter() - windows_started)
 
     raw_candidates = (*raw_native_candidates, *window_candidates)
     raw_regions = _deduplicate_regions(
@@ -1164,6 +1214,8 @@ def score_local_errors(
     img1: ArrayLike | None = None,
     reference_basis: ImageBasis | None = None,
     endpoint_change_map: ArrayLike | None = None,
+    detailed_metrics: bool = True,
+    timings: MutableMapping[str, float] | None = None,
 ) -> LocalScoreResult:
     """Score a prediction against GT and retain localized evidence."""
 
@@ -1173,7 +1225,12 @@ def score_local_errors(
         if reference_basis is None
         else reference_basis
     )
+    maps_started = time.perf_counter()
     maps = _error_maps_against_basis(prediction, resolved_reference)
+    if timings is not None:
+        timings["error_map_generation"] = timings.get(
+            "error_map_generation", 0.0
+        ) + (time.perf_counter() - maps_started)
     if (img0 is None) != (img1 is None):
         raise ValueError("img0 and img1 must be supplied together for UI prioritization")
     endpoint_change: np.ndarray | None = None
@@ -1199,16 +1256,23 @@ def score_local_errors(
         support_map=maps.rgb,
         gt_edge_map=maps.sobel_gt if endpoint_change is not None else None,
         endpoint_change_map=endpoint_change,
+        timings=timings,
     )
     metrics: dict[str, float] = {}
-    for map_name, values in (
-        ("rgb", maps.rgb),
-        ("luminance", maps.luminance),
-        ("edge", maps.edge_difference),
-        ("gt_only_edge", maps.gt_only_edges),
-        ("pred_only_edge", maps.pred_only_edges),
-        ("structure", maps.structure),
-    ):
+    summary_started = time.perf_counter()
+    summary_maps = (
+        (
+            ("rgb", maps.rgb),
+            ("luminance", maps.luminance),
+            ("edge", maps.edge_difference),
+            ("gt_only_edge", maps.gt_only_edges),
+            ("pred_only_edge", maps.pred_only_edges),
+            ("structure", maps.structure),
+        )
+        if detailed_metrics
+        else (("structure", maps.structure),)
+    )
+    for map_name, values in summary_maps:
         for name, value in summarize_error_map(
             values, top_area_fractions=cfg.top_area_fractions
         ).items():
@@ -1216,6 +1280,10 @@ def score_local_errors(
 
     for clipped_size, maximum in window_maxima.items():
         metrics[f"window_{clipped_size}_mean_max"] = maximum
+    if timings is not None:
+        timings["summary_metrics"] = timings.get(
+            "summary_metrics", 0.0
+        ) + (time.perf_counter() - summary_started)
 
     global_local = max(
         metrics.get("structure_top_0_01pct_mean", 0.0),
@@ -1276,6 +1344,42 @@ def score_local_errors(
     )
 
 
+def complete_score_metrics(
+    scoring: LocalScoreResult,
+    config: ScoringConfig | Mapping[str, Any] | Any | None = None,
+    *,
+    timings: MutableMapping[str, float] | None = None,
+) -> LocalScoreResult:
+    """Populate Phase-2-only detailed map summaries in place.
+
+    Candidate generation and ``p_wrong`` are already frozen by Phase 1; this
+    function only restores the legacy detailed metric keys for samples that
+    proceed to diagnosis.
+    """
+
+    cfg = ScoringConfig.from_value(config)
+    if "rgb_mean" in scoring.metrics:
+        return scoring
+    started = time.perf_counter()
+    for map_name, values in (
+        ("rgb", scoring.maps.rgb),
+        ("luminance", scoring.maps.luminance),
+        ("edge", scoring.maps.edge_difference),
+        ("gt_only_edge", scoring.maps.gt_only_edges),
+        ("pred_only_edge", scoring.maps.pred_only_edges),
+    ):
+        for name, value in summarize_error_map(
+            values,
+            top_area_fractions=cfg.top_area_fractions,
+        ).items():
+            scoring.metrics[f"{map_name}_{name}"] = value
+    if timings is not None:
+        timings["summary_metrics"] = timings.get(
+            "summary_metrics", 0.0
+        ) + (time.perf_counter() - started)
+    return scoring
+
+
 # Stable descriptive aliases for callers that prefer more explicit names.
 compute_local_error_maps = compute_error_maps
 generate_candidate_regions = find_candidate_regions
@@ -1293,6 +1397,7 @@ __all__ = [
     "compute_error_maps",
     "compute_local_error_maps",
     "compute_structure_map",
+    "complete_score_metrics",
     "find_candidate_regions",
     "generate_candidate_regions",
     "luminance",

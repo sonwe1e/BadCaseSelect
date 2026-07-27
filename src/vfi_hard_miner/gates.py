@@ -8,9 +8,11 @@ an unsupported rejection.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, Mapping
+import time
+from typing import Any, Mapping, MutableMapping
 
 import numpy as np
+import torch
 
 from .scoring import as_rgb01
 
@@ -184,6 +186,22 @@ class MotionEvidence:
 
     scope_metrics: ScopeMetrics
     flow_discontinuity_map: np.ndarray | None
+
+
+@dataclass(frozen=True, slots=True)
+class TorchMotionEvidence:
+    """Device-side scope scalars plus compressed diagnostic support.
+
+    ``scope_metrics`` is ``[B, 6]`` in the same field order as
+    :class:`ScopeMetrics`. ``flow_discontinuity_support`` is a uint8
+    ``[B, 1, H, W]`` map because diagnosis only consumes the ``>= 0.60``
+    support decision; transferring the normalized float map would preserve
+    no additional downstream information.
+    """
+
+    scope_metrics: torch.Tensor
+    flow_discontinuity_support: torch.Tensor
+    timings_seconds: Mapping[str, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,9 +402,11 @@ def compute_validity_metrics(
     sequence_contiguous: bool = True,
     menu_transition_score: float | None = None,
     luminance_triplet: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    timings: MutableMapping[str, float] | None = None,
 ) -> FrameValidityMetrics:
     """Compute cheap temporal validity evidence from an aligned triplet."""
 
+    difference_started = time.perf_counter()
     if luminance_triplet is None:
         first = _luma(img0)
         middle = _luma(gt)
@@ -408,23 +428,40 @@ def compute_validity_metrics(
     adjacent_t1 = float(difference_t1.mean())
     denominator = adjacent_0t + adjacent_t1 + 1e-8
     asymmetry = float(abs(adjacent_0t - adjacent_t1) / denominator)
+    if timings is not None:
+        timings["validity_difference"] = timings.get(
+            "validity_difference", 0.0
+        ) + (time.perf_counter() - difference_started)
+
+    histogram_started = time.perf_counter()
     histogram_0t = _histogram_distance(first, middle)
     histogram_t1 = _histogram_distance(middle, last)
     histogram_jump = max(histogram_0t, histogram_t1)
     # A cut is both a large distribution jump and temporally one-sided.
     scene_cut_score = float(histogram_jump * (0.5 + 0.5 * asymmetry))
+    if timings is not None:
+        timings["validity_histogram"] = timings.get(
+            "validity_histogram", 0.0
+        ) + (time.perf_counter() - histogram_started)
+
+    quantile_started = time.perf_counter()
     resolved_menu_score = (
         _automatic_menu_transition_score(difference_0t, difference_t1)
         if menu_transition_score is None
         else float(menu_transition_score)
     )
+    duplicate_distance = min(
+        _repeat_distance(first, middle), _repeat_distance(middle, last)
+    )
+    if timings is not None:
+        timings["validity_quantile"] = timings.get(
+            "validity_quantile", 0.0
+        ) + (time.perf_counter() - quantile_started)
     return FrameValidityMetrics(
         decode_ok=bool(decode_ok),
         finite=True,
         sequence_contiguous=bool(sequence_contiguous),
-        duplicate_distance=min(
-            _repeat_distance(first, middle), _repeat_distance(middle, last)
-        ),
+        duplicate_distance=duplicate_distance,
         scene_cut_score=scene_cut_score,
         histogram_jump=histogram_jump,
         temporal_asymmetry=asymmetry,
@@ -698,6 +735,206 @@ def compute_motion_evidence(
     )
 
 
+def _synchronize_for_timing(device: torch.device) -> None:
+    """Synchronize one accelerator without assuming CUDA-only APIs."""
+
+    if device.type == "cpu":
+        return
+    module = getattr(torch, device.type, None)
+    synchronize = getattr(module, "synchronize", None)
+    if not callable(synchronize):
+        return
+    try:
+        synchronize(device)
+    except TypeError:
+        synchronize()
+
+
+def _as_nchw_flow_tensor(flow: torch.Tensor, *, name: str) -> torch.Tensor:
+    if not isinstance(flow, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if flow.ndim != 4 or flow.shape[1] != 2:
+        raise ValueError(f"{name} must have shape [B,2,H,W], got {tuple(flow.shape)}")
+    if flow.shape[0] < 1 or flow.shape[2] < 1 or flow.shape[3] < 1:
+        raise ValueError(f"{name} dimensions must be positive")
+    return flow.to(dtype=torch.float32)
+
+
+def compute_motion_evidence_torch(
+    flow_t0: torch.Tensor,
+    flow_t1: torch.Tensor,
+    *,
+    synchronize_timings: bool = True,
+) -> TorchMotionEvidence:
+    """Compute scope evidence on the flow's current device.
+
+    The formulas intentionally mirror :func:`compute_motion_evidence`.
+    Only the binary ``>= 0.60`` diagnostic gradient support crosses the
+    device boundary, because that is the sole downstream use of the normalized
+    map.  Four timing groups are synchronized by default so A3 logs represent
+    executed device work rather than asynchronous launch latency.
+    """
+
+    first = _as_nchw_flow_tensor(flow_t0, name="flow_t0")
+    second = _as_nchw_flow_tensor(flow_t1, name="flow_t1")
+    if first.shape != second.shape:
+        raise ValueError("flow_t0 and flow_t1 must have the same shape")
+    batch, _, height, width = first.shape
+    device = first.device
+    diagonal = max(1.0, float(np.hypot(height, width)))
+    timings: dict[str, float] = {}
+
+    def start_stage() -> float:
+        if synchronize_timings:
+            _synchronize_for_timing(device)
+        return time.perf_counter()
+
+    def finish_stage(name: str, started: float) -> None:
+        if synchronize_timings:
+            _synchronize_for_timing(device)
+        timings[name] = timings.get(name, 0.0) + (
+            time.perf_counter() - started
+        )
+
+    oob_started = start_stage()
+    yy = torch.arange(height, dtype=torch.float32, device=device).view(
+        1, height, 1
+    )
+    xx = torch.arange(width, dtype=torch.float32, device=device).view(
+        1, 1, width
+    )
+    raw_oob: list[torch.Tensor] = []
+    for flow in (first, second):
+        sample_x = xx + flow[:, 0]
+        sample_y = yy + flow[:, 1]
+        raw_oob.append(
+            (sample_x < 0.0)
+            | (sample_x > width - 1)
+            | (sample_y < 0.0)
+            | (sample_y > height - 1)
+        )
+    finish_stage("flow_oob", oob_started)
+
+    background_started = start_stage()
+    border = max(
+        1,
+        min(
+            min(height, width),
+            int(round(min(height, width) * _BACKGROUND_BORDER_FRACTION)),
+        ),
+    )
+    border_mask = torch.zeros((height, width), dtype=torch.bool, device=device)
+    border_mask[:border, :] = True
+    border_mask[-border:, :] = True
+    border_mask[:, :border] = True
+    border_mask[:, -border:] = True
+    residuals: list[torch.Tensor] = []
+    background_motions: list[torch.Tensor] = []
+    unexplained_oob: list[torch.Tensor] = []
+    for flow, oob in zip((first, second), raw_oob):
+        spatial = flow.permute(0, 2, 3, 1)
+        background = torch.quantile(
+            spatial[:, border_mask, :],
+            0.5,
+            dim=1,
+        )
+        residual = torch.linalg.vector_norm(
+            spatial - background[:, None, None, :],
+            dim=-1,
+        ) / diagonal
+        residuals.append(residual)
+        background_motions.append(
+            torch.linalg.vector_norm(background, dim=-1) / diagonal
+        )
+        unexplained_oob.append(
+            oob & (residual > _LARGE_MOTION_NORMALIZED)
+        )
+    finish_stage("flow_background_median", background_started)
+
+    gradient_started = start_stage()
+    discontinuity_ratios: list[torch.Tensor] = []
+    gradient_magnitudes: list[torch.Tensor] = []
+    for flow in (first, second):
+        raw_dx = flow[:, :, :, 1:] - flow[:, :, :, :-1]
+        raw_dy = flow[:, :, 1:, :] - flow[:, :, :-1, :]
+        dx = torch.linalg.vector_norm(raw_dx, dim=1) / diagonal
+        dy = torch.linalg.vector_norm(raw_dy, dim=1) / diagonal
+        discontinuous = (dx > 0.02).sum(dim=(1, 2)) + (
+            dy > 0.02
+        ).sum(dim=(1, 2))
+        discontinuity_ratios.append(
+            discontinuous.to(dtype=torch.float32)
+            / max(1, dx[0].numel() + dy[0].numel())
+        )
+        gradient_squared = torch.zeros(
+            (batch, height, width),
+            dtype=torch.float32,
+            device=device,
+        )
+        gradient_squared[:, :, 1:] += raw_dx.square().sum(dim=1)
+        gradient_squared[:, 1:, :] += raw_dy.square().sum(dim=1)
+        gradient_magnitudes.append(torch.sqrt(gradient_squared))
+    finish_stage("flow_gradient", gradient_started)
+
+    quantile_started = start_stage()
+    support = torch.zeros(
+        (batch, height, width),
+        dtype=torch.bool,
+        device=device,
+    )
+    for magnitude in gradient_magnitudes:
+        for index in range(batch):
+            positive = magnitude[index][magnitude[index] > 0]
+            if positive.numel():
+                scale = torch.clamp(
+                    torch.quantile(positive, 0.95),
+                    min=1e-8,
+                )
+                support[index] |= magnitude[index] >= (0.60 * scale)
+    residual = torch.maximum(residuals[0], residuals[1])
+    combined_oob = unexplained_oob[0] | unexplained_oob[1]
+    backward_inconsistency = torch.linalg.vector_norm(
+        (first + second).permute(0, 2, 3, 1),
+        dim=-1,
+    ) / diagonal
+    out_of_bounds_ratio = torch.maximum(
+        unexplained_oob[0].to(dtype=torch.float32).mean(dim=(1, 2)),
+        unexplained_oob[1].to(dtype=torch.float32).mean(dim=(1, 2)),
+    )
+    discontinuity_ratio = torch.maximum(
+        discontinuity_ratios[0],
+        discontinuity_ratios[1],
+    )
+    foreground_ratio = (
+        residual > _LARGE_MOTION_NORMALIZED
+    ).to(dtype=torch.float32).mean(dim=(1, 2))
+    occlusion_ratio = (
+        (backward_inconsistency > _LARGE_MOTION_NORMALIZED)
+        | combined_oob
+    ).to(dtype=torch.float32).mean(dim=(1, 2))
+    background_motion = torch.maximum(
+        background_motions[0],
+        background_motions[1],
+    )
+    scope_metrics = torch.stack(
+        (
+            out_of_bounds_ratio,
+            discontinuity_ratio,
+            foreground_ratio,
+            occlusion_ratio,
+            foreground_ratio,
+            background_motion,
+        ),
+        dim=1,
+    )
+    finish_stage("flow_quantile", quantile_started)
+    return TorchMotionEvidence(
+        scope_metrics=scope_metrics,
+        flow_discontinuity_support=support[:, None].to(dtype=torch.uint8),
+        timings_seconds=timings,
+    )
+
+
 def compute_scope_metrics(
     flow_t0: Any,
     flow_t1: Any | None = None,
@@ -871,9 +1108,11 @@ __all__ = [
     "GateResult",
     "MotionEvidence",
     "ScopeMetrics",
+    "TorchMotionEvidence",
     "classify_sample",
     "combine_gates",
     "compute_motion_evidence",
+    "compute_motion_evidence_torch",
     "compute_scope_metrics",
     "compute_validity_metrics",
     "decide_hard_case",

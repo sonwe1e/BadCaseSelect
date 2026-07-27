@@ -353,11 +353,15 @@ B =
       一条命令内部依次执行 index → main → 可选 teacher → CGVQM → finalize。main 和 CGVQM 都有独立 SQLite 状态、
       任务租约、attempt 结果与 30 秒日志心跳。解码 batch 保持 uint8，NPU 主推理只 stack 固定网络分辨率 Tensor；
       原分辨率 float32 只为已通过 <code>postproc_buffer_mb</code> 准入的 reconstruction 微批次创建。
-      预算覆盖 18 通道重建结果、9 通道输入、评分 scratch 和 endpoint stack transient。
+      flow scope 在 reconstruction device 上计算；CPU Tier-1 只接收 prediction、6 个标量和一张 uint8
+      discontinuity 支持图，不再扫描或保留全分辨率 flow。预算同时覆盖 CPU retained、设备 Tier-2、
+      9 通道输入、评分 scratch 和 endpoint stack transient。
       invalid、out-of-scope 与明显简单样本跳过 branch diagnosis；训练级样本仍完成全部质量门。
-      warp/endpoint evidence 只计算带 1 px halo 的候选 crop，flow scope 保持全分辨率。
-      日志显示 decode_uint8、network、reconstruction_transient、retained/reserved 与 resident_estimate，
-      并周期汇总 decode、inference、reconstruction、Future wait 和四个 CPU 子阶段的 ms/sample。
+      warp/endpoint evidence 只计算带 1 px halo 的候选 crop。Phase 1 与 Phase 2 独立排队并优先回收任意
+      已完成 Future，最终通过 sequence reorder buffer 恢复原始顺序。
+      日志显示 worker/微批次解析结果、candidate ratio、两阶段队列深度、实际 Tier-2 D2H、
+      decode/network/transient/retained/reserved/device-retained 与 resident_estimate，并周期汇总
+      validity、flow、error map、candidate、连通域、integral windows、summary 和 Phase-2 diagnosis 的 ms/sample。
     </p>
     <p class="small">
       分阶段命令仍保留用于故障恢复：<code>index</code>、<code>mine</code>、<code>teacher</code>、
@@ -369,7 +373,7 @@ B =
     <h2>10. A3 首轮抽检与阈值调节</h2>
     <ol>
       <li>对同一 chunk 分别测试 <code>model.batch_size=16/32/64</code>，以完整墙钟时间最短为准，不只比较 NPU inference。</li>
-      <li>同时比较每 worker 1/2 个 postprocess Future；观察 resident_estimate、进程 RSS、swap 和八阶段 ms/sample。</li>
+      <li>同时比较每 worker 1/2 个 postprocess Future，以及微批次 4/8/auto；观察 resident_estimate、进程 RSS、swap、队列深度和细分 ms/sample。</li>
       <li>先看 Review 中的 CGVQM error、spatial_overlap、temporal_persistence 分布，不要直接降低所有阈值。</li>
       <li>A 中若仍有轻微帧，优先提高 <code>severe_wrong_accept_at</code> 或 <code>a_error_at</code>；不要降低 B 来“补数量”。</li>
       <li>B 中若有抗锯齿/UI 误报，优先提高 <code>spatial_overlap_at</code>、<code>b_error_at</code>，并检查 priority_weight。</li>

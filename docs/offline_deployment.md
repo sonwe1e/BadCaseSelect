@@ -230,7 +230,16 @@ vfi-hard-miner run --config configs/my_game.json
 
 诊断任务按视频排序后动态切块，目标是让 8 卡配置拥有足够任务并行度；实际 worker 数为 `min(runtime.workers, 当前任务数)`。每个进程只绑定一张 NPU、加载一次当前模型。解码队列保持 uint8，推理只 stack 固定网络分辨率 Tensor，原分辨率 float32 只在当前 reconstruction 微批次中创建。自动模式每个 NPU worker 最多使用两个评分 Future；准入在 float32 转换前检查，覆盖 Future retained、24 plane 评分 scratch、6 通道 endpoint stack transient 与固定开销。这里不使用 DDP、HCCL 或跨卡梯度同步。
 
-main/teacher/diagnostic 日志会分别报告 `decode_uint8`、`network`、`reconstruction_transient`、retained、reserved 和 `resident_estimate`，并周期输出八阶段 `ms/sample`。`resident_estimate` 只是程序可归因内存，不等同 RSS。A3 应对同一 chunk 测试 batch 16/32/64 以及 postproc worker 1/2，以完整 chunk 时间最短且无持续 swap 的组合为准。
+main/teacher/diagnostic 日志会分别报告 `decode_uint8`、`network`、`reconstruction_transient`、retained、reserved、device-retained 和 `resident_estimate`。主阶段还会输出 `resolved_postproc_workers`、实际微批次、candidate ratio、Tier-2 实际 D2H 字节数以及 Phase 1/2 队列深度，并将 validity、flow scope、error-map、candidate quantile、native component、integral windows、summary metrics 和 Phase-2 diagnosis 拆分为独立 `ms/sample`。主阶段的 full-resolution flow scope 已迁到 reconstruction device；CPU Tier-1 仅接收 prediction、6 个 scope 标量和 uint8 discontinuity 支持图。Phase 1/2 Future 按完成状态回收，最终由 sequence reorder buffer 恢复 JSONL 顺序。`resident_estimate` 只是程序可归因内存，不等同 RSS。A3 应对同一 chunk 测试 batch 16/32/64、postproc worker 1/2 以及微批次 4/8/auto，以完整 chunk 时间最短且无持续 swap 的组合为准。
+
+A3 执行 A/B 前应限制数值库内部线程，避免 8 个 worker 与两个 Future 再次嵌套扩张：
+
+```bash
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+```
 
 状态恢复使用 execution-scoped SQLite、后台 lease heartbeat 和 attempt fencing。每次尝试写入独立的 part/artifact 目录；完成记录会绑定 winning task/attempt，缺失或无效产物在重跑时重新排队，旧 attempt 不会进入最终 `diagnostic_results.jsonl`。
 

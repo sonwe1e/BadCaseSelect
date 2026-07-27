@@ -10,6 +10,7 @@ from vfi_hard_miner.scoring import (
     compute_error_maps,
     compute_structure_map,
     score_local_errors,
+    summarize_error_map,
     top_area_mean,
 )
 
@@ -28,6 +29,32 @@ def test_identical_images_have_zero_local_error():
     assert result.p_wrong == 0.0
     assert result.regions == ()
     assert np.count_nonzero(result.maps.structure) == 0
+
+
+@pytest.mark.parametrize("size", [1, 2, 17, 4097])
+def test_single_partition_summary_matches_numpy_reference(size):
+    rng = np.random.default_rng(100 + size)
+    values = rng.random(size, dtype=np.float32)
+    fractions = (0.0001, 0.001, 0.01, 0.10)
+
+    actual = summarize_error_map(
+        values,
+        top_area_fractions=fractions,
+    )
+
+    expected_quantiles = np.quantile(values, (0.95, 0.99, 0.999))
+    np.testing.assert_allclose(
+        [actual["q95"], actual["q99"], actual["q999"]],
+        expected_quantiles,
+        rtol=0.0,
+        atol=1e-12,
+    )
+    for fraction in fractions:
+        name = scoring_module._fraction_name(fraction)
+        assert actual[name] == pytest.approx(
+            top_area_mean(values, fraction),
+            abs=1e-7,
+        )
 
 
 def test_small_missing_structure_is_not_diluted_by_global_mean():
@@ -71,9 +98,12 @@ def test_window_integral_grid_is_built_once_per_unique_size(monkeypatch):
     calls: list[int] = []
     original = scoring_module._window_grid
 
-    def counted(values, window):
+    integrals = []
+
+    def counted(values, window, *, integral=None):
         calls.append(int(window))
-        return original(values, window)
+        integrals.append(integral)
+        return original(values, window, integral=integral)
 
     monkeypatch.setattr(scoring_module, "_window_grid", counted)
     score_local_errors(
@@ -83,6 +113,7 @@ def test_window_integral_grid_is_built_once_per_unique_size(monkeypatch):
     )
 
     assert calls == [16, 32, 64, 128]
+    assert all(value is integrals[0] for value in integrals)
 
 
 def test_high_confidence_two_pixel_structure_survives_area_filter():

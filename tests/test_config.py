@@ -242,14 +242,15 @@ def test_example_json_loads_with_production_settings():
     assert config.runtime.prefetch == 4
     assert config.runtime.decode_workers == 4
     assert config.runtime.decode_cache_mb == 1024
-    assert config.runtime.postproc_workers == 4
-    assert config.runtime.postproc_buffer_mb == 2048
+    assert config.runtime.postproc_workers == 2
+    assert config.runtime.postproc_buffer_mb == 4096
+    assert config.runtime.postproc_microbatch_size == 4
     assert config.runtime.reconstruction == "device"
     assert config.cgvqm.batch_size == 4
     assert config.cgvqm.context_cache_mb == 256
     # Calibration baseline stays put.
     assert config.model.batch_size == 64
-    assert config.runtime.cpu_threads_per_worker == 8
+    assert config.runtime.cpu_threads_per_worker == 1
     assert config.runtime.precision == "float32"
 
 
